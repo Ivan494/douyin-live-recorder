@@ -31,6 +31,12 @@ Cookie），因此不会把你已经打开的抖音网页挤下线。
 - 可选导入 Chrome 登录态（本机 DPAPI 加密，不要提交到 git）
 - 支持托盘的图形界面
 
+## 演示效果
+
+![主界面](docs/demo-main.png)
+
+资料名称已打码。
+
 ## 从源码运行
 
 需要：Windows、Python 3.11+，以及在 `PATH` 上的 `ffmpeg` / `ffprobe`
@@ -124,6 +130,12 @@ The interface defaults to Simplified Chinese; switch to English in Settings.
   live monitoring
 - Optional Chrome session import (DPAPI-encrypted, stored only on your machine)
 - Tray-capable GUI
+
+## Demo
+
+![Main window](docs/demo-main.png)
+
+Profile names are redacted.
 
 ## Run from source
 
