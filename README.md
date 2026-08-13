@@ -1,6 +1,14 @@
+<p align="center">
+  <a href="https://linux.do" title="LINUX DO">
+    <img src="https://cdn3.ldstatic.com/original/4X/d/1/4/d146c68151340881c884d95e0da4acdf369258c6.png" alt="LINUX DO" width="100" height="100" />
+  </a>
+</p>
+
 # Douyin Live Recorder
 
 English | [简体中文](#抖音直播录制)
+
+Acknowledges [LINUX DO](https://linux.do).
 
 Portable Windows app that records Douyin live streams and downloads posted
 works / stories. Live-room probes stay anonymous (no login cookies) so
@@ -96,6 +104,8 @@ rights of content creators. Not affiliated with Douyin or ByteDance.
 # 抖音直播录制
 
 [English](#douyin-live-recorder) | 简体中文
+
+本项目认可 [LINUX DO](https://linux.do) 社区。
 
 Windows 便携版：录制抖音直播，并下载作品 / 日常。直播间探测走匿名请求（不带登录
 Cookie），因此不会把你已经打开的抖音网页挤下线。
