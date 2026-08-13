@@ -10,7 +10,7 @@
   "error_min_backoff_seconds": 30,
   "error_max_backoff_seconds": 300,
   "container": "mkv",
-  "language": "en",
+  "language": "zh-CN",
   "new_profile_poll_interval_seconds": 60,
   "priority_risk_control_backoff_seconds": 60,
   "standard_risk_control_backoff_seconds": 60,

@@ -41,6 +41,7 @@ from recording_urls import (
     has_recording_url,
     recording_input_url,
 )
+from i18n import LANGUAGE_CHOICES, set_language, t
 
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -289,7 +290,7 @@ def detect_platform(url):
 
 
 def platform_label(platform):
-    return {"douyin": "Douyin", "youtube": "YouTube"}.get(platform, "Unknown")
+    return {"douyin": t("platform_douyin"), "youtube": t("platform_youtube")}.get(platform, t("platform_unknown"))
 
 
 def fallback_name_from_url(url):
@@ -353,17 +354,18 @@ def byte_size_text(size):
 def media_progress_text(progress):
     phase = progress.get("phase") or ""
     if phase == "resolving":
-        return "Resolving profile…"
+        return t("progress_resolving")
     if phase == "scanning":
         pages = int(progress.get("pages") or 0)
         found = int(progress.get("found") or 0)
         if not pages:
-            return "Scanning posted works…"
-        return f"Scanning history • {pages} pages • {found} found"
+            return t("progress_scanning")
+        return t("progress_history", pages=pages, found=found)
     if phase == "checking_stories":
-        return "Checking active stories…"
+        return t("progress_stories")
 
-    media_kind = "Story" if progress.get("media_kind") == "story" else "Video"
+    is_story = progress.get("media_kind") == "story"
+    media_kind = t("kind_story") if is_story else t("kind_video")
     current = int(progress.get("current") or 0)
     total = int(progress.get("total") or 0)
     downloaded = int(progress.get("downloaded") or 0)
@@ -374,13 +376,14 @@ def media_progress_text(progress):
         item = item[:33] + "…"
 
     if not current:
-        return f"Preparing {total} {media_kind.lower()}s…"
+        kind = t("kind_story_lower") if is_story else t("kind_video_lower")
+        return t("progress_preparing", total=total, kind=kind)
 
     prefix = f"{media_kind} {current}/{total}"
     if phase == "retrying":
         attempt = int(progress.get("attempt") or 1)
         attempts = int(progress.get("attempts") or attempt)
-        text = f"{prefix} • retry {attempt}/{attempts}"
+        text = t("progress_retry", prefix=prefix, attempt=attempt, attempts=attempts)
     elif "bytes_downloaded" in progress:
         transferred = int(progress.get("bytes_downloaded") or 0)
         expected = int(progress.get("bytes_total") or 0)
@@ -389,9 +392,9 @@ def media_progress_text(progress):
         elif transferred:
             text = f"{prefix} • {byte_size_text(transferred)}"
         else:
-            text = f"{prefix} • connecting…"
+            text = t("progress_connecting", prefix=prefix)
     else:
-        text = f"{prefix} • +{downloaded} • {skipped} skipped • {failed} failed"
+        text = t("progress_counts", prefix=prefix, downloaded=downloaded, skipped=skipped, failed=failed)
     if item:
         text += f" • {item}"
     return text
@@ -461,7 +464,7 @@ def install_exception_hooks(root=None):
         def report_callback_exception(exc_type, exc_value, exc_traceback):
             logging.error("Unhandled GUI callback exception", exc_info=(exc_type, exc_value, exc_traceback))
             try:
-                messagebox.showerror("Unexpected error", f"{exc_type.__name__}: {exc_value}")
+                messagebox.showerror(t("unexpected_error"), f"{exc_type.__name__}: {exc_value}")
             except Exception:
                 pass
 
@@ -633,7 +636,7 @@ def restore_window_for_pid(pid):
         buffer = ctypes.create_unicode_buffer(length + 1)
         GetWindowTextW(hwnd, buffer, length + 1)
         title = buffer.value or ""
-        if "Douyin Live Recorder" in title or title.strip() == "Douyin Live Recorder":
+        if "Douyin Live Recorder" in title or "抖音直播录制" in title:
             found.append(hwnd)
             return False
         if "Douyin" in title and "Recorder" in title:
@@ -727,7 +730,7 @@ def default_settings():
         "ytdlp_path": str(DEFAULT_YTDLP_PATH),
         "container": "mkv",
         "quality": "OD",
-        "language": "en",
+        "language": "zh-CN",
         "start_hidden_to_tray": False,
         "priority_risk_control_backoff_seconds": 60,
         "standard_risk_control_backoff_seconds": 60,
@@ -834,6 +837,7 @@ def save_json(path, data):
 class RecorderStore:
     def __init__(self):
         self.settings = load_json(SETTINGS_FILE, default_settings())
+        set_language(self.settings.get("language"))
         if "start_with_windows" not in self.settings:
             self.settings["start_with_windows"] = is_autostart_enabled()
         # Repair the startup shortcut when the setting is enabled but the
@@ -975,7 +979,7 @@ class MonitorEngine:
         self.recover_pending_recording_sessions()
         self.thread = threading.Thread(target=self._run, name="live-monitor", daemon=True)
         self.thread.start()
-        self.emit("engine", "Monitoring started.")
+        self.emit("engine", t("monitoring_started"))
 
     def stop(self, terminate_recordings=True):
         self.stop_event.set()
@@ -1013,7 +1017,7 @@ class MonitorEngine:
             for profile_id in list(self.recordings):
                 if profile_id not in self.processes:
                     self._finalize_recording_session(profile_id, "Recorder stopped")
-        self.emit("engine", "Monitoring stopping.")
+        self.emit("engine", t("monitoring_stopping"))
 
     def refresh_all(self):
         for profile in list(self.store.profiles):
@@ -1021,7 +1025,7 @@ class MonitorEngine:
         if not self.is_running():
             self.start()
         self.wake_event.set()
-        self.emit("engine", "Refresh requested.")
+        self.emit("engine", t("refresh_requested"))
 
     def emit(self, profile_id, message, **state):
         self.event_queue.put({"profile_id": profile_id, "message": message, "state": state, "time": now_text()})
@@ -1369,7 +1373,7 @@ class MonitorEngine:
             or "sec.douyin.com" in lowered  # FIX-APP-10: captcha CDN domain
             or "action=verify" in lowered  # FIX-APP-10: captcha action parameter
         ):
-            return "captcha", "Captcha"
+            return "captcha", t("captcha")
         # FIX-C1: Replaced mojibake literals with correct Chinese characters.
         if (
             "risk control" in lowered
@@ -1379,14 +1383,14 @@ class MonitorEngine:
             or "\u8bf7\u6c42\u8fc7\u4e8e\u9891\u7e41" in message
             or "\u670d\u52a1\u5668\u6253\u77e1\u4e86" in message
         ):
-            return "risk_control", "Rate limited"
+            return "risk_control", t("rate_limited")
         if "\u53ef\u89c1\u8303\u56f4" in message:
-            return "not_visible", "Not visible"
+            return "not_visible", t("not_visible")
         if "VR live is not supported" in message:
-            return "unsupported_stream", "Unsupported stream"
+            return "unsupported_stream", t("unsupported_stream")
         if "empty api" in lowered or "empty response" in lowered:
-            return "empty_response", "Empty response"
-        return "error", "Error"
+            return "empty_response", t("empty_response")
+        return "error", t("error")
 
     def _run(self):
         while not self.stop_event.is_set():
@@ -1429,7 +1433,7 @@ class MonitorEngine:
                     continue
                 self.emit(
                     profile_id,
-                    f"Next check in {wait_seconds}s.",
+                    t("next_check_in", seconds=wait_seconds),
                     next_check=future_text(wait_seconds),
                     cooldown=self.cooldown_label(profile_id, profile, wait_seconds),
                 )
@@ -1437,7 +1441,7 @@ class MonitorEngine:
             self.wake_event.clear()
 
         self._poll_processes()
-        self.emit("engine", "Monitoring stopped.")
+        self.emit("engine", t("monitoring_stopped"))
 
     def _is_recording(self, profile_id):
         process = self.processes.get(profile_id)
@@ -1777,7 +1781,7 @@ class MonitorEngine:
         try:
             # FIX-APP-4: 30s timeout prevents a hanging Douyin API from blocking all profiles
             room, stream = asyncio.run(asyncio.wait_for(self._resolve(profile), timeout=30))
-            status = "Live" if stream.is_live else "Offline"
+            status = t("live") if stream.is_live else t("offline")
             live_url = room.get("live_url") or ""
             if live_url and profile.get("fallback_live_url") != live_url:
                 profile["fallback_live_url"] = live_url
@@ -1785,7 +1789,7 @@ class MonitorEngine:
                 save_json(PROFILES_FILE, self.store.profiles)
             self.emit(
                 profile["id"],
-                f"Checked: {status}.",
+                t("checked", status=status),
                 status=status,
                 recording=False,
                 last_checked=now_text(),
@@ -2184,12 +2188,12 @@ class MediaDownloadEngine:
         self.wake_event.clear()
         self.thread = threading.Thread(target=self._run, name="media-download-monitor", daemon=True)
         self.thread.start()
-        self.emit("engine", "Media auto-download monitor started.")
+        self.emit("engine", t("media_monitor_started"))
 
     def stop(self):
         self.stop_event.set()
         self.wake_event.set()
-        self.emit("engine", "Media auto-download monitor stopping.")
+        self.emit("engine", t("media_monitor_stopping"))
 
     def refresh_all(self):
         for profile in list(self.store.profiles):
@@ -2197,14 +2201,14 @@ class MediaDownloadEngine:
         if not self.is_running():
             self.start()
         self.wake_event.set()
-        self.emit("engine", "Media refresh requested.")
+        self.emit("engine", t("media_refresh_requested"))
 
     def refresh_profile(self, profile_id):
         self.next_check[profile_id] = 0
         if not self.is_running():
             self.start()
         self.wake_event.set()
-        self.emit(profile_id, "Media refresh requested for selected profile.")
+        self.emit(profile_id, t("media_refresh_profile"))
 
     def emit(self, profile_id, message, **state):
         self.event_queue.put({"profile_id": profile_id, "message": message, "state": state, "time": now_text()})
@@ -2287,33 +2291,36 @@ class MediaDownloadEngine:
                 )
             self.wake_event.wait(1)
             self.wake_event.clear()
-        self.emit("engine", "Media auto-download monitor stopped.")
+        self.emit("engine", t("media_monitor_stopped"))
 
     @staticmethod
     def summarize_kind(summary, key):
         result = summary.get(key) or {}
         status = result.get("status") or "unknown"
-        label = "Works" if key == "videos" else key.capitalize()
+        label = t("works") if key == "videos" else (t("stories") if key == "stories" else key.capitalize())
         if status == "disabled":
             return ""
         if status == "ok":
-            return (
-                f"{label} +{result.get('downloaded', 0)} • "
-                f"{result.get('skipped', 0)} skipped • {result.get('failed', 0)} failed"
+            return t(
+                "summary_ok",
+                label=label,
+                downloaded=result.get("downloaded", 0),
+                skipped=result.get("skipped", 0),
+                failed=result.get("failed", 0),
             )
         if status == "no_active_stories":
-            return "Stories: none active"
+            return t("stories_none")
         if status == "mobile_only":
-            return "Stories: active, mobile app access required"
+            return t("stories_mobile")
         if status in {"blocked", "api_empty"}:
-            return f"{label}: API returned an empty response"
+            return t("api_empty", label=label)
         if status == "login_required":
             if key == "videos":
-                return "Works: Douyin requires login for this profile (it may contain notes only)"
-            return f"{label}: login required"
+                return t("works_login")
+            return t("login_required", label=label)
         if status == "captcha":
-            return f"{label}: captcha/verification required"
-        return f"{label}: {status.replace('_', ' ')}"
+            return t("captcha_required", label=label)
+        return t("summary_status", label=label, status=status.replace("_", " "))
 
     def _check_profile(self, profile):
         videos = bool(profile.get("auto_download_videos"))
@@ -2362,10 +2369,10 @@ class MediaDownloadEngine:
                 self.consecutive_failures[profile["id"]] = 0
             self._save_circuit_breaker_state()  # FIX-AUDIT-5
             parts = [part for part in (self.summarize_kind(summary, "videos"), self.summarize_kind(summary, "stories")) if part]
-            media_status = "; ".join(parts) or "No media work"
+            media_status = "; ".join(parts) or t("no_media_work")
             self.emit(
                 profile["id"],
-                f"Media check: {media_status}",
+                t("media_check", status=media_status),
                 media_status=media_status,
                 media_progress=media_status,
                 media_last_checked=now_text(),
@@ -2456,7 +2463,7 @@ class ProfileDialog(Toplevel):
         self.store = store
         self.result = None
         self.profile = dict(profile or {})
-        self.title("Profile")
+        self.title(t("profile_title"))
         self.geometry("720x590")
         self.resizable(False, False)
         self.transient(parent)
@@ -2490,50 +2497,50 @@ class ProfileDialog(Toplevel):
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(1, weight=1)
 
-        ttk.Label(frame, text="Live/Profile URL").grid(row=0, column=0, sticky="w", pady=6)
+        ttk.Label(frame, text=t("live_profile_url")).grid(row=0, column=0, sticky="w", pady=6)
         url_row = ttk.Frame(frame)
         url_row.grid(row=0, column=1, sticky="ew", pady=6)
         url_row.columnconfigure(0, weight=1)
         ttk.Entry(url_row, textvariable=self.url_var).grid(row=0, column=0, sticky="ew")
-        self.resolve_button = ttk.Button(url_row, text="Resolve", command=self.resolve_link)
+        self.resolve_button = ttk.Button(url_row, text=t("resolve"), command=self.resolve_link)
         self.resolve_button.grid(row=0, column=1, padx=(8, 0))
 
-        ttk.Label(frame, text="Profile URL (media)").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Label(frame, text=t("profile_url_media")).grid(row=1, column=0, sticky="w", pady=6)
         ttk.Entry(frame, textvariable=self.profile_url_var).grid(row=1, column=1, sticky="ew", pady=6)
 
-        ttk.Label(frame, text="Display name").grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Label(frame, text=t("display_name")).grid(row=2, column=0, sticky="w", pady=6)
         ttk.Entry(frame, textvariable=self.name_var).grid(row=2, column=1, sticky="ew", pady=6)
 
-        ttk.Label(frame, text="Output folder").grid(row=3, column=0, sticky="w", pady=6)
+        ttk.Label(frame, text=t("output_folder")).grid(row=3, column=0, sticky="w", pady=6)
         out_row = ttk.Frame(frame)
         out_row.grid(row=3, column=1, sticky="ew", pady=6)
         out_row.columnconfigure(0, weight=1)
         ttk.Entry(out_row, textvariable=self.output_var).grid(row=0, column=0, sticky="ew")
-        ttk.Button(out_row, text="Browse", command=self.browse).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(out_row, text=t("browse"), command=self.browse).grid(row=0, column=1, padx=(8, 0))
 
-        ttk.Label(frame, text="Quality").grid(row=4, column=0, sticky="w", pady=6)
+        ttk.Label(frame, text=t("quality")).grid(row=4, column=0, sticky="w", pady=6)
         ttk.Combobox(frame, textvariable=self.quality_var, values=QUALITY_OPTIONS, width=12, state="readonly").grid(row=4, column=1, sticky="w", pady=6)
 
-        ttk.Label(frame, text="Check every").grid(row=5, column=0, sticky="w", pady=6)
+        ttk.Label(frame, text=t("check_every")).grid(row=5, column=0, sticky="w", pady=6)
         interval_row = ttk.Frame(frame)
         interval_row.grid(row=5, column=1, sticky="w", pady=6)
         ttk.Entry(interval_row, textvariable=self.interval_var, width=10).pack(side="left")
-        ttk.Label(interval_row, text="seconds").pack(side="left", padx=(8, 0))
+        ttk.Label(interval_row, text=t("seconds")).pack(side="left", padx=(8, 0))
 
-        ttk.Checkbutton(frame, text="Priority", variable=self.priority_var).grid(row=6, column=1, sticky="w", pady=6)
-        ttk.Checkbutton(frame, text="Enabled", variable=self.enabled_var).grid(row=7, column=1, sticky="w", pady=6)
-        ttk.Checkbutton(frame, text="Auto-download posted works (videos + images)", variable=self.auto_videos_var).grid(row=8, column=1, sticky="w", pady=6)
-        ttk.Checkbutton(frame, text="Auto-download stories (mobile API)", variable=self.auto_stories_var).grid(row=9, column=1, sticky="w", pady=6)
-        ttk.Label(frame, text="Media check every").grid(row=10, column=0, sticky="w", pady=6)
+        ttk.Checkbutton(frame, text=t("priority"), variable=self.priority_var).grid(row=6, column=1, sticky="w", pady=6)
+        ttk.Checkbutton(frame, text=t("enabled"), variable=self.enabled_var).grid(row=7, column=1, sticky="w", pady=6)
+        ttk.Checkbutton(frame, text=t("auto_works"), variable=self.auto_videos_var).grid(row=8, column=1, sticky="w", pady=6)
+        ttk.Checkbutton(frame, text=t("auto_stories"), variable=self.auto_stories_var).grid(row=9, column=1, sticky="w", pady=6)
+        ttk.Label(frame, text=t("media_check_every")).grid(row=10, column=0, sticky="w", pady=6)
         media_interval_row = ttk.Frame(frame)
         media_interval_row.grid(row=10, column=1, sticky="w", pady=6)
         ttk.Entry(media_interval_row, textvariable=self.media_interval_var, width=10).pack(side="left")
-        ttk.Label(media_interval_row, text="seconds").pack(side="left", padx=(8, 0))
+        ttk.Label(media_interval_row, text=t("seconds")).pack(side="left", padx=(8, 0))
 
         actions = ttk.Frame(frame)
         actions.grid(row=10, column=0, columnspan=2, sticky="e", pady=(24, 0))
-        ttk.Button(actions, text="Cancel", command=self.destroy).pack(side="right", padx=(8, 0))
-        ttk.Button(actions, text="Save", command=self.save).pack(side="right")
+        ttk.Button(actions, text=t("cancel"), command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(actions, text=t("save"), command=self.save).pack(side="right")
         self.resolve_after_id = self.after(100, self.process_resolve_results)
 
     def browse(self):
@@ -2550,12 +2557,12 @@ class ProfileDialog(Toplevel):
         platform = detect_platform(url)
         if not url or platform not in ("douyin", "youtube"):
             if show_errors:
-                messagebox.showerror("Invalid URL", "Enter a Douyin or YouTube URL first.")
+                messagebox.showerror(t("invalid_url"), t("enter_url"))
             return None
         quality = self.quality_var.get() or self.store.settings["quality"]
         existing_name = self.name_var.get().strip()
         self.resolving = True
-        self.resolve_button.configure(text="Resolving...", state="disabled")
+        self.resolve_button.configure(text=t("resolving"), state="disabled")
 
         def worker():
             try:
@@ -2583,15 +2590,15 @@ class ProfileDialog(Toplevel):
             result = None
         if result is not None:
             self.resolving = False
-            self.resolve_button.configure(text="Resolve", state="normal")
+            self.resolve_button.configure(text=t("resolve"), state="normal")
             if not result.get("ok"):
                 if result.get("show_errors"):
-                    messagebox.showerror("Resolve failed", result.get("error") or "Unknown error", parent=self)
+                    messagebox.showerror(t("resolve_failed"), result.get("error") or t("unknown_error"), parent=self)
             else:
                 room = result["room"]
                 platform = result["platform"]
                 url = result["url"]
-                name = room.get("anchor_name") or self.name_var.get().strip() or f"{platform_label(platform)} Profile"
+                name = room.get("anchor_name") or self.name_var.get().strip() or t("platform_profile", platform=platform_label(platform))
                 live_url = room.get("live_url") or url.split("?")[0]
                 self.name_var.set(name)
                 self.url_var.set(live_url)
@@ -2634,10 +2641,10 @@ class ProfileDialog(Toplevel):
         name = self.name_var.get().strip()
         platform = detect_platform(url)
         if not url:
-            messagebox.showerror("Missing URL", "Enter a Douyin or YouTube URL.")
+            messagebox.showerror(t("missing_url"), t("enter_url_short"))
             return
         if platform not in ("douyin", "youtube"):
-            messagebox.showerror("Invalid URL", "Enter a Douyin or YouTube URL.")
+            messagebox.showerror(t("invalid_url"), t("enter_url_short"))
             return
         if not name:
             # Saving must never block the Tk event loop on a network request.
@@ -2654,7 +2661,7 @@ class ProfileDialog(Toplevel):
             poll_interval = max(15, int(self.interval_var.get()))
             media_interval = max(60, int(self.media_interval_var.get()))
         except ValueError:
-            messagebox.showerror("Invalid interval", "Check intervals must be numbers.")
+            messagebox.showerror(t("invalid_interval"), t("intervals_numbers"))
             return
         self.result = {
             "id": self.profile.get("id", str(uuid.uuid4())),
@@ -2686,48 +2693,45 @@ class DouyinSessionDialog(Toplevel):
         self.checking = False
         self.auto_poll = False
         self.cdp_url = ""
-        self.title("Douyin Session Login")
+        self.title(t("session_title"))
         self.geometry("650x310")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self.close_dialog)
 
-        self.status_var = StringVar(value="Checking saved session...")
+        self.status_var = StringVar(value=t("checking_saved"))
         self.detail_var = StringVar(value="")
 
         frame = ttk.Frame(self, padding=22)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(0, weight=1)
 
-        ttk.Label(frame, text="Douyin Session Login", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(frame, text=t("session_title"), style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             frame,
-            text=(
-                "Open the dedicated login browser, scan the QR code with the Douyin mobile app, "
-                "and keep it open until this window confirms the session was saved."
-            ),
+            text=t("session_help"),
             wraplength=590,
             justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(12, 8))
         ttk.Label(
             frame,
-            text="This optional login is used only when Douyin hides notes, images, or restricted works. Live monitoring and public works stay anonymous when possible.",
+            text=t("session_note"),
             wraplength=590,
             justify="left",
             style="Subtle.TLabel",
         ).grid(row=2, column=0, sticky="w")
 
-        status_box = ttk.LabelFrame(frame, text="Status", padding=12)
+        status_box = ttk.LabelFrame(frame, text=t("status"), padding=12)
         status_box.grid(row=3, column=0, sticky="ew", pady=(18, 0))
         ttk.Label(status_box, textvariable=self.status_var, wraplength=560, justify="left").pack(anchor="w")
         ttk.Label(status_box, textvariable=self.detail_var, wraplength=560, justify="left", style="Subtle.TLabel").pack(anchor="w", pady=(5, 0))
 
         actions = ttk.Frame(frame)
         actions.grid(row=4, column=0, sticky="ew", pady=(18, 0))
-        ttk.Button(actions, text="Open Douyin Login", command=self.open_login_browser).pack(side="left")
-        ttk.Button(actions, text="Check Login Now", command=self.check_now).pack(side="left", padx=(8, 0))
-        ttk.Button(actions, text="Close", command=self.close_dialog).pack(side="right")
+        ttk.Button(actions, text=t("open_login"), command=self.open_login_browser).pack(side="left")
+        ttk.Button(actions, text=t("check_login"), command=self.check_now).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text=t("close"), command=self.close_dialog).pack(side="right")
 
         self.refresh_saved_status()
         self.after(250, self.process_results)
@@ -2735,24 +2739,24 @@ class DouyinSessionDialog(Toplevel):
     def refresh_saved_status(self):
         info = saved_session_info()
         if info.get("logged_in"):
-            imported_at = info.get("imported_at") or "unknown time"
-            self.status_var.set("Saved Douyin session is available.")
-            self.detail_var.set(f"Imported {imported_at}; {info.get('cookie_count', 0)} session cookies stored.")
+            imported_at = info.get("imported_at") or t("unknown_time")
+            self.status_var.set(t("session_available"))
+            self.detail_var.set(t("session_imported", imported_at=imported_at, count=info.get("cookie_count", 0)))
         else:
-            self.status_var.set("No usable Douyin session is saved.")
-            self.detail_var.set("Open the login browser and scan the QR code to continue.")
+            self.status_var.set(t("session_missing"))
+            self.detail_var.set(t("session_scan_hint"))
 
     def open_login_browser(self):
         try:
             launched = launch_douyin_login_browser()
         except Exception as exc:
             logging.exception("Could not open Douyin login browser")
-            messagebox.showerror("Login browser failed", str(exc), parent=self)
+            messagebox.showerror(t("login_browser_failed"), str(exc), parent=self)
             return
         self.cdp_url = launched["cdp_url"]
         self.auto_poll = True
-        self.status_var.set("Waiting for Douyin QR login...")
-        self.detail_var.set("Scan the QR code in the browser. This window will import the session automatically.")
+        self.status_var.set(t("waiting_qr"))
+        self.detail_var.set(t("scan_qr"))
         self.after(1200, self.check_now)
 
     def check_now(self):
@@ -2786,13 +2790,13 @@ class DouyinSessionDialog(Toplevel):
             if result.get("ok"):
                 self.auto_poll = False
                 info = result["info"]
-                self.status_var.set("Douyin login imported successfully.")
-                self.detail_var.set(f"Saved {info.get('cookie_count', 0)} encrypted session cookies.")
+                self.status_var.set(t("login_imported"))
+                self.detail_var.set(t("saved_cookies", count=info.get("cookie_count", 0)))
                 if self.on_change:
                     self.on_change()
             else:
-                self.status_var.set("Waiting for a logged-in Douyin session...")
-                self.detail_var.set(result.get("error") or "Login is not ready yet.")
+                self.status_var.set(t("waiting_logged_in"))
+                self.detail_var.set(result.get("error") or t("login_not_ready"))
                 if self.auto_poll:
                     self.after(1800, self.check_now)
         if self.winfo_exists():
@@ -2807,8 +2811,8 @@ class SettingsDialog(Toplevel):
     def __init__(self, parent, store):
         super().__init__(parent)
         self.store = store
-        self.title("Settings")
-        self.geometry("560x420")
+        self.title(t("settings_title"))
+        self.geometry("560x470")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -2825,32 +2829,44 @@ class SettingsDialog(Toplevel):
         self.priority_risk_backoff_var = StringVar(value=str(store.settings["priority_risk_control_backoff_seconds"]))
         self.standard_risk_backoff_var = StringVar(value=str(store.settings["standard_risk_control_backoff_seconds"]))
         self.stall_timeout_var = StringVar(value=str(store.settings.get("recording_stall_timeout_seconds", 300)))
+        self.language_labels = {code: label for code, label in LANGUAGE_CHOICES}
+        self.language_codes = {label: code for code, label in LANGUAGE_CHOICES}
+        initial_language = store.settings.get("language") or "zh-CN"
+        self.language_var = StringVar(value=self.language_labels.get(initial_language, "简体中文"))
 
         frame = ttk.Frame(self, padding=18)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(1, weight=1)
 
-        ttk.Label(frame, text="FFmpeg path").grid(row=0, column=0, sticky="w", pady=6)
-        ttk.Entry(frame, textvariable=self.ffmpeg_var).grid(row=0, column=1, sticky="ew", pady=6)
-        ttk.Label(frame, text="yt-dlp path").grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Entry(frame, textvariable=self.ytdlp_var).grid(row=1, column=1, sticky="ew", pady=6)
-        ttk.Label(frame, text="Default new profile interval").grid(row=2, column=0, sticky="w", pady=6)
-        ttk.Entry(frame, textvariable=self.poll_var, width=12).grid(row=2, column=1, sticky="w", pady=6)
-        ttk.Label(frame, text="Container").grid(row=3, column=0, sticky="w", pady=6)
-        ttk.Combobox(frame, textvariable=self.container_var, values=["mkv"], width=12, state="readonly").grid(row=3, column=1, sticky="w", pady=6)
-        ttk.Label(frame, text="Priority risk cooldown").grid(row=4, column=0, sticky="w", pady=6)
-        ttk.Entry(frame, textvariable=self.priority_risk_backoff_var, width=12).grid(row=4, column=1, sticky="w", pady=6)
-        ttk.Label(frame, text="Normal risk cooldown").grid(row=5, column=0, sticky="w", pady=6)
-        ttk.Entry(frame, textvariable=self.standard_risk_backoff_var, width=12).grid(row=5, column=1, sticky="w", pady=6)
-        ttk.Label(frame, text="Recording stall timeout").grid(row=6, column=0, sticky="w", pady=6)
-        ttk.Entry(frame, textvariable=self.stall_timeout_var, width=12).grid(row=6, column=1, sticky="w", pady=6)
-        ttk.Checkbutton(frame, text="Start with Windows", variable=self.autostart_var).grid(row=7, column=1, sticky="w", pady=6)
-        ttk.Checkbutton(frame, text="Start hidden to tray", variable=self.hidden_var).grid(row=8, column=1, sticky="w", pady=6)
+        ttk.Label(frame, text=t("language")).grid(row=0, column=0, sticky="w", pady=6)
+        ttk.Combobox(
+            frame,
+            textvariable=self.language_var,
+            values=[label for _code, label in LANGUAGE_CHOICES],
+            width=16,
+            state="readonly",
+        ).grid(row=0, column=1, sticky="w", pady=6)
+        ttk.Label(frame, text=t("ffmpeg_path")).grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.ffmpeg_var).grid(row=1, column=1, sticky="ew", pady=6)
+        ttk.Label(frame, text=t("ytdlp_path")).grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.ytdlp_var).grid(row=2, column=1, sticky="ew", pady=6)
+        ttk.Label(frame, text=t("default_interval")).grid(row=3, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.poll_var, width=12).grid(row=3, column=1, sticky="w", pady=6)
+        ttk.Label(frame, text=t("container")).grid(row=4, column=0, sticky="w", pady=6)
+        ttk.Combobox(frame, textvariable=self.container_var, values=["mkv"], width=12, state="readonly").grid(row=4, column=1, sticky="w", pady=6)
+        ttk.Label(frame, text=t("priority_cooldown")).grid(row=5, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.priority_risk_backoff_var, width=12).grid(row=5, column=1, sticky="w", pady=6)
+        ttk.Label(frame, text=t("normal_cooldown")).grid(row=6, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.standard_risk_backoff_var, width=12).grid(row=6, column=1, sticky="w", pady=6)
+        ttk.Label(frame, text=t("stall_timeout")).grid(row=7, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.stall_timeout_var, width=12).grid(row=7, column=1, sticky="w", pady=6)
+        ttk.Checkbutton(frame, text=t("start_with_windows"), variable=self.autostart_var).grid(row=8, column=1, sticky="w", pady=6)
+        ttk.Checkbutton(frame, text=t("start_hidden"), variable=self.hidden_var).grid(row=9, column=1, sticky="w", pady=6)
 
         actions = ttk.Frame(frame)
-        actions.grid(row=9, column=0, columnspan=2, sticky="e", pady=(24, 0))
-        ttk.Button(actions, text="Cancel", command=self.destroy).pack(side="right", padx=(8, 0))
-        ttk.Button(actions, text="Save", command=self.save).pack(side="right")
+        actions.grid(row=10, column=0, columnspan=2, sticky="e", pady=(24, 0))
+        ttk.Button(actions, text=t("cancel"), command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(actions, text=t("save"), command=self.save).pack(side="right")
 
     def save(self):
         try:
@@ -2859,10 +2875,12 @@ class SettingsDialog(Toplevel):
             standard_risk_backoff = max(1, int(self.standard_risk_backoff_var.get()))
             stall_timeout = max(60, int(self.stall_timeout_var.get()))
         except ValueError:
-            messagebox.showerror("Invalid settings", "Interval, cooldown, and timeout values must be numbers.")
+            messagebox.showerror(t("invalid_settings"), t("settings_numbers"))
             return
         try:
             updated_settings = dict(self.store.settings)
+            previous_language = updated_settings.get("language") or "zh-CN"
+            language_code = self.language_codes.get(self.language_var.get(), "zh-CN")
             updated_settings["ffmpeg_path"] = self.ffmpeg_var.get().strip()
             updated_settings["ytdlp_path"] = self.ytdlp_var.get().strip()
             updated_settings["new_profile_poll_interval_seconds"] = poll
@@ -2872,14 +2890,18 @@ class SettingsDialog(Toplevel):
             updated_settings["priority_risk_control_backoff_seconds"] = priority_risk_backoff
             updated_settings["standard_risk_control_backoff_seconds"] = standard_risk_backoff
             updated_settings["recording_stall_timeout_seconds"] = stall_timeout
+            updated_settings["language"] = language_code
             if updated_settings["start_with_windows"] != is_autostart_enabled():
                 set_autostart_enabled(updated_settings["start_with_windows"])
             self.store.settings = updated_settings
             self.store.save()
+            set_language(language_code)
         except Exception as exc:
             logging.exception("Settings save failed")
-            messagebox.showerror("Settings save failed", str(exc))
+            messagebox.showerror(t("settings_save_failed"), str(exc))
             return
+        if language_code != previous_language:
+            messagebox.showinfo(t("settings_title"), t("language_restart"), parent=self)
         self.destroy()
 
 
@@ -2890,16 +2912,16 @@ class SingleVideoDialog(Toplevel):
         super().__init__(parent)
         self.event_queue = event_queue
         self.notify_callback = notify_callback
-        self.title("Download Single Video")
+        self.title(t("single_title"))
         self.geometry("700x320")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
 
         self.worker = None
-        self._status_text = "Paste a Douyin share link (v.douyin.com) or full video URL."
+        self._status_text = t("single_hint")
         self._result = None
-        self._output_dir = str(ROOT_DOWNLOAD_DIR / "Single Videos")
+        self._output_dir = str(ROOT_DOWNLOAD_DIR / t("folder_single_videos"))
 
         self.url_var = StringVar()
         self.output_var = StringVar(value=self._output_dir)
@@ -2909,13 +2931,13 @@ class SingleVideoDialog(Toplevel):
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(1, weight=1)
 
-        ttk.Label(frame, text="Video link").grid(row=0, column=0, sticky="w", pady=6)
+        ttk.Label(frame, text=t("video_link")).grid(row=0, column=0, sticky="w", pady=6)
         url_entry = ttk.Entry(frame, textvariable=self.url_var)
         url_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=6)
         url_entry.focus_set()
-        ttk.Label(frame, text="Save to").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Label(frame, text=t("save_to")).grid(row=1, column=0, sticky="w", pady=6)
         ttk.Entry(frame, textvariable=self.output_var).grid(row=1, column=1, sticky="ew", pady=6)
-        ttk.Button(frame, text="Browse", command=self.browse_output).grid(row=1, column=2, padx=(8, 0), pady=6)
+        ttk.Button(frame, text=t("browse"), command=self.browse_output).grid(row=1, column=2, padx=(8, 0), pady=6)
 
         self.status_label = ttk.Label(
             frame, textvariable=self.status_var, style="Subtle.TLabel", wraplength=620, justify="left"
@@ -2924,10 +2946,10 @@ class SingleVideoDialog(Toplevel):
 
         actions = ttk.Frame(frame)
         actions.grid(row=3, column=0, columnspan=3, sticky="e", pady=(24, 0))
-        ttk.Button(actions, text="Close", command=self.destroy).pack(side="right", padx=(8, 0))
-        self.open_folder_button = ttk.Button(actions, text="Open Folder", command=self.open_folder, state="disabled")
+        ttk.Button(actions, text=t("close"), command=self.destroy).pack(side="right", padx=(8, 0))
+        self.open_folder_button = ttk.Button(actions, text=t("open_folder"), command=self.open_folder, state="disabled")
         self.open_folder_button.pack(side="right", padx=(8, 0))
-        self.download_button = ttk.Button(actions, text="Download", command=self.start_download)
+        self.download_button = ttk.Button(actions, text=t("download"), command=self.start_download)
         self.download_button.pack(side="right")
 
         self.bind("<Return>", lambda event: self.start_download())
@@ -2943,13 +2965,13 @@ class SingleVideoDialog(Toplevel):
             return
         link = self.url_var.get().strip()
         if not link:
-            messagebox.showinfo("Missing link", "Paste a Douyin share link or video URL first.", parent=self)
+            messagebox.showinfo(t("missing_link"), t("paste_link"), parent=self)
             return
-        self._output_dir = self.output_var.get().strip() or str(ROOT_DOWNLOAD_DIR / "Single Videos")
+        self._output_dir = self.output_var.get().strip() or str(ROOT_DOWNLOAD_DIR / t("folder_single_videos"))
         self._result = None
         self.download_button.config(state="disabled")
         self.open_folder_button.config(state="disabled")
-        self._status_text = "Resolving link..."
+        self._status_text = t("resolving_link")
         self.status_var.set(self._status_text)
         self.worker = threading.Thread(
             target=self._run_download, args=(link, self._output_dir), name="single-video-download", daemon=True
@@ -2965,17 +2987,22 @@ class SingleVideoDialog(Toplevel):
             total = progress.get("bytes_total") or 0
             if isinstance(done, int) and total:
                 percent = min(100, done * 100 // max(total, 1))
-                message = f"Downloading: {byte_size_text(done)} of {byte_size_text(total)} ({percent}%)"
+                message = t(
+                    "downloading_progress",
+                    done=byte_size_text(done),
+                    total=byte_size_text(total),
+                    percent=percent,
+                )
             else:
-                message = "Downloading video..."
+                message = t("downloading_video")
         elif phase == "retrying":
-            message = f"Retrying download ({progress.get('error') or 'network error'})..."
+            message = t("retrying_download", error=progress.get("error") or "network error")
         else:
-            message = f"Working ({phase})..."
+            message = t("working_phase", phase=phase)
         self._status_text = message
         try:
             self.event_queue.put(
-                {"profile_id": "engine", "message": f"Single video: {message}", "state": {}, "time": now_text()}
+                {"profile_id": "engine", "message": t("single_prefix", message=message), "state": {}, "time": now_text()}
             )
         except Exception:
             pass
@@ -3014,19 +3041,19 @@ class SingleVideoDialog(Toplevel):
         self.download_button.config(state="normal")
         if status == "ok":
             files = result.get("files") or []
-            names = ", ".join(Path(item).name for item in files) or "file saved"
-            self.status_var.set(f"Saved {title}: {names}")
+            names = ", ".join(Path(item).name for item in files) or t("file_saved")
+            self.status_var.set(t("saved_title", title=title, names=names))
             self.open_folder_button.config(state="normal")
             self._output_dir = result.get("output_dir") or self._output_dir
-            summary = f"Single video saved: {title}"
+            summary = t("single_saved", title=title)
         elif status == "skipped":
-            self.status_var.set(f"Already downloaded: {title}")
+            self.status_var.set(t("already_downloaded", title=title))
             self.open_folder_button.config(state="normal")
             self._output_dir = result.get("output_dir") or self._output_dir
-            summary = f"Single video already downloaded: {title}"
+            summary = t("single_already", title=title)
         else:
-            self.status_var.set(f"Failed: {result.get('message') or 'unknown error'}")
-            summary = "Single video download failed"
+            self.status_var.set(t("failed", message=result.get("message") or t("unknown_error")))
+            summary = t("single_failed")
         try:
             self.event_queue.put({"profile_id": "engine", "message": summary, "state": {}, "time": now_text()})
         except Exception:
@@ -3042,7 +3069,7 @@ class SingleVideoDialog(Toplevel):
             Path(self._output_dir).mkdir(parents=True, exist_ok=True)
             os.startfile(self._output_dir)
         except Exception as exc:
-            messagebox.showerror("Open folder failed", str(exc), parent=self)
+            messagebox.showerror(t("open_folder_failed"), str(exc), parent=self)
 
 
 
@@ -3059,7 +3086,7 @@ class RecorderApp:
 
         self.root = Tk()
         install_exception_hooks(self.root)
-        self.root.title("Douyin Live Recorder")
+        self.root.title(t("app_title"))
         self.root.geometry("1180x700")
         self.root.minsize(1040, 600)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
@@ -3092,41 +3119,41 @@ class RecorderApp:
         header = ttk.Frame(shell)
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="Douyin Live Recorder", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        self.status_label = ttk.Label(header, text="Ready", style="Subtle.TLabel")
+        ttk.Label(header, text=t("app_title"), style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        self.status_label = ttk.Label(header, text=t("ready"), style="Subtle.TLabel")
         self.status_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
-        self.session_status_var = StringVar(value="Douyin session: checking...")
+        self.session_status_var = StringVar(value=t("session_checking"))
         ttk.Label(header, textvariable=self.session_status_var, style="Subtle.TLabel").grid(row=2, column=0, sticky="w", pady=(2, 0))
         self.refresh_session_status()
 
         toolbar = ttk.Frame(shell)
         toolbar.grid(row=1, column=0, sticky="ew", pady=(16, 8))
-        ttk.Button(toolbar, text="Start Monitoring", command=self.start_monitoring).pack(side="left")
-        ttk.Button(toolbar, text="Stop", command=self.stop_monitoring).pack(side="left", padx=(8, 0))
-        ttk.Button(toolbar, text="Refresh Now", command=self.refresh_now).pack(side="left", padx=(8, 0))
+        ttk.Button(toolbar, text=t("start_monitoring"), command=self.start_monitoring).pack(side="left")
+        ttk.Button(toolbar, text=t("stop"), command=self.stop_monitoring).pack(side="left", padx=(8, 0))
+        ttk.Button(toolbar, text=t("refresh_now"), command=self.refresh_now).pack(side="left", padx=(8, 0))
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=12)
-        ttk.Button(toolbar, text="Download Media", command=self.download_media_now).pack(side="left")
-        ttk.Button(toolbar, text="Download Video", command=self.download_single_video).pack(side="left", padx=(8, 0))
-        ttk.Button(toolbar, text="Douyin Login", command=self.open_session_login).pack(side="left", padx=(8, 0))
-        ttk.Button(toolbar, text="Settings", command=self.open_settings).pack(side="left", padx=(8, 0))
-        ttk.Button(toolbar, text="Hide", command=self.hide_to_tray).pack(side="right")
+        ttk.Button(toolbar, text=t("download_media"), command=self.download_media_now).pack(side="left")
+        ttk.Button(toolbar, text=t("download_video"), command=self.download_single_video).pack(side="left", padx=(8, 0))
+        ttk.Button(toolbar, text=t("douyin_login"), command=self.open_session_login).pack(side="left", padx=(8, 0))
+        ttk.Button(toolbar, text=t("settings"), command=self.open_settings).pack(side="left", padx=(8, 0))
+        ttk.Button(toolbar, text=t("hide"), command=self.hide_to_tray).pack(side="right")
 
         profile_toolbar = ttk.Frame(shell)
         profile_toolbar.grid(row=2, column=0, sticky="ew", pady=(0, 12))
-        ttk.Button(profile_toolbar, text="Add Profile", command=self.add_profile).pack(side="left")
-        ttk.Button(profile_toolbar, text="Edit", command=self.edit_profile).pack(side="left", padx=(8, 0))
-        ttk.Button(profile_toolbar, text="Remove", command=self.remove_profile).pack(side="left", padx=(8, 0))
+        ttk.Button(profile_toolbar, text=t("add_profile"), command=self.add_profile).pack(side="left")
+        ttk.Button(profile_toolbar, text=t("edit"), command=self.edit_profile).pack(side="left", padx=(8, 0))
+        ttk.Button(profile_toolbar, text=t("remove"), command=self.remove_profile).pack(side="left", padx=(8, 0))
         ttk.Separator(profile_toolbar, orient="vertical").pack(side="left", fill="y", padx=12)
-        ttk.Button(profile_toolbar, text="Open Folder", command=self.open_folder).pack(side="left")
+        ttk.Button(profile_toolbar, text=t("open_folder"), command=self.open_folder).pack(side="left")
 
         columns = PROFILE_TABLE_COLUMNS
         headings = {
-            "enabled": "On",
-            "name": "Profile",
-            "status": "Live",
-            "media_auto": "Media Auto",
-            "media_progress": "Media Progress",
-            "next_check": "Next Check",
+            "enabled": t("col_on"),
+            "name": t("col_profile"),
+            "status": t("col_live"),
+            "media_auto": t("col_media_auto"),
+            "media_progress": t("col_media_progress"),
+            "next_check": t("col_next_check"),
         }
         widths = {
             "enabled": 44,
@@ -3155,9 +3182,9 @@ class RecorderApp:
         self.tree.configure(yscrollcommand=y_scroll.set)
         y_scroll.grid(row=0, column=1, sticky="ns")
 
-        log_frame = ttk.LabelFrame(shell, text="Activity")
+        log_frame = ttk.LabelFrame(shell, text=t("activity"))
         log_frame.grid(row=4, column=0, sticky="ew", pady=(14, 0))
-        self.activity = ttk.Label(log_frame, text="No recent activity.", anchor="w")
+        self.activity = ttk.Label(log_frame, text=t("no_activity"), anchor="w")
         self.activity.pack(fill="x", padx=10, pady=10)
 
     def _start_tray(self):
@@ -3169,14 +3196,14 @@ class RecorderApp:
             draw.ellipse((14, 14, 50, 50), fill="#e11d48")
             draw.polygon([(29, 24), (29, 40), (43, 32)], fill="white")
             menu = pystray.Menu(
-                pystray.MenuItem("Show window", lambda: self.root.after(0, self.show_window), default=True),
-                pystray.MenuItem("Start Monitoring", lambda: self.root.after(0, self.start_monitoring)),
-                pystray.MenuItem("Stop Monitoring", lambda: self.root.after(0, self.stop_monitoring)),
-                pystray.MenuItem("Refresh Now", lambda: self.root.after(0, self.refresh_now)),
-                pystray.MenuItem("Open Download Folder", lambda: self.root.after(0, self.open_root_folder)),
-                pystray.MenuItem("Exit (stop app)", lambda: self.root.after(0, self.exit_app)),
+                pystray.MenuItem(t("tray_show"), lambda: self.root.after(0, self.show_window), default=True),
+                pystray.MenuItem(t("tray_start"), lambda: self.root.after(0, self.start_monitoring)),
+                pystray.MenuItem(t("tray_stop"), lambda: self.root.after(0, self.stop_monitoring)),
+                pystray.MenuItem(t("tray_refresh"), lambda: self.root.after(0, self.refresh_now)),
+                pystray.MenuItem(t("tray_open_folder"), lambda: self.root.after(0, self.open_root_folder)),
+                pystray.MenuItem(t("tray_exit"), lambda: self.root.after(0, self.exit_app)),
             )
-            self.tray_icon = pystray.Icon("live-recorder", image, "Douyin Live Recorder", menu)
+            self.tray_icon = pystray.Icon("live-recorder", image, t("app_title"), menu)
 
             def setup_icon(icon):
                 try:
@@ -3225,24 +3252,37 @@ class RecorderApp:
             row = self.rows.get(profile["id"], {})
             media_modes = []
             if profile.get("auto_download_videos"):
-                media_modes.append("Works")
+                media_modes.append(t("works"))
             if profile.get("auto_download_stories"):
-                media_modes.append("Stories")
-            live_status = row.get("status", "Ready")
+                media_modes.append(t("stories"))
+            live_status = row.get("status", t("ready"))
+            live_status = {
+                "Recording": t("recording"),
+                "Ready": t("ready"),
+                "Live": t("live"),
+                "Offline": t("offline"),
+                "Disabled": t("disabled"),
+                "Error": t("error"),
+                "Captcha": t("captcha"),
+                "Rate limited": t("rate_limited"),
+                "Not visible": t("not_visible"),
+                "Unsupported stream": t("unsupported_stream"),
+                "Empty response": t("empty_response"),
+            }.get(live_status, live_status)
             if row.get("recording"):
-                recording_details = ["Recording"]
+                recording_details = [t("recording")]
                 if row.get("elapsed"):
                     recording_details.append(row["elapsed"])
                 if row.get("file_size"):
                     recording_details.append(row["file_size"])
                 live_status = " • ".join(recording_details)
             profile_name = f"★ {profile['name']}" if profile.get("priority") else profile["name"]
-            media_auto = " + ".join(media_modes) if media_modes else "Off"
+            media_auto = " + ".join(media_modes) if media_modes else t("off")
             media_progress = row.get("media_progress") or row.get("media_status")
             if not media_progress:
-                media_progress = "Waiting" if media_modes else "—"
+                media_progress = t("waiting") if media_modes else "—"
             values = (
-                "Yes" if profile.get("enabled", True) else "No",
+                t("yes") if profile.get("enabled", True) else t("no"),
                 profile_name,
                 live_status,
                 media_auto,
@@ -3289,7 +3329,7 @@ class RecorderApp:
 
     def stop_monitoring(self):
         if any(p.poll() is None for p in list(self.engine.processes.values())):  # FIX-L15: snapshot to avoid RuntimeError
-            if not messagebox.askyesno("Stop recordings?", "Active recordings will be stopped. Continue?"):
+            if not messagebox.askyesno(t("stop_recordings_title"), t("stop_recordings_body")):
                 return
         self.media_engine.stop()
         self.engine.stop(terminate_recordings=True)
@@ -3305,7 +3345,7 @@ class RecorderApp:
     def edit_profile(self):
         profile = self.selected_profile()
         if not profile:
-            messagebox.showinfo("Select profile", "Select a profile to edit.")
+            messagebox.showinfo(t("select_profile"), t("select_profile_edit"))
             return
         dialog = ProfileDialog(self.root, self.store, profile)
         self.root.wait_window(dialog)
@@ -3317,12 +3357,12 @@ class RecorderApp:
     def remove_profile(self):
         profile = self.selected_profile()
         if not profile:
-            messagebox.showinfo("Select profile", "Select a profile to remove.")
+            messagebox.showinfo(t("select_profile"), t("select_profile_remove"))
             return
         if self.engine._is_recording(profile["id"]):
-            messagebox.showerror("Recording active", "Stop monitoring before removing this profile.")
+            messagebox.showerror(t("recording_active"), t("stop_before_remove"))
             return
-        if messagebox.askyesno("Remove profile", f"Remove {profile['name']} from monitoring? Existing recordings stay on disk."):
+        if messagebox.askyesno(t("remove_profile_title"), t("remove_profile_body", name=profile["name"])):
             self.store.remove_profile(profile["id"])
             self.rows.pop(profile["id"], None)
             self.refresh_profiles()
@@ -3341,10 +3381,10 @@ class RecorderApp:
     def refresh_session_status(self):
         info = saved_session_info()
         if info.get("logged_in"):
-            imported_at = info.get("imported_at") or "saved"
-            self.session_status_var.set(f"Douyin session: saved (imported {imported_at})")
+            imported_at = info.get("imported_at") or t("unknown_time")
+            self.session_status_var.set(t("session_saved", imported_at=imported_at))
         else:
-            self.session_status_var.set("Douyin session: optional fallback for restricted works")
+            self.session_status_var.set(t("session_optional"))
 
     def open_session_login(self):
         dialog = DouyinSessionDialog(self.root, on_change=self.refresh_session_status)
@@ -3354,15 +3394,15 @@ class RecorderApp:
     def download_media_now(self):
         profile = self.selected_profile()
         if not profile:
-            messagebox.showinfo("Select profile", "Select a Douyin profile first.")
+            messagebox.showinfo(t("select_profile"), t("select_profile_media"))
             return
         if profile.get("platform") != "douyin" and detect_platform(profile.get("url", "")) != "douyin":
-            messagebox.showinfo("Douyin only", "Media download is currently available for Douyin profiles.")
+            messagebox.showinfo(t("douyin_only"), t("media_douyin_only"))
             return
         if not profile.get("auto_download_videos"):
             messagebox.showinfo(
-                "Media options disabled",
-                "Edit this profile and enable automatic posted-work downloads first.",
+                t("media_disabled"),
+                t("media_disabled_body"),
             )
             return
         self.media_engine.refresh_profile(profile["id"])
@@ -3389,7 +3429,7 @@ class RecorderApp:
         """Send a Windows toast notification via the tray icon (best-effort)."""
         if self.tray_icon:
             try:
-                self.tray_icon.notify(message, "Douyin Live Recorder")
+                self.tray_icon.notify(message, t("app_title"))
             except Exception:
                 pass
 
@@ -3401,8 +3441,8 @@ class RecorderApp:
                 try:
                     self.tray_icon.visible = True
                     self.tray_icon.notify(
-                        "Douyin Live Recorder is still running in the tray.",
-                        "Douyin Live Recorder",
+                        t("tray_hidden"),
+                        t("app_title"),
                     )
                 except Exception:
                     # notify() is best-effort; some Windows builds reject balloon tips.
@@ -3431,7 +3471,7 @@ class RecorderApp:
 
     def exit_app(self):
         if any(p.poll() is None for p in list(self.engine.processes.values())):  # FIX-L15: snapshot to avoid RuntimeError
-            if not messagebox.askyesno("Exit", "Active recordings will be stopped. Exit anyway?"):
+            if not messagebox.askyesno(t("exit_title"), t("exit_body")):
                 return
         logging.info("Exit requested; stopping engines.")
         self.media_engine.stop()

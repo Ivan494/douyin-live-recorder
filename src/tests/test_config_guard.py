@@ -61,6 +61,7 @@ class ConfigGuardTest(unittest.TestCase):
         data = json.loads(settings_path.read_text(encoding="utf-8"))
         self.assertFalse(data.get("start_with_windows"))
         self.assertEqual("mkv", data.get("container"))
+        self.assertEqual("zh-CN", data.get("language"))
 
     def test_shipped_profiles_are_empty(self):
         profiles_path = Path(__file__).resolve().parents[1] / "profiles.json"

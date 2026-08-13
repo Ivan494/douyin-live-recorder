@@ -55,6 +55,7 @@ class ReliabilityTest(unittest.TestCase):
 
         self.assertFalse(settings["start_with_windows"])
         self.assertEqual("mkv", settings["container"])
+        self.assertEqual("zh-CN", settings["language"])
 
     def test_pid_probe_uses_process_identity(self):
         self.assertTrue(app.pid_is_running(os.getpid()))
@@ -415,6 +416,9 @@ class ReliabilityTest(unittest.TestCase):
             recorder.root.destroy()
 
     def test_media_progress_text_covers_scan_transfer_and_retry(self):
+        from i18n import set_language
+
+        set_language("en")
         self.assertEqual(
             "Scanning history • 3 pages • 54 found",
             app.media_progress_text({"phase": "scanning", "pages": 3, "found": 54}),
@@ -447,6 +451,9 @@ class ReliabilityTest(unittest.TestCase):
         )
 
     def test_media_summary_does_not_claim_antibot_or_session_health(self):
+        from i18n import set_language
+
+        set_language("en")
         summary = {"videos": {"status": "api_empty"}}
 
         message = app.MediaDownloadEngine.summarize_kind(summary, "videos")
@@ -456,6 +463,9 @@ class ReliabilityTest(unittest.TestCase):
         self.assertNotIn("session ok", message.lower())
 
     def test_media_summary_surfaces_mobile_only_story(self):
+        from i18n import set_language
+
+        set_language("en")
         summary = {"stories": {"status": "mobile_only"}}
 
         self.assertEqual(

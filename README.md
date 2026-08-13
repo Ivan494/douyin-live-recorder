@@ -14,6 +14,7 @@ Unzip anywhere and run `DouyinLiveRecorder.exe`. Python and ffmpeg are
 bundled; nothing else to install.
 
 The app does **not** start with Windows unless you turn that on in Settings.
+The interface defaults to Simplified Chinese; switch to English in Settings.
 
 ## Features
 
@@ -106,6 +107,7 @@ Cookie），因此不会把你已经打开的抖音网页挤下线。
 `DouyinLiveRecorder.exe`。已内置 Python 和 ffmpeg，不用再装别的。
 
 默认**不会**开机自启。若需要，在设置里打开即可。
+界面默认简体中文，可在设置里改成 English。
 
 ## 功能
 
