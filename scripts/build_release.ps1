@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$Version = $Version.TrimStart("vV")
 
 $root = Split-Path -Parent $PSScriptRoot
 $src = Join-Path $root "src"

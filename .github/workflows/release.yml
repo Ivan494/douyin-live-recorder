@@ -39,14 +39,17 @@ jobs:
 
       - name: Build release zip
         shell: pwsh
-        run: ./scripts/build_release.ps1 -Version "${{ github.ref_name }}" -FfmpegDir tools
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v',''
+          ./scripts/build_release.ps1 -Version $ver -FfmpegDir tools
 
       - name: Publish release
         shell: pwsh
         run: |
+          $ver = "${{ github.ref_name }}" -replace '^v',''
           gh release create "${{ github.ref_name }}" `
-            --title "Douyin Live Recorder ${{ github.ref_name }}" `
-            --notes "Standalone Windows build. Unzip and run DouyinLiveRecorder.exe — ffmpeg included, no Python needed." `
-            "dist/DouyinLiveRecorder-${{ github.ref_name }}-win64.zip"
+            --title "Douyin Live Recorder v$ver" `
+            --notes "Standalone Windows build. Unzip and run DouyinLiveRecorder.exe. ffmpeg is included; no Python install needed." `
+            "dist/DouyinLiveRecorder-v$ver-win64.zip"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
