@@ -1,0 +1,9 @@
+httpx>=0.27
+requests>=2.31
+Pillow>=10.0
+pystray>=0.19
+streamget>=4.0
+h2>=4.1
+
+# dev / tests
+pytest>=8.0

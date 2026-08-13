@@ -1,0 +1,14 @@
+{
+  "profile_url": "",
+  "streamer_name": "",
+  "output_dir": "${DOWNLOAD_ROOT}\\recordings",
+  "ffmpeg_path": "${TOOLS_DIR}\\ffmpeg.exe",
+  "poll_interval_seconds": 60,
+  "container": "mkv",
+  "quality": "OD",
+  "stream_orientation": 1,
+  "proxy_addr": null,
+  "cookies": null,
+  "log_file": "${DOWNLOAD_ROOT}\\logs\\watcher.log",
+  "lock_file": "${DOWNLOAD_ROOT}\\watcher.lock"
+}

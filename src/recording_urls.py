@@ -1,0 +1,86 @@
+from urllib.parse import urlparse
+
+# Microseconds. FFmpeg aborts a hung read after this window.
+DEFAULT_RW_TIMEOUT_US = 30_000_000
+# Seconds. Cap backoff while retrying a dropped live pull.
+DEFAULT_RECONNECT_DELAY_MAX = 30
+
+
+def _text_attr(stream, name):
+    value = getattr(stream, name, "")
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _url_path(url):
+    return urlparse(url).path.lower()
+
+
+def _url_kind(url):
+    path = _url_path(url)
+    if path.endswith(".flv"):
+        return "flv"
+    if path.endswith(".m3u8"):
+        return "hls"
+    return "direct"
+
+
+def recording_input_url(stream):
+    flv_url = _text_attr(stream, "flv_url")
+    if flv_url:
+        return flv_url, "flv"
+
+    record_url = _text_attr(stream, "record_url")
+    if record_url:
+        return record_url, _url_kind(record_url)
+
+    m3u8_url = _text_attr(stream, "m3u8_url")
+    if m3u8_url:
+        return m3u8_url, "hls"
+
+    return "", ""
+
+
+def has_recording_url(stream):
+    url, _kind = recording_input_url(stream)
+    return bool(url)
+
+
+def recording_extension(input_url, default_container):
+    default_extension = str(default_container or "flv").lstrip(".") or "flv"
+    return default_extension
+
+
+def ffmpeg_live_input_options(
+    input_url,
+    *,
+    rw_timeout_us=DEFAULT_RW_TIMEOUT_US,
+    reconnect_delay_max=DEFAULT_RECONNECT_DELAY_MAX,
+):
+    """Input-side FFmpeg flags for live HTTP pulls.
+
+    Enables reconnect for transient CDN/socket drops so one recording process
+    can survive brief disconnects instead of exiting and opening a new file.
+
+    Intentionally omits ``-reconnect_at_eof``: a true stream end should still
+    make FFmpeg exit so the app can re-resolve the room and mark offline.
+    """
+    options = [
+        "-rw_timeout",
+        str(int(rw_timeout_us)),
+        "-fflags",
+        "+discardcorrupt+genpts",
+    ]
+    if str(input_url or "").lower().startswith(("http://", "https://")):
+        options.extend(
+            [
+                "-reconnect",
+                "1",
+                "-reconnect_streamed",
+                "1",
+                "-reconnect_delay_max",
+                str(int(reconnect_delay_max)),
+            ]
+        )
+    return options
