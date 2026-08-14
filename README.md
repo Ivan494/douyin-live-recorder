@@ -25,6 +25,7 @@ Cookie），因此不会把你已经打开的抖音网页挤下线。
 ## 功能
 
 - 直播录制成 MKV 分段，自动重连、卡顿检测
+- 每个资料可单独关闭直播录制，只自动下载作品和日常
 - 多账号并行，每个资料有独立的轮询间隔、清晰度和保存目录
 - 作品和日常走移动端接口（X-Gorgon 签名）
 - 纯 Python 签名（X-Bogus / Gorgon），盯直播不用开浏览器
@@ -86,7 +87,7 @@ python -m pytest src/tests
 
 ```text
 pip install -r requirements.txt pyinstaller
-pwsh ./scripts/build_release.ps1 -Version 1.0.1 -FfmpegDir <含 ffmpeg.exe 的目录>
+pwsh ./scripts/build_release.ps1 -Version 1.1.0 -FfmpegDir <含 ffmpeg.exe 的目录>
 ```
 
 推送 `v*` 标签会在 GitHub Actions 上走同样的打包流程。
@@ -124,6 +125,7 @@ The interface defaults to Simplified Chinese; switch to English in Settings.
 ## Features
 
 - Live recording to MKV segments with auto-reconnect and stall detection
+- Optional per-profile live recording so works/stories can download without monitoring live streams
 - Multiple profiles, each with its own interval, quality, and output folder
 - Posted works and stories via the mobile API (X-Gorgon signed)
 - Pure-Python request signing (X-Bogus / Gorgon) — no browser required for
@@ -188,7 +190,7 @@ python -m pytest src/tests
 
 ```text
 pip install -r requirements.txt pyinstaller
-pwsh ./scripts/build_release.ps1 -Version 1.0.1 -FfmpegDir <folder-with-ffmpeg.exe>
+pwsh ./scripts/build_release.ps1 -Version 1.1.0 -FfmpegDir <folder-with-ffmpeg.exe>
 ```
 
 Pushing a `v*` tag runs the same packaging on GitHub Actions.
