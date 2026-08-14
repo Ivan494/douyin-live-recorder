@@ -489,9 +489,67 @@ class ReliabilityTest(unittest.TestCase):
         store.normalize()
 
         self.assertTrue(store.profiles[0]["auto_download_stories"])
+        self.assertTrue(store.profiles[0]["record_live"])
+
+    def test_profile_normalization_preserves_live_recording_off(self):
+        store = object.__new__(app.RecorderStore)
+        store.settings = app.default_settings()
+        store.profiles = [{
+            "name": "Media only",
+            "url": "https://www.douyin.com/user/MS4wLjABAAAAtest",
+            "record_live": False,
+            "auto_download_videos": True,
+        }]
+
+        store.normalize()
+
+        self.assertFalse(store.profiles[0]["record_live"])
+        self.assertTrue(store.profiles[0]["auto_download_videos"])
+
+    def test_wants_live_recording_defaults_on_and_respects_toggles(self):
+        self.assertTrue(app.wants_live_recording({}))
+        self.assertTrue(app.wants_live_recording({"enabled": True}))
+        self.assertTrue(app.wants_live_recording({"enabled": True, "record_live": True}))
+        self.assertFalse(app.wants_live_recording({"enabled": True, "record_live": False}))
+        self.assertFalse(app.wants_live_recording({"enabled": False, "record_live": True}))
+        self.assertFalse(app.wants_live_recording(None))
+
+    def test_live_monitor_skips_probe_when_record_live_is_off(self):
+        store = FakeStore()
+        store.profiles = [{
+            "id": "p1",
+            "name": "Media only",
+            "url": "https://live.douyin.com/123456",
+            "enabled": True,
+            "record_live": False,
+            "poll_interval_seconds": 15,
+        }]
+        events = app.queue.Queue()
+        engine = app.MonitorEngine(store, events)
+
+        def stop_after_first_wait(_timeout=None):
+            engine.stop_event.set()
+            return False
+
+        with patch.object(engine, "_check_profile") as check, patch.object(
+            engine, "_poll_processes"
+        ), patch.object(engine.wake_event, "wait", side_effect=stop_after_first_wait):
+            engine._run()
+
+        check.assert_not_called()
+        statuses = [
+            event.get("state", {}).get("status")
+            for event in list(events.queue)
+            if event.get("profile_id") == "p1"
+        ]
+        self.assertIn("Live off", statuses)
 
     def test_media_worker_runs_story_only_profiles(self):
         self.assertTrue(app.MediaDownloadEngine.enabled_for_profile({"auto_download_stories": True}))
+        self.assertTrue(app.MediaDownloadEngine.enabled_for_profile({
+            "record_live": False,
+            "auto_download_videos": True,
+        }))
 
 
 class ProfileResolverTest(unittest.TestCase):

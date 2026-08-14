@@ -73,6 +73,13 @@ PROFILE_TABLE_COLUMNS = (
 )
 
 
+def wants_live_recording(profile):
+    """Probe and record live streams only when the profile and live toggle are on."""
+    if not isinstance(profile, dict):
+        return False
+    return bool(profile.get("enabled", True)) and bool(profile.get("record_live", True))
+
+
 def startup_dir():
     appdata = os.environ.get("APPDATA")
     if not appdata:
@@ -895,6 +902,7 @@ class RecorderStore:
             existing_interval = self.settings.get("poll_interval_seconds", DEFAULT_NEW_PROFILE_INTERVAL)
             profile.setdefault("id", str(uuid.uuid4()))
             profile.setdefault("enabled", True)
+            profile.setdefault("record_live", True)
             profile.setdefault("name", "Live Profile")
             profile.setdefault("url", "")
             profile.setdefault("platform", detect_platform(profile.get("url", "")))
@@ -977,6 +985,7 @@ class MonitorEngine:
         if self.store.settings.get("adopt_existing_ffmpeg", True):
             self.adopt_existing_ffmpeg()
         self.recover_pending_recording_sessions()
+        self._stop_unwanted_live_recordings()
         self.thread = threading.Thread(target=self._run, name="live-monitor", daemon=True)
         self.thread.start()
         self.emit("engine", t("monitoring_started"))
@@ -1018,6 +1027,48 @@ class MonitorEngine:
                 if profile_id not in self.processes:
                     self._finalize_recording_session(profile_id, "Recorder stopped")
         self.emit("engine", t("monitoring_stopping"))
+
+    def stop_profile_recording(self, profile_id, reason="Live recording disabled"):
+        process = self.processes.get(profile_id)
+        if process is not None and process.poll() is None:
+            self.emit(profile_id, reason)
+            recording = self.recordings.get(profile_id) or {}
+            recording["finalize_on_exit"] = True
+            recording["stop_reason"] = reason
+            try:
+                process.terminate()
+            except Exception:
+                logging.exception("Failed to stop recording for %s", profile_id)
+            deadline = time.time() + 5
+            while time.time() < deadline and process.poll() is None:
+                time.sleep(0.05)
+            if process.poll() is None:
+                logging.warning(
+                    "Force-killing unresponsive FFmpeg for %s (PID %s)",
+                    profile_id,
+                    getattr(process, "pid", "?"),
+                )
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", str(process.pid), "/T"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=10,
+                        **hidden_subprocess_kwargs(),
+                    )
+                except Exception:
+                    logging.exception("Failed to force-kill FFmpeg for %s", profile_id)
+        self._poll_processes()
+        if profile_id in self.recordings and profile_id not in self.processes:
+            self._finalize_recording_session(profile_id, reason)
+
+    def _stop_unwanted_live_recordings(self):
+        for profile in list(self.store.profiles):
+            if wants_live_recording(profile):
+                continue
+            profile_id = profile["id"]
+            if self._is_recording(profile_id) or self._has_recording_session(profile_id):
+                self.stop_profile_recording(profile_id, t("live_recording_off_detail"))
 
     def refresh_all(self):
         for profile in list(self.store.profiles):
@@ -1415,6 +1466,19 @@ class MonitorEngine:
                         recording=False,
                         cooldown="Disabled",
                         next_check=future_text(wait_seconds),
+                    )
+                    self.next_check[profile_id] = time.monotonic() + wait_seconds
+                    continue
+                if not profile.get("record_live", True):
+                    if self._is_recording(profile_id) or self._has_recording_session(profile_id):
+                        self.stop_profile_recording(profile_id, t("live_recording_off_detail"))
+                    wait_seconds = self.interval_seconds(profile)
+                    self.emit(
+                        profile_id,
+                        t("live_recording_off_detail"),
+                        status="Live off",
+                        recording=False,
+                        cooldown=t("live_recording_off"),
                     )
                     self.next_check[profile_id] = time.monotonic() + wait_seconds
                     continue
@@ -2488,6 +2552,7 @@ class ProfileDialog(Toplevel):
             ))
         )
         self.enabled_var = BooleanVar(value=self.profile.get("enabled", True))
+        self.record_live_var = BooleanVar(value=self.profile.get("record_live", True))
         self.priority_var = BooleanVar(value=self.profile.get("priority", False))
         self.auto_videos_var = BooleanVar(value=self.profile.get("auto_download_videos", False))
         self.auto_stories_var = BooleanVar(value=self.profile.get("auto_download_stories", False))
@@ -2529,16 +2594,17 @@ class ProfileDialog(Toplevel):
 
         ttk.Checkbutton(frame, text=t("priority"), variable=self.priority_var).grid(row=6, column=1, sticky="w", pady=6)
         ttk.Checkbutton(frame, text=t("enabled"), variable=self.enabled_var).grid(row=7, column=1, sticky="w", pady=6)
-        ttk.Checkbutton(frame, text=t("auto_works"), variable=self.auto_videos_var).grid(row=8, column=1, sticky="w", pady=6)
-        ttk.Checkbutton(frame, text=t("auto_stories"), variable=self.auto_stories_var).grid(row=9, column=1, sticky="w", pady=6)
-        ttk.Label(frame, text=t("media_check_every")).grid(row=10, column=0, sticky="w", pady=6)
+        ttk.Checkbutton(frame, text=t("record_live"), variable=self.record_live_var).grid(row=8, column=1, sticky="w", pady=6)
+        ttk.Checkbutton(frame, text=t("auto_works"), variable=self.auto_videos_var).grid(row=9, column=1, sticky="w", pady=6)
+        ttk.Checkbutton(frame, text=t("auto_stories"), variable=self.auto_stories_var).grid(row=10, column=1, sticky="w", pady=6)
+        ttk.Label(frame, text=t("media_check_every")).grid(row=11, column=0, sticky="w", pady=6)
         media_interval_row = ttk.Frame(frame)
-        media_interval_row.grid(row=10, column=1, sticky="w", pady=6)
+        media_interval_row.grid(row=11, column=1, sticky="w", pady=6)
         ttk.Entry(media_interval_row, textvariable=self.media_interval_var, width=10).pack(side="left")
         ttk.Label(media_interval_row, text=t("seconds")).pack(side="left", padx=(8, 0))
 
         actions = ttk.Frame(frame)
-        actions.grid(row=10, column=0, columnspan=2, sticky="e", pady=(24, 0))
+        actions.grid(row=12, column=0, columnspan=2, sticky="e", pady=(24, 0))
         ttk.Button(actions, text=t("cancel"), command=self.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(actions, text=t("save"), command=self.save).pack(side="right")
         self.resolve_after_id = self.after(100, self.process_resolve_results)
@@ -2666,6 +2732,7 @@ class ProfileDialog(Toplevel):
         self.result = {
             "id": self.profile.get("id", str(uuid.uuid4())),
             "enabled": self.enabled_var.get(),
+            "record_live": self.record_live_var.get(),
             "priority": self.priority_var.get(),
             "name": name,
             "url": url,
@@ -3262,6 +3329,7 @@ class RecorderApp:
                 "Live": t("live"),
                 "Offline": t("offline"),
                 "Disabled": t("disabled"),
+                "Live off": t("live_recording_off"),
                 "Error": t("error"),
                 "Captcha": t("captcha"),
                 "Rate limited": t("rate_limited"),
@@ -3276,18 +3344,23 @@ class RecorderApp:
                 if row.get("file_size"):
                     recording_details.append(row["file_size"])
                 live_status = " • ".join(recording_details)
+            if not profile.get("record_live", True) and not row.get("recording"):
+                live_status = t("live_recording_off")
             profile_name = f"★ {profile['name']}" if profile.get("priority") else profile["name"]
             media_auto = " + ".join(media_modes) if media_modes else t("off")
             media_progress = row.get("media_progress") or row.get("media_status")
             if not media_progress:
                 media_progress = t("waiting") if media_modes else "—"
+            next_check = row.get("next_check", "")
+            if not profile.get("record_live", True):
+                next_check = row.get("media_next_check") or next_check
             values = (
                 t("yes") if profile.get("enabled", True) else t("no"),
                 profile_name,
                 live_status,
                 media_auto,
                 media_progress,
-                row.get("next_check", ""),
+                next_check,
             )
             if profile["id"] in existing:
                 self.tree.item(profile["id"], values=values)
@@ -3340,6 +3413,8 @@ class RecorderApp:
         if dialog.result:
             self.store.upsert_profile(dialog.result)
             Path(dialog.result["output_dir"]).mkdir(parents=True, exist_ok=True)
+            self.engine.wake_event.set()
+            self.media_engine.wake_event.set()
             self.refresh_profiles()
 
     def edit_profile(self):
@@ -3352,6 +3427,10 @@ class RecorderApp:
         if dialog.result:
             self.store.upsert_profile(dialog.result)
             Path(dialog.result["output_dir"]).mkdir(parents=True, exist_ok=True)
+            if not wants_live_recording(dialog.result):
+                self.engine.stop_profile_recording(dialog.result["id"], t("live_recording_off_detail"))
+            self.engine.wake_event.set()
+            self.media_engine.wake_event.set()
             self.refresh_profiles()
 
     def remove_profile(self):
@@ -3503,7 +3582,7 @@ def run_check():
     events = queue.Queue()
     engine = MonitorEngine(store, events)
     for profile in store.profiles:
-        if profile.get("enabled", True):
+        if wants_live_recording(profile):
             engine._check_profile(profile)
     while not events.empty():
         event = events.get()

@@ -24,6 +24,7 @@ class ProfileDialogTest(unittest.TestCase):
             profile = {
                 "id": "test-profile",
                 "enabled": True,
+                "record_live": False,
                 "priority": False,
                 "name": "Test Profile",
                 "url": "https://live.douyin.com/123456",
@@ -47,6 +48,7 @@ class ProfileDialogTest(unittest.TestCase):
                 root.destroy()
 
         self.assertEqual(profile_url, result["original_profile_url"])
+        self.assertFalse(result["record_live"])
         self.assertTrue(result["auto_download_videos"])
         self.assertTrue(result["auto_download_stories"])
         self.assertEqual(300, result["media_poll_interval_seconds"])
