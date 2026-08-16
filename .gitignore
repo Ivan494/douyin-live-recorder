@@ -27,3 +27,7 @@ env/
 # Local session / secrets — never commit
 src/douyin_session.json
 **/douyin_session.json
+src/mobile_session.json
+**/mobile_session.json
+src/mobile_device.json
+**/mobile_device.json

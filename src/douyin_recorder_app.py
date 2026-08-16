@@ -2761,7 +2761,7 @@ class DouyinSessionDialog(Toplevel):
         self.auto_poll = False
         self.cdp_url = ""
         self.title(t("session_title"))
-        self.geometry("650x310")
+        self.geometry("650x340")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()

@@ -29,7 +29,7 @@ Cookie），因此不会把你已经打开的抖音网页挤下线。
 - 多账号并行，每个资料有独立的轮询间隔、清晰度和保存目录
 - 作品和日常走移动端接口（X-Gorgon 签名）
 - 纯 Python 签名（X-Bogus / Gorgon），盯直播不用开浏览器
-- 可选导入 Chrome 登录态（本机 DPAPI 加密，不要提交到 git）
+- 可选抖音 App 登录（扫码后保存为 App 会话，本机 DPAPI 加密，不要提交到 git）
 - 支持托盘的图形界面
 
 ## 演示效果
@@ -59,6 +59,8 @@ python src/douyin_recorder_app.py
 | `src/settings.json` | 软件默认设置。开机自启默认关闭。 |
 | `src/config.json` | 可选命令行值守脚本的模板。 |
 | `src/douyin_session.json` | 本机加密登录态。已加入 .gitignore，不要提交。 |
+| `src/mobile_session.json` | App 会话 Cookie。已加入 .gitignore，不要提交。 |
+| `src/mobile_device.json` | 本机绑定的设备标识。已加入 .gitignore，不要提交。 |
 
 路径占位符：
 
@@ -70,8 +72,9 @@ python src/douyin_recorder_app.py
 
 ### 日常
 
-日常走移动端作品接口（`/aweme/v1/aweme/post/`），需要已保存的抖音登录态
-（界面里的 **Session**）或资料里的 Cookie。勾选 **自动下载日常**，或：
+日常走移动端接口：优先 `/aweme/v1/story/profile/list/`，并回退到作品列表和
+life/feed。需要已保存的抖音 App 登录（界面里的 **抖音 App 登录**）。
+勾选 **自动下载日常**，或：
 
 ```text
 python src/douyin_media_downloader.py --profile-url <用户主页> --stories --output-dir <目录>
@@ -87,7 +90,7 @@ python -m pytest src/tests
 
 ```text
 pip install -r requirements.txt pyinstaller
-pwsh ./scripts/build_release.ps1 -Version 1.1.0 -FfmpegDir <含 ffmpeg.exe 的目录>
+pwsh ./scripts/build_release.ps1 -Version 1.2.0 -FfmpegDir <含 ffmpeg.exe 的目录>
 ```
 
 推送 `v*` 标签会在 GitHub Actions 上走同样的打包流程。
@@ -130,7 +133,7 @@ The interface defaults to Simplified Chinese; switch to English in Settings.
 - Posted works and stories via the mobile API (X-Gorgon signed)
 - Pure-Python request signing (X-Bogus / Gorgon) — no browser required for
   live monitoring
-- Optional Chrome session import (DPAPI-encrypted, stored only on your machine)
+- Optional Douyin app login (QR scan saved as an app-capable session; DPAPI-encrypted, local only)
 - Tray-capable GUI
 
 ## Demo
@@ -161,6 +164,8 @@ present).
 | `src/settings.json` | App defaults. Autostart is off. |
 | `src/config.json` | Template for the optional CLI watcher. |
 | `src/douyin_session.json` | Local encrypted session. Gitignored. Do not commit. |
+| `src/mobile_session.json` | App session cookies. Gitignored. Do not commit. |
+| `src/mobile_device.json` | Bound device identity. Gitignored. Do not commit. |
 
 Path tokens:
 
@@ -172,9 +177,10 @@ own output directory, poll interval, quality, and download flags.
 
 ### Stories
 
-Stories go through the mobile post API (`/aweme/v1/aweme/post/`). That path
-needs a saved Douyin session (GUI **Session** dialog) or profile cookies.
-Enable **Auto-download stories** per profile, or:
+Stories use the mobile APIs, preferring `/aweme/v1/story/profile/list/` and
+falling back to the post list and life/feed. That needs a saved Douyin app
+login (GUI **Douyin App Login**). Enable **Auto-download stories** per
+profile, or:
 
 ```text
 python src/douyin_media_downloader.py --profile-url <user-url> --stories --output-dir <dir>
@@ -190,7 +196,7 @@ python -m pytest src/tests
 
 ```text
 pip install -r requirements.txt pyinstaller
-pwsh ./scripts/build_release.ps1 -Version 1.1.0 -FfmpegDir <folder-with-ffmpeg.exe>
+pwsh ./scripts/build_release.ps1 -Version 1.2.0 -FfmpegDir <folder-with-ffmpeg.exe>
 ```
 
 Pushing a `v*` tag runs the same packaging on GitHub Actions.

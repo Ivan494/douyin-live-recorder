@@ -70,6 +70,35 @@ class MediaDownloaderTest(unittest.TestCase):
         self.assertEqual("test-sec-user", fetch_browser.call_args.args[1])
         self.assertEqual("ok", summary["videos"]["status"])
 
+    def test_download_profile_prefers_app_login_mobile_posts(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = {
+                "id": "test",
+                "name": "Test",
+                "output_dir": temporary_directory,
+                "original_profile_url": "https://www.douyin.com/user/test-sec-user",
+                "cookies": "sessionid=secret",
+            }
+            posts = [{"aweme_id": "app-post", "desc": "from app"}]
+
+            with patch.object(media, "apply_saved_session", side_effect=AssertionError("must not mutate profile")), patch.object(
+                media, "_mobile_cookie_header", return_value="sessionid=secret"
+            ), patch.object(
+                media, "fetch_posts_via_mobile_api", return_value=posts
+            ) as fetch_mobile, patch.object(
+                media, "fetch_posts", side_effect=AssertionError("web post must not run after app login")
+            ), patch.object(
+                media, "fetch_posts_via_browser", side_effect=AssertionError("browser must not run after app login")
+            ), patch.object(
+                media, "download_aweme_items", return_value=media.MediaResult(status="ok", downloaded=1)
+            ):
+                summary = media.download_profile(profile, videos=True, stories=False)
+
+        fetch_mobile.assert_called_once()
+        self.assertEqual("test-sec-user", fetch_mobile.call_args.args[1])
+        self.assertEqual("sessionid=secret", fetch_mobile.call_args.kwargs["cookie_header"])
+        self.assertEqual("ok", summary["videos"]["status"])
+
     def test_available_cdp_port_zero_returns_assigned_port(self):
         port = media.available_cdp_port(0)
 
@@ -186,8 +215,18 @@ class MediaDownloaderTest(unittest.TestCase):
             ],
         }
 
-        with patch.object(media, "request_life_feed", return_value=(None, "life skipped")), patch.object(
+        with patch.object(media, "fetch_stories_via_mobile_post_api", return_value=(None, "no post stories")), patch.object(
+            media, "fetch_stories_via_mobile_story_feed", return_value=(None, "no feed")
+        ), patch.object(
+            media, "fetch_stories_via_mobile_life_feed", return_value=(None, "no life")
+        ), patch.object(
+            media, "fetch_stories_via_mobile_life_feed", return_value=(None, "no life")
+        ), patch.object(
+            media, "fetch_stories_via_browser", return_value=(None, "no browser")
+        ), patch.object(media, "request_life_feed", return_value=(None, "life skipped")), patch.object(
             media, "request_json", return_value=payload
+        ), patch.object(
+            media, "fetch_stories_via_emulator", return_value=(None, "no emu")
         ):
             items, source, supported = media.fetch_stories(object(), {}, target)
 
@@ -214,8 +253,16 @@ class MediaDownloaderTest(unittest.TestCase):
         }
         familiar_payload = {"status_code": 0, "data": []}
 
-        with patch.object(media, "request_life_feed", return_value=(life_payload, media.LIFE_FEED_PATH)), patch.object(
+        with patch.object(media, "fetch_stories_via_mobile_post_api", return_value=(None, "no post stories")), patch.object(
+            media, "fetch_stories_via_mobile_story_feed", return_value=(None, "no feed")
+        ), patch.object(
+            media, "fetch_stories_via_mobile_life_feed", return_value=(None, "no life")
+        ), patch.object(
+            media, "fetch_stories_via_browser", return_value=(None, "no browser")
+        ), patch.object(media, "request_life_feed", return_value=(life_payload, media.LIFE_FEED_PATH)), patch.object(
             media, "request_json", return_value=familiar_payload
+        ), patch.object(
+            media, "fetch_stories_via_emulator", return_value=(None, "no emu")
         ):
             items, source, supported = media.fetch_stories(object(), {"cookies": "x"}, target)
 
@@ -240,8 +287,16 @@ class MediaDownloaderTest(unittest.TestCase):
                 return moment_payload
             return {"status_code": 404}
 
-        with patch.object(media, "request_life_feed", return_value=(None, "life empty")), patch.object(
+        with patch.object(media, "fetch_stories_via_mobile_post_api", return_value=(None, "no post stories")), patch.object(
+            media, "fetch_stories_via_mobile_story_feed", return_value=(None, "no feed")
+        ), patch.object(
+            media, "fetch_stories_via_mobile_life_feed", return_value=(None, "no life")
+        ), patch.object(
+            media, "fetch_stories_via_browser", return_value=(None, "no browser")
+        ), patch.object(media, "request_life_feed", return_value=(None, "life empty")), patch.object(
             media, "request_json", side_effect=fake_request_json
+        ), patch.object(
+            media, "fetch_stories_via_emulator", return_value=(None, "no emu")
         ):
             items, source, supported = media.fetch_stories(object(), {}, target)
 
@@ -257,16 +312,234 @@ class MediaDownloaderTest(unittest.TestCase):
                 return {"status_code": 0, "user": {"story_tab_empty": False}}
             return {"status_code": 0, "data": []}
 
-        with patch.object(
+        with patch.object(media, "fetch_stories_via_mobile_post_api", return_value=(None, "no post stories")), patch.object(
+            media, "fetch_stories_via_mobile_story_feed", return_value=(None, "empty pack")
+        ), patch.object(
+            media, "fetch_stories_via_mobile_life_feed", return_value=(None, "no life")
+        ), patch.object(
+            media, "fetch_stories_via_browser", return_value=(None, "no browser")
+        ), patch.object(
             media,
             "request_life_feed",
             return_value=({"status_code": 0, "user_story_list": None}, "no active visible stories"),
-        ), patch.object(media, "request_json", side_effect=fake_request_json):
+        ), patch.object(media, "request_json", side_effect=fake_request_json), patch.object(
+            media, "fetch_stories_via_emulator", return_value=(None, "no emu")
+        ):
             items, source, supported = media.fetch_stories(object(), {"cookies": "x"}, target)
 
         self.assertEqual([], items)
         self.assertFalse(supported)
-        self.assertIn("mobile app", source.lower())
+        self.assertIn("no downloadable story media", source.lower())
+
+    def test_historical_image_notes_do_not_mask_active_story_ring(self):
+        target = "target-sec-uid"
+        old_note = {
+            "aweme_id": "old-image-note",
+            "aweme_type": 68,
+            "is_story": 0,
+            "is_25_story": 0,
+            "author": {"sec_uid": target},
+        }
+
+        def fake_request_json(_client, _profile, path, *_args, **_kwargs):
+            if path == "/aweme/v1/web/user/profile/other/":
+                return {"status_code": 0, "user": {"story_tab_empty": False}}
+            return {"status_code": 0, "data": []}
+
+        with patch.object(
+            media,
+            "fetch_stories_via_mobile_post_api",
+            return_value=([old_note], "https://aweme.snssdk.com/aweme/v1/aweme/post/ (mobile, 1 stories)"),
+        ), patch.object(
+            media, "fetch_stories_via_mobile_story_feed", return_value=(None, "empty pack")
+        ), patch.object(
+            media, "fetch_stories_via_mobile_life_feed", return_value=(None, "no life")
+        ), patch.object(
+            media, "fetch_stories_via_browser", return_value=(None, "no browser")
+        ), patch.object(
+            media,
+            "request_life_feed",
+            return_value=({"status_code": 0, "user_story_list": None}, "no active visible stories"),
+        ), patch.object(media, "request_json", side_effect=fake_request_json), patch.object(
+            media, "fetch_stories_via_emulator", return_value=(None, "no emu")
+        ):
+            items, source, supported = media.fetch_stories(object(), {"cookies": "x"}, target)
+
+        self.assertEqual([], items)
+        self.assertFalse(supported)
+        self.assertIn("no downloadable story media", source.lower())
+
+    def test_mobile_story_feed_is_used_before_web_fallbacks(self):
+        target = "target-sec-uid"
+        feed_items = [
+            {"aweme_id": "ring-story", "is_story": 1, "author": {"sec_uid": target}},
+        ]
+
+        with patch.object(media, "fetch_stories_via_mobile_post_api", return_value=(None, "no post stories")), patch.object(
+            media,
+            "fetch_stories_via_mobile_story_feed",
+            return_value=(feed_items, "https://aweme.snssdk.com/aweme/v1/story/feed/"),
+        ), patch.object(
+            media, "fetch_stories_via_browser", return_value=(None, "no browser")
+        ), patch.object(media, "request_life_feed", return_value=(None, "life skipped")), patch.object(
+            media, "request_json", return_value={"status_code": 0, "data": []}
+        ):
+            items, source, supported = media.fetch_stories(object(), {"cookies": "x"}, target)
+
+        self.assertTrue(supported)
+        self.assertIn("story/feed", source)
+        self.assertEqual(["ring-story"], [item["aweme_id"] for item in items])
+
+    def test_mobile_story_feed_tries_story25_profile_list(self):
+        payload = {
+            "status_code": 0,
+            "active_data": {
+                "data": [
+                    {"aweme_id": "story25-ring", "is_25_story": 1, "is_story": 1},
+                ]
+            },
+        }
+        response = MagicMock()
+        response.json.return_value = payload
+        seen = []
+
+        def fake_request(_client, method, path, extra, *_args, **_kwargs):
+            seen.append((path, dict(extra or {})))
+            if path == media.STORY_PROFILE_LIST_PATH:
+                return response
+            empty = MagicMock()
+            empty.json.return_value = {"status_code": 0, "data": None}
+            return empty
+
+        with patch.object(media, "_check_mobile_signer", return_value=True), patch.object(
+            media, "_mobile_signed_request", side_effect=fake_request
+        ), patch.object(media, "_persistent_mobile_device", return_value=("1" * 16, "2" * 16)), patch.object(
+            media, "_mobile_device_profile", return_value={"own_uid": "551"}
+        ):
+            items, source = media.fetch_stories_via_mobile_story_feed(
+                object(), "sec", user_id="4081005313657150", cookie_header="sid=1"
+            )
+
+        self.assertEqual(["story25-ring"], [item["aweme_id"] for item in items])
+        self.assertIn(media.STORY_PROFILE_LIST_PATH, source)
+        self.assertTrue(seen)
+        self.assertEqual(media.STORY_PROFILE_LIST_PATH, seen[0][0])
+        self.assertEqual("4081005313657150", seen[0][1].get("to_uid"))
+        self.assertEqual("7", seen[0][1].get("story_ttl"))
+
+    def test_story_feed_payload_unwraps_active_data(self):
+        payload = {
+            "status_code": 0,
+            "active_data": {
+                "data": [{"aweme_id": "from-active", "is_25_story": 1, "is_story": 1}],
+            },
+        }
+        items = media._story_items_from_feed_payload(payload)
+        self.assertEqual(["from-active"], [item["aweme_id"] for item in items])
+
+    def test_time_limited_type68_post_is_still_a_story(self):
+        target = "target-sec-uid"
+        story_note = {
+            "aweme_id": "daily-note",
+            "aweme_type": 68,
+            "is_25_story": 1,
+            "author": {"sec_uid": target},
+        }
+
+        with patch.object(
+            media,
+            "fetch_stories_via_mobile_post_api",
+            return_value=([story_note], "https://aweme.snssdk.com/aweme/v1/aweme/post/ (mobile, 1 stories)"),
+        ), patch.object(
+            media, "fetch_stories_via_mobile_story_feed", return_value=(None, "no feed")
+        ), patch.object(
+            media, "fetch_stories_via_mobile_life_feed", return_value=(None, "no life")
+        ), patch.object(
+            media, "fetch_stories_via_browser", return_value=(None, "no browser")
+        ):
+            items, source, supported = media.fetch_stories(object(), {"cookies": "x"}, target)
+
+        self.assertTrue(supported)
+        self.assertEqual(["daily-note"], [item["aweme_id"] for item in items])
+
+    def test_mobile_post_api_ignores_unmarked_image_notes(self):
+        payload = {
+            "status_code": 0,
+            "has_more": 0,
+            "max_cursor": 0,
+            "aweme_list": [
+                {"aweme_id": "image-note", "aweme_type": 68, "is_story": 0, "is_25_story": 0},
+                {"aweme_id": "daily", "aweme_type": 68, "is_25_story": 1},
+            ],
+        }
+        response = MagicMock()
+        response.json.return_value = payload
+
+        with patch.object(media, "_check_mobile_signer", return_value=True), patch.object(
+            media, "_mobile_signed_get", return_value=response
+        ):
+            items, source = media.fetch_stories_via_mobile_post_api(object(), "sec", cookie_header="sid=1")
+
+        self.assertEqual(["daily"], [item["aweme_id"] for item in items])
+        self.assertIn("1 stories", source)
+
+    def test_mobile_life_feed_is_used_when_story_feed_is_empty(self):
+        target = "target-sec-uid"
+        life_items = [
+            {"aweme_id": "life-ring", "is_story": 1, "author": {"sec_uid": target}},
+        ]
+
+        with patch.object(media, "fetch_stories_via_mobile_post_api", return_value=(None, "no post stories")), patch.object(
+            media, "fetch_stories_via_mobile_story_feed", return_value=(None, "empty pack")
+        ), patch.object(
+            media,
+            "fetch_stories_via_mobile_life_feed",
+            return_value=(life_items, "https://aweme.snssdk.com/aweme/v1/life/feed/"),
+        ), patch.object(
+            media, "fetch_stories_via_browser", return_value=(None, "no browser")
+        ):
+            items, source, supported = media.fetch_stories(object(), {"cookies": "x"}, target)
+
+        self.assertTrue(supported)
+        self.assertIn("life/feed", source)
+        self.assertEqual(["life-ring"], [item["aweme_id"] for item in items])
+
+    def test_story_feed_payload_unwraps_user_packs(self):
+        payload = {
+            "status_code": 0,
+            "data": [
+                {
+                    "user": {"sec_uid": "abc"},
+                    "story_list": [{"aweme_id": "from-pack", "is_story": 1}],
+                }
+            ],
+        }
+        items = media._story_items_from_feed_payload(payload)
+        self.assertEqual(["from-pack"], [item["aweme_id"] for item in items])
+
+    def test_download_uses_local_emulator_cache(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            source = Path(temporary_directory) / "cached.mp4"
+            source.write_bytes(b"\x00\x00\x00 ftypisomlocal")
+            aweme = {
+                "aweme_id": "local-story",
+                "desc": "日常",
+                "create_time": 1786893660,
+                "is_25_story": 1,
+                "_local_media_path": str(source),
+            }
+            profile = {"id": "t", "name": "T", "output_dir": temporary_directory}
+            result = media.download_aweme_items(
+                object(), profile, [aweme], temporary_directory, {"downloaded_story_ids": []}, "story"
+            )
+            self.assertEqual(1, result.downloaded)
+            saved = Path(result.files[0])
+            self.assertTrue(saved.is_file())
+            self.assertEqual(source.read_bytes(), saved.read_bytes())
+
+    def test_parse_share_command_blk(self):
+        blob = b"keva-blk\x00https://v.douyin.com/EXY01FyD8dU/\x00junk"
+        self.assertEqual("https://v.douyin.com/EXY01FyD8dU/", media._parse_share_command_blk(blob))
 
     def test_normalize_items_extracts_user_story_list(self):
         payload = {
@@ -575,6 +848,122 @@ class MediaDownloaderTest(unittest.TestCase):
         self.assertTrue(any(event.get("bytes_downloaded") == 5 for event in progress))
         self.assertEqual(1, progress[-1]["downloaded"])
         self.assertEqual("A visible progress item", progress[-1]["item"])
+
+    def test_import_chrome_session_saves_app_capable_login(self):
+        cookies = [
+            {"name": "sessionid", "value": "sid", "domain": ".douyin.com", "path": "/", "expires": 0},
+            {"name": "uid_tt", "value": "uid", "domain": "www.douyin.com", "path": "/", "expires": 0},
+        ]
+        list_response = MagicMock()
+        list_response.json.return_value = [
+            {
+                "type": "page",
+                "url": "https://www.douyin.com/",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9344/devtools/page/1",
+            }
+        ]
+        list_response.raise_for_status.return_value = None
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.get.return_value = list_response
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            session_file = root / "douyin_session.json"
+            mobile_file = root / "mobile_session.json"
+            device_file = root / "mobile_device.json"
+            with patch.object(media.httpx, "Client", return_value=client), patch.object(
+                media, "chrome_cdp_command", return_value={"cookies": cookies}
+            ), patch.object(media, "SESSION_FILE", session_file), patch.object(
+                media, "MOBILE_SESSION_FILE", mobile_file
+            ), patch.object(media, "MOBILE_DEVICE_FILE", device_file):
+                result = media.import_chrome_session("http://127.0.0.1:9344")
+
+            self.assertTrue(result["app_capable"])
+            self.assertTrue(session_file.is_file())
+            self.assertTrue(mobile_file.is_file())
+            device = media.load_json(device_file, {})
+            self.assertTrue(str(device.get("device_id") or "").isdigit())
+            self.assertTrue(str(device.get("install_id") or "").isdigit())
+            self.assertTrue(str(device.get("cdid") or ""))
+            with patch.object(media, "SESSION_FILE", session_file), patch.object(
+                media, "MOBILE_SESSION_FILE", mobile_file
+            ), patch.object(media, "MOBILE_DEVICE_FILE", device_file):
+                self.assertIn("sessionid=sid", media.load_session_cookie_header())
+                self.assertIn("sessionid=sid", media.load_mobile_session_cookie_header())
+                info = media.saved_session_info()
+            self.assertTrue(info["logged_in"])
+            self.assertTrue(info["app_capable"])
+
+    def test_fetch_posts_via_mobile_api_reuses_bound_device(self):
+        payload = {
+            "status_code": 0,
+            "has_more": 0,
+            "max_cursor": 0,
+            "aweme_list": [{"aweme_id": "one", "desc": "post"}],
+        }
+        response = MagicMock()
+        response.json.return_value = payload
+        seen = []
+
+        def fake_get(_client, _path, extra, cookie, device_id, install_id, **_kwargs):
+            seen.append((cookie, device_id, install_id, dict(extra or {})))
+            return response
+
+        with patch.object(media, "_check_mobile_signer", return_value=True), patch.object(
+            media, "_mobile_signed_get", side_effect=fake_get
+        ), patch.object(
+            media, "_persistent_mobile_device", return_value=("1" * 16, "2" * 16)
+        ), patch.object(media, "_mobile_cookie_header", return_value="sessionid=app"):
+            items = media.fetch_posts_via_mobile_api(object(), "sec", limit=1)
+
+        self.assertEqual(["one"], [item["aweme_id"] for item in items])
+        self.assertEqual("sessionid=app", seen[0][0])
+        self.assertEqual("1" * 16, seen[0][1])
+        self.assertEqual("2" * 16, seen[0][2])
+
+    def test_promote_web_session_copies_cookies_and_binds_device(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            session_file = root / "douyin_session.json"
+            mobile_file = root / "mobile_session.json"
+            device_file = root / "mobile_device.json"
+            with patch.object(media, "SESSION_FILE", session_file), patch.object(
+                media, "MOBILE_SESSION_FILE", mobile_file
+            ), patch.object(media, "MOBILE_DEVICE_FILE", device_file):
+                media.save_session_cookie_header("sessionid=web; uid_tt=u", source="test")
+                header = media.promote_web_session_to_app()
+                self.assertIn("sessionid=web", header)
+                self.assertIn("sessionid=web", media.load_mobile_session_cookie_header())
+                profile = media.apply_saved_session({})
+                self.assertIn("sessionid=web", profile["cookies"])
+                media.clear_saved_session()
+                self.assertFalse(session_file.exists())
+                self.assertFalse(mobile_file.exists())
+                self.assertEqual("", media._mobile_cookie_header())
+
+    def test_mobile_base_params_reuse_stable_cdid(self):
+        with patch.object(
+            media,
+            "_mobile_device_profile",
+            return_value={
+                "os_api": "35",
+                "os_version": "15",
+                "device_type": "SM-A5560",
+                "device_brand": "samsung",
+                "channel": "channel_aweme",
+                "version_code": "380700",
+                "version_name": "38.7.0",
+                "update_version_code": "380700",
+                "cdid": "11111111-2222-3333-4444-555555555555",
+            },
+        ):
+            first = media._mobile_base_params("1" * 16, "2" * 16)
+            second = media._mobile_base_params("1" * 16, "2" * 16)
+        self.assertEqual("11111111-2222-3333-4444-555555555555", first["cdid"])
+        self.assertEqual(first["cdid"], second["cdid"])
+        self.assertEqual("channel_aweme", first["channel"])
+        self.assertEqual("380700", first["update_version_code"])
 
 
 if __name__ == "__main__":

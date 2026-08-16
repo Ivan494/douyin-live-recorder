@@ -50,6 +50,10 @@ USER_AGENT = (
 POST_PATH = "/aweme/v1/web/aweme/post/"
 FAMILIAR_FEED_PATH = "/aweme/v1/web/familiar/feed/"
 LIFE_FEED_PATH = "/aweme/v1/life/feed/"
+STORY_FEED_PATH = "/aweme/v1/story/feed/"
+STORY_PROFILE_LIST_PATH = "/aweme/v1/story/profile/list/"
+NEW_STORY_FEED_PATH = "/aweme/v1/new/story/feed/"
+NEW_STORY_FEED_V2_PATH = "/aweme/v2/new/story/feed/"
 LIFE_FEED_HOSTS = (
     "https://aweme.snssdk.com",
     "https://api5-normal-c-lf.amemv.com",
@@ -70,23 +74,64 @@ STORY_NESTED_LIST_KEYS = (
     "item_list",
 )
 MOBILE_ONLY_STORY_MESSAGE = (
-    "Active story detected, but Douyin only exposes 25-hour story media to the mobile app; "
-    "the saved web login cannot download it."
+    "Active story detected, but no downloadable story media was returned."
 )
+_SESSION_REQUIRED_COOKIES = {"sessionid", "sessionid_ss", "uid_tt", "uid_tt_ss"}
 
 # ---------------------------------------------------------------------------
 # Mobile API story fetching via X-Gorgon signing.
-# Stories (aweme_type=68) are returned by the mobile /aweme/v1/aweme/post/
-# endpoint, bypassing the blocked life/feed and story/feed endpoints.
+# aweme_type=68 is Douyin's image-note (图文) type, not a 24h/日常 story.
+# Only keep type-68 posts that also carry time-limited story markers.
+# Active 24h rings live on /aweme/v1/story/feed/ and /aweme/v1/life/feed/.
 # ---------------------------------------------------------------------------
 MOBILE_API_HOST = "https://aweme.snssdk.com"
 MOBILE_API_AID = 1128
 MOBILE_API_UA = (
-    "com.ss.android.ugc.aweme/320900 (Linux; U; Android 13; zh_CN; "
-    "Pixel 7; Build/TQ3A.230901.001)"
+    "com.ss.android.ugc.aweme/380700 (Linux; U; Android 15; zh_CN; "
+    "SM-A5560; Build/AP3A.240905.015.A2)"
 )
 MOBILE_STORY_AWEME_TYPE = 68
+MOBILE_DEVICE_FILE = APP_DIR / "mobile_device.json"
+MOBILE_SESSION_FILE = APP_DIR / "mobile_session.json"
 _mobile_signer_available = None  # lazy-checked
+
+
+def _persistent_mobile_device():
+    """Reuse one device/install pair so Douyin can attach the app login to it."""
+    stored = load_json(MOBILE_DEVICE_FILE, {}) or {}
+    device_id = str(stored.get("device_id") or "")
+    install_id = str(stored.get("install_id") or "")
+    changed = False
+    if not (device_id.isdigit() and install_id.isdigit() and len(device_id) >= 16):
+        device_id = str(random.randint(7200000000000000000, 7399999999999999999))
+        install_id = str(random.randint(7200000000000000000, 7399999999999999999))
+        stored["device_id"] = device_id
+        stored["install_id"] = install_id
+        changed = True
+    if not str(stored.get("cdid") or "").strip():
+        stored["cdid"] = str(__import__("uuid").uuid4())
+        changed = True
+    if changed:
+        save_json(MOBILE_DEVICE_FILE, stored)
+    return device_id, install_id
+
+
+def _mobile_device_profile():
+    """Device/app identity for signed mobile requests. Prefer the bound device pair."""
+    stored = load_json(MOBILE_DEVICE_FILE, {}) or {}
+    version_code = str(stored.get("version_code") or "380700")
+    return {
+        "version_code": version_code,
+        "version_name": str(stored.get("version_name") or "38.7.0"),
+        "device_type": str(stored.get("device_type") or "SM-A5560"),
+        "device_brand": str(stored.get("device_brand") or "samsung"),
+        "os_version": str(stored.get("os_version") or "15"),
+        "os_api": str(stored.get("os_api") or "35"),
+        "own_uid": str(stored.get("own_uid") or ""),
+        "cdid": str(stored.get("cdid") or ""),
+        "channel": str(stored.get("channel") or "channel_aweme"),
+        "update_version_code": str(stored.get("update_version_code") or version_code),
+    }
 
 
 def _check_mobile_signer():
@@ -105,36 +150,58 @@ def _check_mobile_signer():
 def _mobile_base_params(device_id, install_id):
     """Build common mobile API query parameters."""
     import hashlib
-    import uuid as _uuid
+    ident = _mobile_device_profile()
     ts = int(time.time())
+    cdid = str(ident.get("cdid") or "").strip()
+    if not cdid:
+        cdid = hashlib.md5(f"{device_id}:{install_id}".encode()).hexdigest()
+        cdid = f"{cdid[:8]}-{cdid[8:12]}-{cdid[12:16]}-{cdid[16:20]}-{cdid[20:32]}"
     return {
-        "os": "android", "os_api": "33", "os_version": "13",
-        "device_platform": "android", "device_type": "Pixel 7",
-        "device_brand": "Google", "host_abi": "arm64-v8a",
-        "resolution": "1080*2400", "dpi": "420",
-        "language": "zh", "region": "CN", "sys_region": "CN",
-        "locale": "zh_CN", "mcc_mnc": "46000",
-        "carrier_region": "CN", "timezone_name": "Asia/Shanghai",
-        "timezone_offset": "28800", "ac": "wifi",
-        "channel": "channel_aweme", "aid": str(MOBILE_API_AID),
-        "app_name": "aweme", "version_code": "320900",
-        "version_name": "32.9.0", "device_id": device_id,
+        "os": "android",
+        "os_api": ident.get("os_api") or "35",
+        "os_version": ident.get("os_version") or "15",
+        "device_platform": "android",
+        "device_type": ident.get("device_type") or "SM-A5560",
+        "device_brand": ident.get("device_brand") or "samsung",
+        "host_abi": "arm64-v8a",
+        "resolution": "1080*2400",
+        "dpi": "420",
+        "language": "zh",
+        "region": "CN",
+        "sys_region": "CN",
+        "locale": "zh_CN",
+        "mcc_mnc": "46000",
+        "carrier_region": "CN",
+        "timezone_name": "Asia/Shanghai",
+        "timezone_offset": "28800",
+        "ac": "wifi",
+        "channel": ident.get("channel") or "channel_aweme",
+        "aid": str(MOBILE_API_AID),
+        "app_name": "aweme",
+        "version_code": ident.get("version_code") or "380700",
+        "version_name": ident.get("version_name") or "38.7.0",
+        "update_version_code": ident.get("update_version_code") or ident.get("version_code") or "380700",
+        "device_id": device_id,
+        "iid": install_id,
         "install_id": install_id,
         "openudid": hashlib.md5(device_id.encode()).hexdigest()[:16],
-        "cdid": str(_uuid.uuid4()), "ssmix": "a",
-        "ts": str(ts), "_rticket": str(int(time.time() * 1000)),
+        "cdid": cdid,
+        "ssmix": "a",
+        "ts": str(ts),
+        "_rticket": str(int(time.time() * 1000)),
         "app_type": "normal",
     }
 
 
 def _mobile_signed_get(client, path, extra_params, cookie_header,
-                       device_id, install_id):
+                       device_id, install_id, *, full_sign=False):
     """Make a signed GET request to the Douyin mobile API."""
     from signer.gorgon import get_xgorgon
     params = _mobile_base_params(device_id, install_id)
     params.update(extra_params)
     query_string = urllib.parse.urlencode(params)
     ts = time.time()
+    khronos = int(ts)
     gorgon = get_xgorgon(
         params=query_string, ticket=ts, data="", cookie=cookie_header,
     )
@@ -142,28 +209,96 @@ def _mobile_signed_get(client, path, extra_params, cookie_header,
         "User-Agent": MOBILE_API_UA,
         "Cookie": cookie_header,
         "X-Gorgon": gorgon,
-        "X-Khronos": str(int(ts)),
+        "X-Khronos": str(khronos),
     }
+    if full_sign:
+        try:
+            from signer.argus import Argus
+            from signer.ladon import Ladon
+            headers["X-Argus"] = Argus.get_sign(
+                queryhash=query_string,
+                data=None,
+                timestamp=khronos,
+                aid=MOBILE_API_AID,
+            )
+            headers["X-Ladon"] = Ladon.encrypt(khronos, "1611921764", MOBILE_API_AID)
+        except Exception:
+            logging.debug("Argus/Ladon signing unavailable for %s", path, exc_info=True)
     url = f"{MOBILE_API_HOST}{path}?{query_string}"
     return client.get(url, headers=headers)
 
 
+def _mobile_signed_request(client, method, path, extra_params, cookie_header,
+                           device_id, install_id, *, body="", host=None, full_sign=True):
+    """Signed mobile GET/POST. POST bodies are included in Gorgon/Argus hashes."""
+    from signer.gorgon import get_xgorgon
+    params = _mobile_base_params(device_id, install_id)
+    params.update(extra_params or {})
+    query_string = urllib.parse.urlencode(params)
+    ts = time.time()
+    khronos = int(ts)
+    gorgon = get_xgorgon(
+        params=query_string, ticket=ts, data=body or "", cookie=cookie_header,
+    )
+    headers = {
+        "User-Agent": MOBILE_API_UA,
+        "Cookie": cookie_header,
+        "X-Gorgon": gorgon,
+        "X-Khronos": str(khronos),
+    }
+    if body:
+        from hashlib import md5 as _md5
+        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+        headers["X-SS-STUB"] = _md5(body.encode("utf-8")).hexdigest().upper()
+        headers["X-SS-REQ-TICKET"] = str(int(ts * 1000))
+    if full_sign:
+        try:
+            from hashlib import md5 as _md5
+            from signer.argus import Argus
+            from signer.ladon import Ladon
+            stub = _md5((body or "").encode("utf-8")).hexdigest() if body else None
+            headers["X-Argus"] = Argus.get_sign(
+                queryhash=query_string,
+                data=stub,
+                timestamp=khronos,
+                aid=MOBILE_API_AID,
+            )
+            headers["X-Ladon"] = Ladon.encrypt(khronos, "1611921764", MOBILE_API_AID)
+        except Exception:
+            logging.debug("Argus/Ladon signing unavailable for %s %s", method, path, exc_info=True)
+    url = f"{(host or MOBILE_API_HOST)}{path}?{query_string}"
+    if str(method).upper() == "POST":
+        return client.post(url, headers=headers, content=(body or "").encode("utf-8"))
+    return client.get(url, headers=headers)
+
+
+def _is_mobile_post_story(aweme):
+    """True when a post-feed item is itself a time-limited 日常, not just 图文."""
+    if not isinstance(aweme, dict):
+        return False
+    if aweme.get("aweme_type") == MOBILE_STORY_AWEME_TYPE and is_time_limited_story(aweme):
+        return True
+    return is_time_limited_story(aweme)
+
+
 def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header=""):
     """
-    Fetch story items (aweme_type=68) via the mobile /aweme/v1/aweme/post/
-    endpoint with X-Gorgon signing.
+    Fetch time-limited story items from the mobile /aweme/v1/aweme/post/ feed.
+
+    aweme_type=68 alone is not enough: that is the regular image-note type and
+    those posts stay in the profile feed forever. Only items that also carry
+    24h/日常 markers are treated as stories.
 
     Returns (items_list, source_label) or (None, error_message).
     """
     if not _check_mobile_signer():
         return None, "mobile_post_api: signer module not available"
     if not cookie_header:
-        cookie_header = load_session_cookie_header()
+        cookie_header = _mobile_cookie_header()
     if not cookie_header:
         return None, "mobile_post_api: no session cookies"
 
-    device_id = str(random.randint(7200000000000000000, 7399999999999999999))
-    install_id = str(random.randint(7200000000000000000, 7399999999999999999))
+    device_id, install_id = _persistent_mobile_device()
 
     stories = []
     max_cursor = "0"
@@ -196,7 +331,7 @@ def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header=""):
 
             aweme_list = data.get("aweme_list") or []
             for aweme in aweme_list:
-                if isinstance(aweme, dict) and aweme.get("aweme_type") == MOBILE_STORY_AWEME_TYPE:
+                if _is_mobile_post_story(aweme):
                     stories.append(aweme)
 
             has_more = data.get("has_more", 0)
@@ -214,26 +349,252 @@ def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header=""):
 
     if stories:
         return stories, f"{MOBILE_API_HOST}/aweme/v1/aweme/post/ (mobile, {len(stories)} stories)"
-    return None, "mobile_post_api: no stories found in post feed"
+    return None, "mobile_post_api: no time-limited stories in post feed"
+
+
+def _story_items_from_feed_payload(data):
+    """Extract aweme dicts from /aweme/v1/story/feed/ or similar packs."""
+    if not isinstance(data, dict):
+        return []
+    items = []
+    raw = data.get("data")
+    active = data.get("active_data")
+    if raw in (None, [], {}) and isinstance(active, dict):
+        raw = active.get("data") if active.get("data") not in (None, [], {}) else active
+    entries = []
+    if isinstance(raw, list):
+        entries = raw
+    elif isinstance(raw, dict):
+        entries = [raw]
+        for key in ("aweme_list", "story_list", "all_story_list", "user_story_list", "items", "data"):
+            nested = raw.get(key)
+            if isinstance(nested, list):
+                entries.extend(nested)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        packed = _story_items_from_user_entry(entry)
+        if packed:
+            items.extend(packed)
+            continue
+        aweme = entry.get("aweme") or entry.get("aweme_info")
+        if isinstance(aweme, dict) and (aweme.get("aweme_id") or aweme.get("group_id")):
+            items.append(aweme)
+        elif entry.get("aweme_id") or entry.get("group_id"):
+            items.append(entry)
+    if not items:
+        items = normalize_items(data)
+    seen = set()
+    unique = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        aweme_id = str(item.get("aweme_id") or item.get("group_id") or "")
+        if aweme_id and aweme_id in seen:
+            continue
+        if aweme_id:
+            seen.add(aweme_id)
+        unique.append(item)
+    return unique
+
+
+def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_header=""):
+    """
+    Fetch the active 24h/日常 pack via mobile story endpoints.
+
+    The follow-tab tray is /aweme/v1/story/feed/. Story25 (日常) also lives on
+    /aweme/v1/new/story/feed/, /aweme/v2/new/story/feed/, and the profile
+    tab /aweme/v1/story/profile/list/. Returns (items, source) or (None, msg).
+    """
+    if not _check_mobile_signer():
+        return None, "mobile_story_feed: signer module not available"
+    if not cookie_header:
+        cookie_header = _mobile_cookie_header()
+    if not cookie_header:
+        return None, "mobile_story_feed: no session cookies"
+
+    numeric_uid = str(user_id or "").strip()
+    if not numeric_uid.isdigit():
+        numeric_uid = resolve_numeric_user_id(client, {"cookies": cookie_header}, sec_user_id)
+    device_id, install_id = _persistent_mobile_device()
+    own_uid = _mobile_device_profile().get("own_uid") or ""
+
+    path_variants = []
+    if numeric_uid.isdigit():
+        # Captured from the app's Story25Api.getFeeds (profile 日常 tab).
+        profile_extra = {
+            "to_uid": numeric_uid,
+            "offset": "0",
+            "story_ttl": "7",
+            "active_data_size": "20",
+            "month_data_size": "4",
+            "insert_ids": "",
+            "delete_ids": "",
+        }
+        path_variants.append((STORY_PROFILE_LIST_PATH, profile_extra))
+
+    insert_json = json.dumps([int(numeric_uid)]) if numeric_uid.isdigit() else ""
+    viewer_uid = own_uid if own_uid.isdigit() else numeric_uid
+    tray_extra = {"cursor": "0", "count": "20", "source": "1", "sec_user_id": sec_user_id}
+    if viewer_uid.isdigit():
+        tray_extra["user_id"] = viewer_uid
+    if insert_json:
+        tray_extra["insert_ids"] = insert_json
+        tray_extra["filter_warn"] = "0"
+        tray_extra["user_per_page"] = "0"
+    for path in (STORY_FEED_PATH, NEW_STORY_FEED_PATH, NEW_STORY_FEED_V2_PATH):
+        path_variants.append((path, dict(tray_extra)))
+
+    last_message = "mobile_story_feed: no items"
+    hosts = (MOBILE_API_HOST, "https://api3-social-m-lf.amemv.com")
+    for path, extra in path_variants:
+        try_hosts = hosts if path == STORY_PROFILE_LIST_PATH else (MOBILE_API_HOST,)
+        for host in try_hosts:
+            try:
+                response = _mobile_signed_request(
+                    client,
+                    "GET",
+                    path,
+                    extra,
+                    cookie_header,
+                    device_id,
+                    install_id,
+                    host=host,
+                    full_sign=True,
+                )
+                data = response.json()
+            except Exception as exc:
+                last_message = f"mobile_story_feed: {host}{path}: {exc}"
+                continue
+            if not isinstance(data, dict):
+                continue
+            status_code = data.get("status_code")
+            if status_code not in (0, None):
+                last_message = (
+                    f"mobile_story_feed: {path}: status_code={status_code} "
+                    f"{(data.get('status_msg') or data.get('message') or '')}"
+                )
+                continue
+            items = _story_items_from_feed_payload(data)
+            if not items:
+                items = normalize_items(data)
+            if items:
+                return items, f"{host}{path}"
+            last_message = f"{host}{path}: empty pack"
+    return None, last_message
+
+
+def fetch_stories_via_mobile_life_feed(client, sec_user_id, user_id="", cookie_header=""):
+    """
+    Fetch the active 24h/日常 pack via a signed mobile POST to /aweme/v1/life/feed/.
+
+    The web a_bogus POST often returns an accepted empty pack. The app endpoint
+    expects Gorgon + Argus over the form body. Returns (items, source) or
+    (None, message).
+    """
+    if not _check_mobile_signer():
+        return None, "mobile_life_feed: signer module not available"
+    if not cookie_header:
+        cookie_header = _mobile_cookie_header()
+    if not cookie_header:
+        return None, "mobile_life_feed: no session cookies"
+
+    numeric_uid = str(user_id or "").strip()
+    if not numeric_uid.isdigit():
+        numeric_uid = resolve_numeric_user_id(client, {"cookies": cookie_header}, sec_user_id)
+    if not numeric_uid.isdigit():
+        return None, "mobile_life_feed: could not resolve numeric user_id"
+
+    device_id, install_id = _persistent_mobile_device()
+    bodies = (
+        urllib.parse.urlencode(
+            {
+                "user_ids": json.dumps([int(numeric_uid)]),
+                "sec_user_ids": json.dumps([sec_user_id]),
+                "count": "20",
+                "cursor": "0",
+                "pull_type": "2",
+            }
+        ),
+        urllib.parse.urlencode(
+            {
+                "user_ids": json.dumps([int(numeric_uid)]),
+                "count": "20",
+                "cursor": "0",
+                "pull_type": "2",
+            }
+        ),
+        urllib.parse.urlencode(
+            {
+                "user_ids": numeric_uid,
+                "count": "20",
+                "cursor": "0",
+            }
+        ),
+    )
+    last_message = "mobile_life_feed: no items"
+    last_ok = None
+    for host in LIFE_FEED_HOSTS:
+        for body in bodies:
+            try:
+                response = _mobile_signed_request(
+                    client,
+                    "POST",
+                    LIFE_FEED_PATH,
+                    {},
+                    cookie_header,
+                    device_id,
+                    install_id,
+                    body=body,
+                    host=host,
+                    full_sign=True,
+                )
+                data = response.json()
+            except Exception as exc:
+                last_message = f"{host}{LIFE_FEED_PATH}: {exc}"
+                continue
+            if not isinstance(data, dict):
+                continue
+            try:
+                status_code = int(data.get("status_code") or 0)
+            except (TypeError, ValueError):
+                status_code = -1
+            if status_code != 0:
+                last_message = (
+                    f"{host}{LIFE_FEED_PATH}: status_code={status_code} "
+                    f"{(data.get('status_msg') or data.get('message') or '')}"
+                )
+                continue
+            last_ok = data
+            items = normalize_items(data)
+            if not items:
+                items = _story_items_from_feed_payload(data)
+            if items:
+                return items, f"{host}{LIFE_FEED_PATH}"
+            last_message = f"{host}{LIFE_FEED_PATH}: empty pack"
+    if last_ok is not None:
+        return None, last_message
+    return None, last_message
 
 
 def fetch_posts_via_mobile_api(client, sec_user_id, limit=0, cookie_header=""):
     """
     Fetch ALL post items (videos + images + stories) via the mobile
     /aweme/v1/aweme/post/ endpoint with X-Gorgon signing.
-    Used as a fallback when both the web API and browser paths fail.
+
+    This is the app-login post list. The bound device_id/install_id must stay
+    stable so Douyin keeps treating the EXE QR session as that app.
 
     Returns list of aweme dicts, or raises on total failure.
     """
     if not _check_mobile_signer():
         raise EmptyApiResponseError("mobile_post_api: signer module not available")
     if not cookie_header:
-        cookie_header = load_session_cookie_header()
+        cookie_header = _mobile_cookie_header()
     if not cookie_header:
         raise EmptyApiResponseError("mobile_post_api: no session cookies")
 
-    device_id = str(random.randint(7200000000000000000, 7399999999999999999))
-    install_id = str(random.randint(7200000000000000000, 7399999999999999999))
+    device_id, install_id = _persistent_mobile_device()
 
     all_items = []
     max_cursor = "0"
@@ -379,6 +740,65 @@ def load_session_cookie_header():
         return dpapi_unprotect(encrypted).decode("utf-8")
     except Exception:
         return ""
+
+
+def save_mobile_session_cookie_header(cookie_header, source="edge-qr-app"):
+    """Persist the EXE QR login as the app-capable mobile session."""
+    encrypted = dpapi_protect(cookie_header.encode("utf-8"))
+    save_json(
+        MOBILE_SESSION_FILE,
+        {
+            "format": "windows-dpapi-v1",
+            "encrypted_cookie_header": base64.b64encode(encrypted).decode("ascii"),
+            "source": source,
+            "imported_at": datetime.now().isoformat(timespec="seconds"),
+        },
+    )
+
+
+def load_mobile_session_cookie_header():
+    session = load_json(MOBILE_SESSION_FILE, {})
+    encoded = session.get("encrypted_cookie_header") if isinstance(session, dict) else ""
+    if not encoded:
+        return ""
+    try:
+        encrypted = base64.b64decode(encoded)
+        return dpapi_unprotect(encrypted).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _session_cookie_names(cookie_header):
+    return {
+        part.split("=", 1)[0].strip()
+        for part in (cookie_header or "").split(";")
+        if "=" in part and part.split("=", 1)[0].strip()
+    }
+
+
+def _session_is_logged_in(cookie_header):
+    names = _session_cookie_names(cookie_header)
+    return bool((cookie_header or "").strip() and names.intersection(_SESSION_REQUIRED_COOKIES))
+
+
+def promote_web_session_to_app():
+    """One EXE QR login is enough: copy web cookies into the app session and bind a device."""
+    header = load_mobile_session_cookie_header() or load_session_cookie_header()
+    if not header:
+        return ""
+    if not load_mobile_session_cookie_header():
+        save_mobile_session_cookie_header(header, source="edge-qr-app")
+    _persistent_mobile_device()
+    return header
+
+
+def _mobile_cookie_header(fallback=""):
+    """Unified EXE login cookies. Web QR cookies work as the app session with the bound device."""
+    return (
+        load_mobile_session_cookie_header()
+        or (fallback or "").strip()
+        or load_session_cookie_header()
+    )
 
 
 def _read_http_headers(sock):
@@ -979,6 +1399,185 @@ def _cdp_collect_post_payloads(session, sec_user_id, *, timeout=25):
     return bodies
 
 
+def _is_story_capture_url(url):
+    text = str(url or "").lower()
+    if not text.startswith("http"):
+        return False
+    markers = (
+        "/story/",
+        "/life/",
+        "/moment/",
+        "story/feed",
+        "life/feed",
+        "life/item",
+        "aweme/detail",
+        "multi/aweme/detail",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _cdp_collect_json_payloads(session, url_predicate, *, timeout=12):
+    """Harvest JSON bodies for network responses whose URL matches predicate."""
+    request_ids = []
+    bodies = []
+    seen_ids = set()
+    harvested_ids = set()
+
+    def harvest(events):
+        for event in events:
+            method = event.get("method")
+            params = event.get("params") or {}
+            if method == "Network.responseReceived":
+                response = params.get("response") or {}
+                url = response.get("url") or ""
+                request_id = params.get("requestId")
+                if request_id and url_predicate(url) and request_id not in seen_ids:
+                    request_ids.append(request_id)
+                    seen_ids.add(request_id)
+            elif method == "Network.loadingFinished":
+                request_id = params.get("requestId")
+                if request_id in seen_ids and request_id not in harvested_ids:
+                    try:
+                        result = session.call(
+                            "Network.getResponseBody",
+                            {"requestId": request_id},
+                            timeout=8,
+                        )
+                    except Exception:
+                        continue
+                    raw = result.get("body") or ""
+                    if result.get("base64Encoded"):
+                        try:
+                            raw = base64.b64decode(raw).decode("utf-8", errors="replace")
+                        except Exception:
+                            continue
+                    if not raw:
+                        continue
+                    try:
+                        data = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(data, dict):
+                        data = dict(data)
+                        data["_source_url"] = ""
+                        bodies.append(data)
+                        harvested_ids.add(request_id)
+
+    events = session.wait_for_events(
+        lambda collected: any(
+            (e.get("method") == "Network.responseReceived")
+            and url_predicate(((e.get("params") or {}).get("response") or {}).get("url"))
+            for e in collected
+        ),
+        timeout=timeout,
+    )
+    harvest(events)
+    if request_ids:
+        more = session.wait_for_events(
+            lambda collected: len(bodies) >= len(request_ids),
+            timeout=6,
+        )
+        harvest(more)
+    return bodies
+
+
+def _cdp_click_profile_story_ring(session):
+    """Click the profile avatar / story ring if one is visible."""
+    result = session.call(
+        "Runtime.evaluate",
+        {
+            "expression": """
+(() => {
+  const nodes = [...document.querySelectorAll('img, canvas, [class*="avatar"], [class*="Avatar"]')];
+  const scored = [];
+  for (const el of nodes) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 56 || rect.width > 280 || rect.height < 56 || rect.top > 500) continue;
+    const src = String(el.src || el.currentSrc || '');
+    const cls = String(el.className || '');
+    let score = 0;
+    if (src.includes('avatar') || src.includes('aweme-avatar')) score += 3;
+    if (/avatar|story|ring|日常/i.test(cls)) score += 2;
+    if (rect.left < 480) score += 1;
+    if (score <= 0) continue;
+    scored.push({el, score, src: src.slice(0, 80)});
+  }
+  scored.sort((a, b) => b.score - a.score);
+  const hit = scored[0];
+  if (!hit) return {ok: false, reason: 'no-avatar'};
+  const target = hit.el.closest('a,button,[role="button"]') || hit.el.parentElement || hit.el;
+  target.click();
+  return {ok: true, src: hit.src, score: hit.score};
+})()
+""",
+            "returnByValue": True,
+        },
+        timeout=8,
+    )
+    return (result.get("result") or {}).get("value") or {}
+
+
+def fetch_stories_via_browser(profile, sec_user_id, cdp_url=None):
+    """
+    Open the profile in the logged-in fetch browser, click the story ring,
+    and harvest story/life/detail API bodies. Returns (items, source) or
+    (None, message). Never wipes the shared fetch-browser session.
+    """
+    launched = None
+    if not cdp_url:
+        launched = ensure_media_fetch_browser()
+        cdp_url = launched["cdp_url"]
+    elif not cdp_is_available(cdp_url):
+        launched = ensure_media_fetch_browser()
+        cdp_url = launched["cdp_url"]
+
+    page = _cdp_pick_page(cdp_url, prefer_douyin=False)
+    if not page:
+        try:
+            with httpx.Client(trust_env=False) as client:
+                client.put(cdp_url.rstrip("/") + "/json/new?about:blank", timeout=5)
+        except Exception:
+            pass
+        time.sleep(0.4)
+        page = _cdp_pick_page(cdp_url, prefer_douyin=False)
+    if not page:
+        return None, "browser_story: no open page target"
+
+    profile_url = f"https://www.douyin.com/user/{sec_user_id}"
+    items = []
+    try:
+        with CdpSession(page["webSocketDebuggerUrl"], timeout=40) as session:
+            session.call("Network.enable", {"maxResourceBufferSize": 20 * 1024 * 1024})
+            session.call("Page.enable", {})
+            cookie_header = (profile.get("cookies") or "").strip() or _mobile_cookie_header()
+            if cookie_header:
+                _cdp_apply_session_cookies(session, cookie_header)
+            session.call("Page.navigate", {"url": profile_url}, timeout=30)
+            time.sleep(2)
+            if _detect_browser_captcha(session):
+                return None, "browser_story: captcha"
+            click = _cdp_click_profile_story_ring(session)
+            payloads = _cdp_collect_json_payloads(
+                session, _is_story_capture_url, timeout=10 if click.get("ok") else 4
+            )
+            if click.get("ok") and not payloads:
+                time.sleep(1.5)
+                payloads.extend(
+                    _cdp_collect_json_payloads(session, _is_story_capture_url, timeout=6)
+                )
+            for payload in payloads:
+                packed = _story_items_from_feed_payload(payload)
+                if not packed:
+                    packed = normalize_items(payload)
+                items.extend(item for item in packed if isinstance(item, dict))
+    except Exception as exc:
+        return None, f"browser_story: {exc}"
+
+    if items:
+        return items, "browser story viewer"
+    return None, "browser_story: no story payloads"
+
+
 # Captcha / slide-verify selectors and text fragments that Douyin injects when
 # it suspects automated access.  Checked via CDP Runtime.evaluate.
 _CAPTCHA_DOM_EXPRESSION = """
@@ -1080,7 +1679,7 @@ def fetch_posts_via_browser(profile, sec_user_id, limit=0, progress_callback=Non
         session.call("Page.enable", {})
         # FIX-LOGIN: Pre-apply session cookies so login-gated profiles
         # (notes, images, restricted works) load correctly on first navigation.
-        _pre_cookie = (profile.get("cookies") or "").strip() or load_session_cookie_header()
+        _pre_cookie = (profile.get("cookies") or "").strip() or _mobile_cookie_header()
         _pre_applied = 0
         if _pre_cookie:
             _pre_applied = _cdp_apply_session_cookies(session, _pre_cookie)
@@ -1148,7 +1747,7 @@ def fetch_posts_via_browser(profile, sec_user_id, limit=0, progress_callback=Non
             # not_login_module used only for the page's login promotion. The
             # promotion is not a hard API failure when usable works are present.
             if response_has_login_tip(data) and not page_items:
-                cookie_header = (profile.get("cookies") or "").strip() or load_session_cookie_header()
+                cookie_header = (profile.get("cookies") or "").strip() or _mobile_cookie_header()
                 if cookie_header and not session_applied:
                     applied = _cdp_apply_session_cookies(session, cookie_header)
                     if applied:
@@ -1274,7 +1873,7 @@ def import_chrome_session(cdp_url=DEFAULT_CHROME_CDP):
         if expires > 0 and expires < now:
             continue
         cookies.append(item)
-    required = {"sessionid", "sessionid_ss", "uid_tt", "uid_tt_ss"}
+    required = _SESSION_REQUIRED_COOKIES
     names = {str(item.get("name") or "") for item in cookies}
     if not names.intersection(required):
         raise RuntimeError("Chrome's Douyin tab is not logged in")
@@ -1287,35 +1886,47 @@ def import_chrome_session(cdp_url=DEFAULT_CHROME_CDP):
     )
     cookie_header = "; ".join(f"{item['name']}={item.get('value', '')}" for item in cookies)
     save_session_cookie_header(cookie_header, cdp_url)
-    return {"cookie_count": len(cookies), "source": cdp_url, "saved_to": str(SESSION_FILE)}
+    save_mobile_session_cookie_header(cookie_header, source="edge-qr-app")
+    _persistent_mobile_device()
+    return {
+        "cookie_count": len(cookies),
+        "source": cdp_url,
+        "saved_to": str(SESSION_FILE),
+        "app_session": str(MOBILE_SESSION_FILE),
+        "app_capable": True,
+    }
 
 
 def apply_saved_session(profile):
     profile = dict(profile)
     if not (profile.get("cookies") or "").strip():
-        profile["cookies"] = load_session_cookie_header()
+        profile["cookies"] = _mobile_cookie_header()
     return profile
 
 
 def saved_session_info():
-    session = load_json(SESSION_FILE, {})
-    cookie_header = load_session_cookie_header()
-    names = {
-        part.split("=", 1)[0].strip()
-        for part in cookie_header.split(";")
-        if "=" in part and part.split("=", 1)[0].strip()
-    }
-    required = {"sessionid", "sessionid_ss", "uid_tt", "uid_tt_ss"}
+    promote_web_session_to_app()
+    mobile_header = load_mobile_session_cookie_header()
+    web_header = load_session_cookie_header()
+    cookie_header = mobile_header or web_header
+    session = load_json(MOBILE_SESSION_FILE if mobile_header else SESSION_FILE, {})
+    names = _session_cookie_names(cookie_header)
+    stored = load_json(MOBILE_DEVICE_FILE, {}) or {}
+    device_id = str(stored.get("device_id") or "")
+    install_id = str(stored.get("install_id") or "")
+    logged_in = _session_is_logged_in(cookie_header)
     return {
-        "logged_in": bool(cookie_header and names.intersection(required)),
+        "logged_in": logged_in,
         "cookie_count": len(names),
         "imported_at": session.get("imported_at", "") if isinstance(session, dict) else "",
         "source": session.get("source", "") if isinstance(session, dict) else "",
+        "app_capable": bool(logged_in and device_id and install_id),
     }
 
 
 def clear_saved_session():
     SESSION_FILE.unlink(missing_ok=True)
+    MOBILE_SESSION_FILE.unlink(missing_ok=True)
 
 
 def find_browser_executable():
@@ -1897,7 +2508,7 @@ def _parse_json_response(response):
 def request_json(client, profile, path, sec_user_id, cursor=0, count=18, *, path_kind="post"):
     params = default_query(profile, sec_user_id, cursor, count, path_kind=path_kind)
     url, ua = signed_douyin_url(path, params)
-    cookies = (profile.get("cookies") or "").strip() or load_session_cookie_header()
+    cookies = (profile.get("cookies") or "").strip() or _mobile_cookie_header()
     headers = _request_headers(profile, sec_user_id, ua, cookies, params["msToken"])
 
     # FIX-AUDIT-8: Removed unnecessary warm-up GET to douyin.com.
@@ -1989,6 +2600,19 @@ def normalize_items(data):
         # Explicit empty pack is still a valid "no stories" response.
         if user_story_list is not None and "user_story_list" in data:
             return []
+    active = data.get("active_data")
+    if isinstance(active, dict):
+        packed = []
+        for key in ("data", "aweme_list", "item_list"):
+            nested = active.get(key)
+            if isinstance(nested, list):
+                packed.extend(
+                    item.get("aweme") if isinstance(item, dict) and isinstance(item.get("aweme"), dict) and not item.get("aweme_id") else item
+                    for item in nested
+                    if isinstance(item, dict)
+                )
+        if packed:
+            return packed
     for key in ("aweme_list", "items", "story_list", "moment_list", "data"):
         value = data.get(key)
         if isinstance(value, list):
@@ -2339,7 +2963,8 @@ def download_aweme_items(
         # video.play_addr. Prefer the actual images instead of saving that audio
         # response with an .mp4 extension.
         video_urls = [] if image_urls else collect_video_urls(aweme)
-        if not video_urls and not image_urls:
+        local_media = Path(str(aweme.get("_local_media_path") or ""))
+        if not video_urls and not image_urls and not (local_media.is_file() and local_media.stat().st_size > 0):
             result.failed += 1
             report_progress(
                 progress_callback,
@@ -2384,7 +3009,17 @@ def download_aweme_items(
             output_path.unlink(missing_ok=True)
         saved = False
         saved_files = []
-        if video_urls:
+        local_media = Path(str(aweme.get("_local_media_path") or ""))
+        if local_media.is_file() and local_media.stat().st_size > 0:
+            try:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(local_media, output_path)
+                saved = output_path.stat().st_size > 0
+                if saved:
+                    saved_files.append(output_path)
+            except OSError:
+                saved = False
+        if not saved and video_urls:
             candidates = video_urls[:8]
             for attempt, url in enumerate(candidates, start=1):
                 details = {
@@ -2643,16 +3278,194 @@ def _filter_story_items(raw_items, sec_user_id, *, require_story_marker, require
     return items
 
 
+ADB_SERIAL = os.environ.get("DOUYIN_ADB_SERIAL", "127.0.0.1:16384")
+ADB_CANDIDATES = (
+    Path(r"C:\Program Files\Netease\MuMuPlayer\nx_main\adb.exe"),
+    Path(os.environ.get("LOCALAPPDATA") or "") / "Android" / "Sdk" / "platform-tools" / "adb.exe",
+)
+
+
+def _find_adb():
+    for candidate in ADB_CANDIDATES:
+        if candidate and candidate.is_file():
+            return str(candidate)
+    return ""
+
+
+def _adb(args, timeout=20):
+    adb = _find_adb()
+    if not adb:
+        raise RuntimeError("adb not found")
+    return subprocess.run(
+        [adb, "-s", ADB_SERIAL, *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def _ui_nodes(xml_text):
+    nodes = []
+    for match in re.finditer(
+        r'text="([^"]*)"[^>]*content-desc="([^"]*)"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
+        xml_text or "",
+    ):
+        x1, y1, x2, y2 = (int(match.group(i)) for i in range(3, 7))
+        nodes.append(
+            {
+                "text": match.group(1),
+                "desc": match.group(2),
+                "x": (x1 + x2) // 2,
+                "y": (y1 + y2) // 2,
+            }
+        )
+    return nodes
+
+
+def _adb_tap_label(labels):
+    dump = _adb(["shell", "uiautomator", "dump", "/sdcard/u_story.xml"])
+    if dump.returncode != 0:
+        return False
+    pulled = _adb(["shell", "cat", "/sdcard/u_story.xml"])
+    wanted = {label.lower() for label in labels}
+    for node in _ui_nodes(pulled.stdout or ""):
+        blob = f"{node['text']} {node['desc']}".lower()
+        if any(label in blob for label in wanted):
+            _adb(["shell", "input", "tap", str(node["x"]), str(node["y"])])
+            return True
+    return False
+
+
+def _parse_share_command_blk(data):
+    text = (data or b"").decode("utf-8", errors="ignore")
+    match = re.search(r"https://v\.douyin\.com/[A-Za-z0-9_\-]+/?", text)
+    return match.group(0) if match else ""
+
+
+def _pull_newest_story_cache():
+    listing = _adb(
+        [
+            "shell",
+            "ls",
+            "-t",
+            "/data/data/com.ss.android.ugc.aweme/cache/cachev2",
+        ]
+    )
+    if listing.returncode != 0:
+        return ""
+    newest = ""
+    for line in (listing.stdout or "").splitlines():
+        name = line.strip().split()[-1] if line.strip() else ""
+        if name.endswith(".mdl") and "h264" in name:
+            newest = name
+            break
+    if not newest:
+        return ""
+    dest = Path(os.environ.get("TEMP") or APP_DIR) / "aweme_story_cache.mp4"
+    remote = f"/data/data/com.ss.android.ugc.aweme/cache/cachev2/{newest}"
+    pulled = _adb(["pull", remote, str(dest)], timeout=60)
+    if pulled.returncode != 0 or not dest.is_file() or dest.stat().st_size < 1000:
+        return ""
+    return str(dest)
+
+
+def fetch_stories_via_emulator(sec_user_id, user_id=""):
+    """
+    Last-resort harvest: open the profile 日常 on the MuMu app, copy the
+    share link, and pull the cached media. Story25 is filtered from HTTP.
+    """
+    if not _find_adb():
+        return None, "emulator_story: adb not found"
+    numeric_uid = str(user_id or "").strip()
+    try:
+        devices = subprocess.run(
+            [_find_adb(), "devices"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception as exc:
+        return None, f"emulator_story: {exc}"
+    if ADB_SERIAL not in (devices.stdout or ""):
+        return None, "emulator_story: device offline"
+
+    if numeric_uid.isdigit():
+        deep = f"snssdk1128://user/profile/{numeric_uid}"
+    else:
+        deep = f"https://www.douyin.com/user/{sec_user_id}"
+    _adb(["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", deep])
+    time.sleep(2.5)
+    if not _adb_tap_label(("日常", "最近 24")):
+        return None, "emulator_story: 日常 tab not found"
+    time.sleep(1.2)
+    if not _adb_tap_label(("小时前", "图片", "视频")):
+        # Cover may have no text; tap a typical first-cell region.
+        _adb(["shell", "input", "tap", "160", "780"])
+    time.sleep(2.0)
+    share_blk = Path(os.environ.get("TEMP") or APP_DIR) / "share_command.blk"
+    _adb(
+        [
+            "pull",
+            "/data/data/com.ss.android.ugc.aweme/files/keva/repo/share_command/share_command.blk",
+            str(share_blk),
+        ]
+    )
+    share_url = ""
+    if share_blk.is_file():
+        share_url = _parse_share_command_blk(share_blk.read_bytes())
+    if not share_url:
+        _adb_tap_label(("分享",))
+        time.sleep(0.8)
+        _adb_tap_label(("分享链接", "复制链接"))
+        time.sleep(0.8)
+        _adb(
+            [
+                "pull",
+                "/data/data/com.ss.android.ugc.aweme/files/keva/repo/share_command/share_command.blk",
+                str(share_blk),
+            ]
+        )
+        if share_blk.is_file():
+            share_url = _parse_share_command_blk(share_blk.read_bytes())
+
+    local = _pull_newest_story_cache()
+    if not local:
+        return None, "emulator_story: no cached media"
+    aweme_id = ""
+    if share_url:
+        try:
+            with httpx.Client(timeout=15, follow_redirects=True) as client:
+                aweme_id = resolve_share_link(client, share_url)
+        except Exception:
+            aweme_id = extract_aweme_id(share_url)
+    aweme = {
+        "aweme_id": aweme_id or Path(local).stem,
+        "desc": "日常",
+        "create_time": int(time.time()),
+        "is_story": 1,
+        "is_25_story": 1,
+        "share_url": share_url,
+        "author": {"sec_uid": sec_user_id, "uid": numeric_uid},
+        "_local_media_path": local,
+        "_source": "emulator_cachev2",
+    }
+    return [aweme], "emulator://story25"
+
+
 def fetch_stories(client, profile, sec_user_id, user_id=""):
     last_message = ""
     supported = False
     supported_message = ""
+    mobile_cookie = _mobile_cookie_header((profile.get("cookies") or "").strip())
 
-    # 1) Mobile post API — stories (aweme_type=68) appear in the regular
-    #    post feed when accessed via the mobile API with X-Gorgon signing.
-    #    This is the endpoint that works anonymously; try it first.
+    # 1) Mobile post API — only time-limited 日常 that also appear as posts.
+    #    Regular 图文 (aweme_type=68 without story markers) stay in the
+    #    profile feed forever and must not hide an active 24h ring.
     try:
-        mobile_cookie = (profile.get("cookies") or "").strip() or load_session_cookie_header()
         mobile_items, mobile_source = fetch_stories_via_mobile_post_api(
             client, sec_user_id, cookie_header=mobile_cookie,
         )
@@ -2660,16 +3473,9 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
             items = _filter_story_items(
                 mobile_items,
                 sec_user_id,
-                require_story_marker=False,
+                require_story_marker=True,
                 require_author_match=True,
             )
-            # aweme_type=68 items are stories by definition
-            if not items:
-                items = [
-                    item for item in mobile_items
-                    if isinstance(item, dict)
-                    and item_author_sec_uid(item) in ("", sec_user_id)
-                ]
             if items:
                 return items, mobile_source, True
         if mobile_source and "not available" not in mobile_source:
@@ -2679,7 +3485,76 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
     except Exception as exc:
         last_message = f"mobile_post_api: {exc}"
 
-    # 2) Mobile life/feed — real story pack API (user_story_list), login-gated.
+    # 2) Mobile story/feed — the actual 24h/日常 tray. Web cookies plus a
+    #    signed request can still return a pack when insert_ids is set.
+    try:
+        feed_items, feed_source = fetch_stories_via_mobile_story_feed(
+            client,
+            sec_user_id,
+            user_id=user_id,
+            cookie_header=mobile_cookie,
+        )
+        if feed_items:
+            items = _filter_story_items(
+                feed_items,
+                sec_user_id,
+                require_story_marker=False,
+                require_author_match=True,
+            )
+            if not items:
+                items = [
+                    item
+                    for item in feed_items
+                    if isinstance(item, dict)
+                    and item_author_sec_uid(item) in ("", sec_user_id)
+                ]
+            if items:
+                return items, feed_source, True
+        if feed_source:
+            last_message = feed_source
+            if "empty pack" in feed_source or feed_source.startswith("http"):
+                supported = True
+                supported_message = feed_source
+    except LoginRequiredError:
+        raise
+    except Exception as exc:
+        last_message = f"mobile_story_feed: {exc}"
+
+    # 3) Signed mobile life/feed POST — this is the real 24h pack API.
+    try:
+        life_items, life_source = fetch_stories_via_mobile_life_feed(
+            client,
+            sec_user_id,
+            user_id=user_id,
+            cookie_header=mobile_cookie,
+        )
+        if life_items:
+            items = _filter_story_items(
+                life_items,
+                sec_user_id,
+                require_story_marker=False,
+                require_author_match=True,
+            )
+            if not items:
+                items = [
+                    item
+                    for item in life_items
+                    if isinstance(item, dict)
+                    and item_author_sec_uid(item) in ("", sec_user_id)
+                ]
+            if items:
+                return items, life_source, True
+        if life_source:
+            last_message = life_source
+            if "empty pack" in life_source or life_source.startswith("http"):
+                supported = True
+                supported_message = life_source
+    except LoginRequiredError:
+        raise
+    except Exception as exc:
+        last_message = f"mobile_life_feed: {exc}"
+
+    # 4) Web-signed life/feed — accepted schema, often empty for 24h rings.
     try:
         life_data, life_source = request_life_feed(client, profile, sec_user_id, user_id=user_id)
     except LoginRequiredError:
@@ -2711,7 +3586,7 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
         last_message = message
         supported_message = message
 
-    # 3) Web candidates (familiar friend posts, legacy moment paths).
+    # 5) Web candidates (familiar friend posts, legacy moment paths).
     for path in STORY_PATH_CANDIDATES:
         try:
             data = request_json(client, profile, path, sec_user_id, 0, 20, path_kind="story")
@@ -2752,13 +3627,43 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
             # posts that happen to be stories, and is often empty even when
             # life/feed would (or did) report pack status.
 
+    ring_active = False
     try:
-        if profile_has_active_story(client, profile, sec_user_id):
-            return [], MOBILE_ONLY_STORY_MESSAGE, False
+        ring_active = profile_has_active_story(client, profile, sec_user_id)
     except LoginRequiredError:
         raise
     except Exception:
-        pass
+        ring_active = False
+
+    # 5) Logged-in browser: click the avatar ring and harvest the viewer APIs.
+    if ring_active:
+        try:
+            browser_items, browser_source = fetch_stories_via_browser(profile, sec_user_id)
+            if browser_items:
+                items = _filter_story_items(
+                    browser_items,
+                    sec_user_id,
+                    require_story_marker=False,
+                    require_author_match=True,
+                )
+                if not items:
+                    items = [
+                        item
+                        for item in browser_items
+                        if isinstance(item, dict)
+                        and item_author_sec_uid(item) in ("", sec_user_id)
+                    ]
+                if items:
+                    return items, browser_source, True
+            if browser_source:
+                last_message = browser_source
+        except LoginRequiredError:
+            raise
+        except Exception as exc:
+            last_message = f"browser_story: {exc}"
+
+    if ring_active:
+        return [], MOBILE_ONLY_STORY_MESSAGE, False
     return [], supported_message or last_message or "No supported story endpoint returned items", supported
 
 
@@ -2783,8 +3688,9 @@ def download_profile(
     limit=0,
     progress_callback=None,
 ):
-    # Profile videos are captured through a dedicated anonymous browser because
-    # Douyin returns empty /aweme/post bodies to standalone HTTP clients.
+    # Posted works use the app login (signed mobile post API) when a session
+    # exists. Without login, public works still go through anonymous HTTP/browser.
+    # Live-room probes stay cookieless and are not part of this path.
     profile = dict(profile)
     settings = settings or {}
     output_dir = Path(profile.get("output_dir") or ROOT_DOWNLOAD_DIR / safe_name(profile.get("name")))
@@ -2826,59 +3732,84 @@ def download_profile(
                     pages=0,
                     found=0,
                 )
-                # ?? Fast path: try direct HTTP API first (no browser). ??
-                # Douyin often returns empty bodies to plain HTTP clients
-                # (Argus), but a valid session sometimes passes.  Trying
-                # HTTP first avoids the ~10 s browser navigation overhead
-                # and reduces captcha exposure.
-                # OPT-D: Skip HTTP if it has failed repeatedly for this profile.
+                # App-session path first: signed mobile post list sees notes,
+                # restricted works, and time-limited stories. Fall back to the
+                # anonymous web/browser paths when no session exists or mobile
+                # does not return items.
                 posts = None
                 _fp_uid = identity["sec_user_id"]
-                _fp_entry = _http_fastpath_failures.get(_fp_uid, (0, 0))
-                _fp_count, _fp_last_ts = _fp_entry if isinstance(_fp_entry, tuple) else (_fp_entry, 0)
-                # FIX-4.1: Auto-reset counter after cooldown so transient failures
-                # don't permanently disable the HTTP fast-path.
-                if _fp_count >= _HTTP_FASTPATH_MAX_FAILURES and (time.time() - _fp_last_ts) > _HTTP_FASTPATH_COOLDOWN:
-                    with _http_fastpath_lock:  # FIX-7.1
-                        _fp_count = 0
-                        _http_fastpath_failures[_fp_uid] = (0, 0)
-                    logging.info("HTTP fast-path cooldown expired for %s, re-enabling.", profile.get("name"))
-                _fp_skip = _fp_count >= _HTTP_FASTPATH_MAX_FAILURES
-                if _fp_skip:
-                    logging.debug("HTTP fast-path skipped for %s (too many consecutive failures).", profile.get("name"))
-                else:
-                    _fp_skip_counter = False
+                _app_cookie = _mobile_cookie_header((profile.get("cookies") or "").strip())
+                if _app_cookie:
                     try:
-                        posts = fetch_posts(
-                            client, profile, _fp_uid,
-                            limit=limit, progress_callback=progress_callback,
+                        posts = fetch_posts_via_mobile_api(
+                            client,
+                            _fp_uid,
+                            limit=limit,
+                            cookie_header=_app_cookie,
                         )
                         if posts:
-                            _http_fastpath_failures[_fp_uid] = (0, 0)  # reset on success
                             logging.info(
-                                "HTTP fast-path returned %d posts for %s (no browser needed).",
-                                len(posts), profile.get("name"),
+                                "App login mobile post API returned %d posts for %s.",
+                                len(posts),
+                                profile.get("name"),
                             )
-                    except CaptchaDetectedError:
-                        raise  # captcha on HTTP ? propagate, do NOT try browser
-                    except LoginRequiredError as _fp_exc:
-                        # FIX-8.1: LoginRequired should fall through to browser (which
-                        # applies session cookies), but NOT increment the failure counter
-                        # since it's a permanent condition, not a transient HTTP issue.
-                        logging.debug("HTTP fast-path got LoginRequired for %s; trying browser with cookies.", profile.get("name"))
+                    except LoginRequiredError:
                         posts = None
-                        _fp_skip_counter = True  # signal to skip counter increment below
-                    except EmptyApiResponseError as _fp_exc:
-                        logging.debug("HTTP fast-path got %s for %s; falling through to browser.", type(_fp_exc).__name__, profile.get("name"))
-                        posts = None  # expected - fall through to browser
-                    except Exception as _fp_exc:
-                        logging.debug("HTTP fast-path unexpected %s for %s; falling through to browser.", type(_fp_exc).__name__, profile.get("name"))
-                        posts = None  # any other HTTP failure - browser fallback
-                    if not posts and not _fp_skip_counter:
+                    except Exception as _mob_exc:
+                        logging.debug(
+                            "App login mobile post API failed for %s: %s",
+                            profile.get("name"),
+                            _mob_exc,
+                        )
+                        posts = None
+
+                # OPT-D: Skip HTTP if it has failed repeatedly for this profile.
+                if not posts:
+                    _fp_entry = _http_fastpath_failures.get(_fp_uid, (0, 0))
+                    _fp_count, _fp_last_ts = _fp_entry if isinstance(_fp_entry, tuple) else (_fp_entry, 0)
+                    # FIX-4.1: Auto-reset counter after cooldown so transient failures
+                    # don't permanently disable the HTTP fast-path.
+                    if _fp_count >= _HTTP_FASTPATH_MAX_FAILURES and (time.time() - _fp_last_ts) > _HTTP_FASTPATH_COOLDOWN:
                         with _http_fastpath_lock:  # FIX-7.1
-                            _fp_prev = _http_fastpath_failures.get(_fp_uid, (0, 0))
-                            _fp_prev_count = _fp_prev[0] if isinstance(_fp_prev, tuple) else _fp_prev
-                            _http_fastpath_failures[_fp_uid] = (_fp_prev_count + 1, time.time())
+                            _fp_count = 0
+                            _http_fastpath_failures[_fp_uid] = (0, 0)
+                        logging.info("HTTP fast-path cooldown expired for %s, re-enabling.", profile.get("name"))
+                    _fp_skip = _fp_count >= _HTTP_FASTPATH_MAX_FAILURES
+                    if _fp_skip:
+                        logging.debug("HTTP fast-path skipped for %s (too many consecutive failures).", profile.get("name"))
+                    else:
+                        _fp_skip_counter = False
+                        try:
+                            posts = fetch_posts(
+                                client, profile, _fp_uid,
+                                limit=limit, progress_callback=progress_callback,
+                            )
+                            if posts:
+                                _http_fastpath_failures[_fp_uid] = (0, 0)  # reset on success
+                                logging.info(
+                                    "HTTP fast-path returned %d posts for %s (no browser needed).",
+                                    len(posts), profile.get("name"),
+                                )
+                        except CaptchaDetectedError:
+                            raise  # captcha on HTTP ? propagate, do NOT try browser
+                        except LoginRequiredError as _fp_exc:
+                            # FIX-8.1: LoginRequired should fall through to browser (which
+                            # applies session cookies), but NOT increment the failure counter
+                            # since it's a permanent condition, not a transient HTTP issue.
+                            logging.debug("HTTP fast-path got LoginRequired for %s; trying browser with cookies.", profile.get("name"))
+                            posts = None
+                            _fp_skip_counter = True  # signal to skip counter increment below
+                        except EmptyApiResponseError as _fp_exc:
+                            logging.debug("HTTP fast-path got %s for %s; falling through to browser.", type(_fp_exc).__name__, profile.get("name"))
+                            posts = None  # expected - fall through to browser
+                        except Exception as _fp_exc:
+                            logging.debug("HTTP fast-path unexpected %s for %s; falling through to browser.", type(_fp_exc).__name__, profile.get("name"))
+                            posts = None  # any other HTTP failure - browser fallback
+                        if not posts and not _fp_skip_counter:
+                            with _http_fastpath_lock:  # FIX-7.1
+                                _fp_prev = _http_fastpath_failures.get(_fp_uid, (0, 0))
+                                _fp_prev_count = _fp_prev[0] if isinstance(_fp_prev, tuple) else _fp_prev
+                                _http_fastpath_failures[_fp_uid] = (_fp_prev_count + 1, time.time())
 
                 if not posts:
                     try:
@@ -2895,10 +3826,9 @@ def download_profile(
                         )
                         posts = None
                 if posts is None:
-                    # Mobile API fallback — uses X-Gorgon signing, bypasses
-                    # both the broken web ABogus path and the browser path.
+                    # Last-resort mobile retry after anonymous web/browser failed.
                     try:
-                        _mob_cookie = (profile.get("cookies") or "").strip() or load_session_cookie_header()
+                        _mob_cookie = _mobile_cookie_header((profile.get("cookies") or "").strip())
                         posts = fetch_posts_via_mobile_api(
                             client,
                             identity["sec_user_id"],
@@ -3064,7 +3994,7 @@ def _detail_query(aweme_id, cookie_header):
 
 def fetch_aweme_detail(client, aweme_id, cookie_header=""):
     """Fetch one aweme via the signed web detail API (videos and image notes)."""
-    cookies = (cookie_header or "").strip() or load_session_cookie_header()
+    cookies = (cookie_header or "").strip() or _mobile_cookie_header()
     params = _detail_query(aweme_id, cookies)
     url, ua = signed_douyin_url(AWEME_DETAIL_PATH, params)
     headers = _request_headers({"cookies": cookies}, "", ua, cookies, params["msToken"])
@@ -3140,7 +4070,7 @@ def download_video_by_url(url, output_dir=None, progress_callback=None):
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         return _single_video_result("error", f"Cannot create output folder: {exc}", output_dir=str(out_dir))
-    cookies = load_session_cookie_header()
+    cookies = _mobile_cookie_header()
     timeout = httpx.Timeout(60, connect=15, read=60, write=60, pool=30)
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True, http2=False) as client:
