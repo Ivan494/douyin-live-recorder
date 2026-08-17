@@ -74,7 +74,7 @@ STORY_NESTED_LIST_KEYS = (
     "item_list",
 )
 MOBILE_ONLY_STORY_MESSAGE = (
-    "Active story detected, but no downloadable story media was returned."
+    "No downloadable 24-hour story media is visible to this login."
 )
 _SESSION_REQUIRED_COOKIES = {"sessionid", "sessionid_ss", "uid_tt", "uid_tt_ss"}
 
@@ -481,6 +481,10 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
             if items:
                 return items, f"{host}{path}"
             last_message = f"{host}{path}: empty pack"
+            # profile/list is the real 日常 tab. status 0 + no items means
+            # there is no active story, even if web story_tab_empty is false.
+            if path == STORY_PROFILE_LIST_PATH:
+                return None, last_message
     return None, last_message
 
 
@@ -2214,6 +2218,8 @@ def response_has_login_tip(data):
 
 
 def profile_has_active_story(client, profile, sec_user_id):
+    """Web profile flag only. story_tab_empty=false means the 日常 tab exists,
+    not that an unseen 24h story is live. Use /story/profile/list/ for that."""
     data = request_json(
         client,
         profile,
@@ -3512,6 +3518,8 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
                 return items, feed_source, True
         if feed_source:
             last_message = feed_source
+            if STORY_PROFILE_LIST_PATH in feed_source and "empty pack" in feed_source:
+                return [], feed_source, True
             if "empty pack" in feed_source or feed_source.startswith("http"):
                 supported = True
                 supported_message = feed_source

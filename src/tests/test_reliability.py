@@ -469,7 +469,7 @@ class ReliabilityTest(unittest.TestCase):
         summary = {"stories": {"status": "mobile_only"}}
 
         self.assertEqual(
-            "Stories: active, mobile app access required",
+            "Stories: none visible to this login",
             app.MediaDownloadEngine.summarize_kind(summary, "stories"),
         )
 

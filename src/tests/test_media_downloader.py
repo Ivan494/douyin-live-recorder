@@ -313,7 +313,8 @@ class MediaDownloaderTest(unittest.TestCase):
             return {"status_code": 0, "data": []}
 
         with patch.object(media, "fetch_stories_via_mobile_post_api", return_value=(None, "no post stories")), patch.object(
-            media, "fetch_stories_via_mobile_story_feed", return_value=(None, "empty pack")
+            media, "fetch_stories_via_mobile_story_feed",
+            return_value=(None, "https://aweme.snssdk.com/aweme/v1/story/profile/list/: empty pack"),
         ), patch.object(
             media, "fetch_stories_via_mobile_life_feed", return_value=(None, "no life")
         ), patch.object(
@@ -328,8 +329,9 @@ class MediaDownloaderTest(unittest.TestCase):
             items, source, supported = media.fetch_stories(object(), {"cookies": "x"}, target)
 
         self.assertEqual([], items)
-        self.assertFalse(supported)
-        self.assertIn("no downloadable story media", source.lower())
+        self.assertTrue(supported)
+        self.assertIn("story/profile/list", source)
+        self.assertIn("empty pack", source.lower())
 
     def test_historical_image_notes_do_not_mask_active_story_ring(self):
         target = "target-sec-uid"
@@ -351,7 +353,8 @@ class MediaDownloaderTest(unittest.TestCase):
             "fetch_stories_via_mobile_post_api",
             return_value=([old_note], "https://aweme.snssdk.com/aweme/v1/aweme/post/ (mobile, 1 stories)"),
         ), patch.object(
-            media, "fetch_stories_via_mobile_story_feed", return_value=(None, "empty pack")
+            media, "fetch_stories_via_mobile_story_feed",
+            return_value=(None, "https://aweme.snssdk.com/aweme/v1/story/profile/list/: empty pack"),
         ), patch.object(
             media, "fetch_stories_via_mobile_life_feed", return_value=(None, "no life")
         ), patch.object(
@@ -366,8 +369,38 @@ class MediaDownloaderTest(unittest.TestCase):
             items, source, supported = media.fetch_stories(object(), {"cookies": "x"}, target)
 
         self.assertEqual([], items)
-        self.assertFalse(supported)
-        self.assertIn("no downloadable story media", source.lower())
+        self.assertTrue(supported)
+        self.assertIn("story/profile/list", source)
+        self.assertIn("empty pack", source.lower())
+
+    def test_empty_profile_list_is_authoritative_no_stories(self):
+        target = "target-sec-uid"
+        payload = {
+            "status_code": 0,
+            "active_data": {"data": None, "has_more": False},
+            "month_list": [],
+        }
+        response = MagicMock()
+        response.json.return_value = payload
+        seen = []
+
+        def fake_request(_client, method, path, extra, *_args, **_kwargs):
+            seen.append(path)
+            return response
+
+        with patch.object(media, "_check_mobile_signer", return_value=True), patch.object(
+            media, "_mobile_signed_request", side_effect=fake_request
+        ), patch.object(media, "_persistent_mobile_device", return_value=("1" * 16, "2" * 16)), patch.object(
+            media, "_mobile_device_profile", return_value={"own_uid": "551"}
+        ):
+            items, source = media.fetch_stories_via_mobile_story_feed(
+                object(), "sec", user_id="1234567890", cookie_header="sid=1"
+            )
+
+        self.assertIsNone(items)
+        self.assertIn(media.STORY_PROFILE_LIST_PATH, source)
+        self.assertIn("empty pack", source)
+        self.assertEqual([media.STORY_PROFILE_LIST_PATH], seen)
 
     def test_mobile_story_feed_is_used_before_web_fallbacks(self):
         target = "target-sec-uid"
