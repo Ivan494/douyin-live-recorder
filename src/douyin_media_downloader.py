@@ -743,6 +743,7 @@ def load_session_cookie_header():
         encrypted = base64.b64decode(encoded)
         return dpapi_unprotect(encrypted).decode("utf-8")
     except Exception:
+        logging.warning("Saved Douyin session could not be decrypted; treating as logged out.")
         return ""
 
 
@@ -769,6 +770,7 @@ def load_mobile_session_cookie_header():
         encrypted = base64.b64decode(encoded)
         return dpapi_unprotect(encrypted).decode("utf-8")
     except Exception:
+        logging.warning("Saved mobile session could not be decrypted; treating as logged out.")
         return ""
 
 
@@ -895,6 +897,9 @@ class CdpSession:
         if self._sock is not None:
             return
         parsed = urllib.parse.urlparse(self.websocket_url)
+        host = (parsed.hostname or "").lower()
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            raise RuntimeError(f"Refusing CDP WebSocket host that is not loopback: {host or '?'}")
         sock = socket.create_connection((parsed.hostname, parsed.port or 80), timeout=self.timeout)
         sock.settimeout(self.timeout)
         key = base64.b64encode(os.urandom(16)).decode("ascii")
@@ -1122,6 +1127,7 @@ def _ensure_media_fetch_browser(port=FETCH_BROWSER_CDP_PORT):
         "--headless=new",
         "--disable-gpu",
         f"--remote-debugging-port={port}",
+        "--remote-debugging-address=127.0.0.1",
         f"--user-data-dir={FETCH_BROWSER_PROFILE_DIR}",
         "--profile-directory=Default",
         "--no-first-run",
@@ -1929,8 +1935,30 @@ def saved_session_info():
 
 
 def clear_saved_session():
+    """Remove DPAPI session files, device binding, and Chromium cookie jars."""
     SESSION_FILE.unlink(missing_ok=True)
     MOBILE_SESSION_FILE.unlink(missing_ok=True)
+    MOBILE_DEVICE_FILE.unlink(missing_ok=True)
+    _wipe_fetch_browser_cookie_store()
+
+
+def _wipe_fetch_browser_cookie_store():
+    """Best-effort wipe of plaintext Chromium cookies left by the login browser."""
+    profile_root = FETCH_BROWSER_PROFILE_DIR
+    if not profile_root.exists():
+        return
+    targets = [
+        profile_root / "Default" / "Cookies",
+        profile_root / "Default" / "Cookies-journal",
+        profile_root / "Default" / "Network" / "Cookies",
+        profile_root / "Default" / "Network" / "Cookies-journal",
+        profile_root / "Default" / "Network" / "Cookies-encrypt",
+    ]
+    for path in targets:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logging.debug("Could not remove browser cookie file %s", path)
 
 
 def find_browser_executable():
@@ -2036,6 +2064,7 @@ def launch_douyin_login_browser():
         command = [
             str(browser_path),
             f"--remote-debugging-port={port}",
+            "--remote-debugging-address=127.0.0.1",
             f"--user-data-dir={FETCH_BROWSER_PROFILE_DIR}",
             "--profile-directory=Default",
             "--no-first-run",
@@ -2109,7 +2138,7 @@ def load_json(path, fallback):
 
 def save_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)
     tmp.replace(path)
@@ -2336,7 +2365,10 @@ def aweme_filename(aweme, suffix=".mp4"):
     if not _fallback_id:
         import random as _rnd
         _fallback_id = f"ts{int(time.time() * 1000)}_{_rnd.randint(1000, 9999)}"
-    aweme_id = _fallback_id
+    # Strict id sanitize: alnum/_/- only so separators and ".." cannot escape
+    # the download directory when the name is joined under target_dir.
+    aweme_id = re.sub(r"[^A-Za-z0-9_-]+", "_", _fallback_id).strip("_") or "unknown"
+    aweme_id = aweme_id[:64]
     # FIX-D1: Use (x or {}) to handle share_info being JSON null.
     desc = safe_name(aweme.get("desc") or (aweme.get("share_info") or {}).get("share_title") or aweme_id)
     # FIX-PATHLEN: Truncate description to prevent exceeding Windows MAX_PATH

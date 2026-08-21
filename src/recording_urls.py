@@ -13,6 +13,23 @@ def _text_attr(stream, name):
     return ""
 
 
+def is_safe_recording_url(url):
+    """Only allow http(s) stream URLs for FFmpeg -i inputs.
+
+    Rejects file:, concat:, pipe:, and other protocols that could read local
+    files or otherwise surprise the recorder if a stream URL is poisoned.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return False
+    parsed = urlparse(text)
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+    if not parsed.netloc:
+        return False
+    return True
+
+
 def _url_path(url):
     return urlparse(url).path.lower()
 
@@ -26,18 +43,24 @@ def _url_kind(url):
     return "direct"
 
 
+def _safe_candidate(url, kind):
+    if is_safe_recording_url(url):
+        return url, kind
+    return "", ""
+
+
 def recording_input_url(stream):
     flv_url = _text_attr(stream, "flv_url")
     if flv_url:
-        return flv_url, "flv"
+        return _safe_candidate(flv_url, "flv")
 
     record_url = _text_attr(stream, "record_url")
     if record_url:
-        return record_url, _url_kind(record_url)
+        return _safe_candidate(record_url, _url_kind(record_url))
 
     m3u8_url = _text_attr(stream, "m3u8_url")
     if m3u8_url:
-        return m3u8_url, "hls"
+        return _safe_candidate(m3u8_url, "hls")
 
     return "", ""
 
@@ -72,9 +95,13 @@ def ffmpeg_live_input_options(
         "-fflags",
         "+discardcorrupt+genpts",
     ]
-    if str(input_url or "").lower().startswith(("http://", "https://")):
+    if is_safe_recording_url(input_url):
+        # Keep the protocol surface narrow even if FFmpeg is invoked with a
+        # surprising URL after a future caller bypasses recording_input_url.
         options.extend(
             [
+                "-protocol_whitelist",
+                "http,https,tcp,tls,crypto",
                 "-reconnect",
                 "1",
                 "-reconnect_streamed",

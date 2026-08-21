@@ -790,6 +790,7 @@ class MediaDownloaderTest(unittest.TestCase):
         command = popen.call_args.args[0]
         self.assertEqual(str(executable), command[0])
         self.assertIn("--remote-debugging-port=9456", command)
+        self.assertIn("--remote-debugging-address=127.0.0.1", command)
         self.assertIn(f"--user-data-dir={profile_dir}", command)
         self.assertEqual("http://127.0.0.1:9456", launched["cdp_url"])
         self.assertEqual(str(profile_dir), launched["profile_dir"])
@@ -909,7 +910,11 @@ class MediaDownloaderTest(unittest.TestCase):
                 media, "chrome_cdp_command", return_value={"cookies": cookies}
             ), patch.object(media, "SESSION_FILE", session_file), patch.object(
                 media, "MOBILE_SESSION_FILE", mobile_file
-            ), patch.object(media, "MOBILE_DEVICE_FILE", device_file):
+            ), patch.object(media, "MOBILE_DEVICE_FILE", device_file), patch.object(
+                media, "dpapi_protect", side_effect=lambda data: b"enc-" + data
+            ), patch.object(
+                media, "dpapi_unprotect", side_effect=lambda data: data[4:]
+            ):
                 result = media.import_chrome_session("http://127.0.0.1:9344")
 
             self.assertTrue(result["app_capable"])
@@ -921,7 +926,11 @@ class MediaDownloaderTest(unittest.TestCase):
             self.assertTrue(str(device.get("cdid") or ""))
             with patch.object(media, "SESSION_FILE", session_file), patch.object(
                 media, "MOBILE_SESSION_FILE", mobile_file
-            ), patch.object(media, "MOBILE_DEVICE_FILE", device_file):
+            ), patch.object(media, "MOBILE_DEVICE_FILE", device_file), patch.object(
+                media, "dpapi_protect", side_effect=lambda data: b"enc-" + data
+            ), patch.object(
+                media, "dpapi_unprotect", side_effect=lambda data: data[4:]
+            ):
                 self.assertIn("sessionid=sid", media.load_session_cookie_header())
                 self.assertIn("sessionid=sid", media.load_mobile_session_cookie_header())
                 info = media.saved_session_info()
@@ -961,20 +970,42 @@ class MediaDownloaderTest(unittest.TestCase):
             session_file = root / "douyin_session.json"
             mobile_file = root / "mobile_session.json"
             device_file = root / "mobile_device.json"
+            browser_dir = root / "edge-profile"
+            (browser_dir / "Default").mkdir(parents=True)
+            (browser_dir / "Default" / "Cookies").write_text("cookie-db", encoding="utf-8")
             with patch.object(media, "SESSION_FILE", session_file), patch.object(
                 media, "MOBILE_SESSION_FILE", mobile_file
-            ), patch.object(media, "MOBILE_DEVICE_FILE", device_file):
+            ), patch.object(media, "MOBILE_DEVICE_FILE", device_file), patch.object(
+                media, "FETCH_BROWSER_PROFILE_DIR", browser_dir
+            ), patch.object(media, "dpapi_protect", side_effect=lambda data: b"enc-" + data), patch.object(
+                media, "dpapi_unprotect", side_effect=lambda data: data[4:]
+            ):
                 media.save_session_cookie_header("sessionid=web; uid_tt=u", source="test")
                 header = media.promote_web_session_to_app()
                 self.assertIn("sessionid=web", header)
                 self.assertIn("sessionid=web", media.load_mobile_session_cookie_header())
+                self.assertTrue(device_file.exists())
                 profile = media.apply_saved_session({})
                 self.assertIn("sessionid=web", profile["cookies"])
                 media.clear_saved_session()
                 self.assertFalse(session_file.exists())
                 self.assertFalse(mobile_file.exists())
+                self.assertFalse(device_file.exists())
+                self.assertFalse((browser_dir / "Default" / "Cookies").exists())
                 self.assertEqual("", media._mobile_cookie_header())
 
+    def test_aweme_filename_sanitizes_path_traversal_ids(self):
+        name = media.aweme_filename(
+            {
+                "aweme_id": r"..\..\evil/id",
+                "desc": "clip",
+                "create_time": 1_700_000_000,
+            }
+        )
+        self.assertNotIn("..", name)
+        self.assertNotIn("/", name)
+        self.assertNotIn("\\", name)
+        self.assertTrue(name.endswith("_clip.mp4") or "_clip.mp4" in name)
     def test_mobile_base_params_reuse_stable_cdid(self):
         with patch.object(
             media,

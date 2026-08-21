@@ -38,6 +38,25 @@ class RecordingUrlSelectionTest(unittest.TestCase):
 
         self.assertIn("-rw_timeout", options)
         self.assertNotIn("-reconnect", options)
+        self.assertNotIn("-protocol_whitelist", options)
+
+    def test_rejects_non_http_stream_urls(self):
+        stream = SimpleNamespace(
+            flv_url="file:C:/temp/live.flv",
+            m3u8_url="concat:evil",
+            record_url="pipe:1",
+        )
+
+        self.assertEqual(("", ""), recording_input_url(stream))
+        self.assertFalse(has_recording_url(stream))
+
+    def test_live_http_input_options_include_protocol_whitelist(self):
+        options = ffmpeg_live_input_options("https://cdn.example/live.flv")
+
+        self.assertEqual(
+            "http,https,tcp,tls,crypto",
+            options[options.index("-protocol_whitelist") + 1],
+        )
 
     def test_uses_record_url_when_no_flv_exists(self):
         stream = SimpleNamespace(

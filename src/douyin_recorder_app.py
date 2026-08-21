@@ -423,8 +423,25 @@ def last_log_line(path):
     for line in reversed(lines):
         stripped = line.strip()
         if stripped:
-            return stripped[:180]
+            return redact_sensitive_text(stripped)[:180]
     return ""
+
+
+def redact_sensitive_text(text):
+    """Strip query strings from URLs so signed CDN tokens do not reach the UI."""
+    return re.sub(r"(https?://[^\s\"']+?)(\?[^\s\"']*)", r"\1?[redacted]", str(text or ""))
+
+
+def _looks_like_cookie_header(value):
+    text = str(value or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(name in lowered for name in ("sessionid=", "uid_tt=", "sid_tt=", "sid_guard=")):
+        return True
+    if ";" in text and "=" in text and not Path(text).suffix:
+        return True
+    return False
 
 
 def hidden_subprocess_kwargs():
@@ -915,6 +932,13 @@ class RecorderStore:
                 profile["container"] = "mkv"
                 migrated = True
             profile.setdefault("cookies", "")
+            # Never keep Douyin session cookie headers in profiles.json.
+            # Auth lives in DPAPI-encrypted session files only. YouTube may
+            # still use cookies as a Netscape cookie *file path*.
+            cookies_value = str(profile.get("cookies") or "").strip()
+            if cookies_value and _looks_like_cookie_header(cookies_value):
+                profile["cookies"] = ""
+                migrated = True
             profile.setdefault("proxy_addr", "")
             profile.setdefault("stream_orientation", 1)
             profile.setdefault("poll_interval_seconds", existing_interval)
@@ -2036,7 +2060,13 @@ class MonitorEngine:
         ]
         cookies = (profile.get("cookies") or "").strip()
         if cookies:
-            cmd[1:1] = ["--cookies", cookies]
+            cookie_path = Path(cookies)
+            if cookie_path.is_file():
+                cmd[1:1] = ["--cookies", str(cookie_path)]
+            else:
+                logging.warning(
+                    "Ignoring YouTube cookies value that is not an existing Netscape cookie file."
+                )
         result = subprocess.run(
             cmd,
             text=True,
@@ -2482,7 +2512,8 @@ class AdoptedProcess:
         if pid_is_running(self.pid, not_started_after=self._adopted_at):
             return None
         if self.returncode is None:
-            self.returncode = 0
+            # Unknown exit status for an adopted process — do not report success.
+            self.returncode = 1
         return self.returncode
 
     def terminate(self):
@@ -2745,7 +2776,12 @@ class ProfileDialog(Toplevel):
             "auto_download_videos": self.auto_videos_var.get() if platform == "douyin" else False,
             "auto_download_stories": self.auto_stories_var.get() if platform == "douyin" else False,
             "media_poll_interval_seconds": media_interval,
-            "cookies": self.profile.get("cookies", ""),
+            # Douyin auth is DPAPI session files only — never persist cookie headers here.
+            "cookies": "" if platform == "douyin" else (
+                self.profile.get("cookies", "")
+                if not _looks_like_cookie_header(self.profile.get("cookies", ""))
+                else ""
+            ),
             "proxy_addr": self.profile.get("proxy_addr", ""),
             "stream_orientation": self.profile.get("stream_orientation", 1),
         }
