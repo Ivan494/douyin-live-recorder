@@ -101,6 +101,8 @@ class ReliabilityTest(unittest.TestCase):
             with patch.object(engine, "_save_recording_manifest"), patch.object(
                 app, "open", return_value=log_handle
             ), patch.object(
+                app, "resolve_ffmpeg_executable", return_value="ffmpeg.exe"
+            ), patch.object(
                 app.subprocess, "Popen", side_effect=OSError("start failed")
             ):
                 with self.assertRaises(OSError):
@@ -123,6 +125,8 @@ class ReliabilityTest(unittest.TestCase):
             profile = {"id": "test", "name": "Test", "output_dir": temporary_directory}
             with patch.object(engine, "_save_recording_manifest"), patch.object(
                 app, "open", return_value=log_handle
+            ), patch.object(
+                app, "resolve_ffmpeg_executable", return_value="ffmpeg.exe"
             ), patch.object(
                 app.subprocess, "Popen", return_value=process
             ) as popen:

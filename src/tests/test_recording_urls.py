@@ -58,6 +58,16 @@ class RecordingUrlSelectionTest(unittest.TestCase):
             options[options.index("-protocol_whitelist") + 1],
         )
 
+    def test_rejects_private_ip_recording_urls(self):
+        stream = SimpleNamespace(
+            flv_url="http://127.0.0.1/live.flv",
+            m3u8_url="",
+            record_url="",
+        )
+
+        self.assertEqual(("", ""), recording_input_url(stream))
+        self.assertFalse(has_recording_url(stream))
+
     def test_uses_record_url_when_no_flv_exists(self):
         stream = SimpleNamespace(
             flv_url="",

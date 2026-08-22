@@ -24,6 +24,12 @@ import httpx
 from streamget.platforms.douyin.live_stream import DouyinLiveStream
 
 from douyin_abogus import ABogus, BrowserFingerprintGenerator
+from security_utils import (
+    follow_safe_redirects,
+    is_loopback_cdp_url,
+    is_safe_media_download_url,
+    is_safe_share_link_url,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -1854,6 +1860,8 @@ def fetch_posts_via_browser(profile, sec_user_id, limit=0, progress_callback=Non
 
 
 def import_chrome_session(cdp_url=DEFAULT_CHROME_CDP):
+    if not is_loopback_cdp_url(cdp_url):
+        raise RuntimeError(f"Refusing non-loopback Chrome DevTools URL: {cdp_url}")
     endpoint = cdp_url.rstrip("/") + "/json/list"
     with httpx.Client(trust_env=False) as client:
         response = client.get(endpoint, timeout=10)
@@ -1898,6 +1906,10 @@ def import_chrome_session(cdp_url=DEFAULT_CHROME_CDP):
     save_session_cookie_header(cookie_header, cdp_url)
     save_mobile_session_cookie_header(cookie_header, source="edge-qr-app")
     _persistent_mobile_device()
+    try:
+        close_cdp_browser(cdp_url)
+    except Exception:
+        logging.debug("Could not close login browser after import", exc_info=True)
     return {
         "cookie_count": len(cookies),
         "source": cdp_url,
@@ -2017,6 +2029,8 @@ def cdp_is_available(cdp_url):
 
 
 def close_cdp_browser(cdp_url, timeout=10):
+    if not is_loopback_cdp_url(cdp_url):
+        raise RuntimeError(f"Refusing non-loopback Chrome DevTools URL: {cdp_url}")
     endpoint = cdp_url.rstrip("/") + "/json/version"
     with httpx.Client(trust_env=False) as client:
         response = client.get(endpoint, timeout=5)
@@ -2132,8 +2146,20 @@ def map_config_strings(data, mapper):
 def load_json(path, fallback):
     if not path.exists():
         return fallback
-    with open(path, "r", encoding="utf-8-sig") as fh:
-        return map_config_strings(json.load(fh), expand_portable_path)
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            return map_config_strings(json.load(fh), expand_portable_path)
+    except OSError as exc:
+        logging.warning("Could not read JSON file %s: %s", path, exc)
+        return fallback
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        corrupt_name = path.with_suffix(path.suffix + f".corrupt-{int(time.time())}")
+        logging.error("JSON file %s is corrupt (%s); quarantining to %s", path, exc, corrupt_name.name)
+        try:
+            path.rename(corrupt_name)
+        except OSError:
+            pass
+        return fallback
 
 
 def save_json(path, data):
@@ -2841,6 +2867,8 @@ def _verify_downloaded_file(output_path):
 
 
 def download_bytes(client, url, output_path, progress_callback=None, progress_details=None):
+    if not is_safe_media_download_url(url):
+        raise ValueError(f"Refusing unsafe media download URL: {url}")
     # FIX-6.3: Use PID-unique .part suffix to prevent concurrent download corruption.
     import os as _os_mod
     part_path = output_path.with_suffix(output_path.suffix + f".part.{_os_mod.getpid()}")
@@ -3986,8 +4014,14 @@ def resolve_share_link(client, url):
     aweme_id = extract_aweme_id(url)
     if aweme_id:
         return aweme_id
+    if not is_safe_share_link_url(url):
+        return ""
     try:
-        response = client.get(url, follow_redirects=True)
+        response = follow_safe_redirects(
+            client,
+            url,
+            url_validator=is_safe_share_link_url,
+        )
     except Exception:
         return ""
     candidates = [str(item.url) for item in response.history] + [str(response.url)]
@@ -4101,6 +4135,8 @@ def download_video_by_url(url, output_dir=None, progress_callback=None):
     link = extract_url_from_text((url or "").strip())
     if not link:
         return _single_video_result("error", "No Douyin link found in the pasted text.")
+    if not extract_aweme_id(link) and not is_safe_share_link_url(link):
+        return _single_video_result("error", "Refusing non-Douyin share link.")
     out_dir = (
         Path(output_dir).expanduser()
         if str(output_dir or "").strip()

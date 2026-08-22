@@ -1,5 +1,7 @@
 from urllib.parse import urlparse
 
+from security_utils import is_safe_recording_url
+
 # Microseconds. FFmpeg aborts a hung read after this window.
 DEFAULT_RW_TIMEOUT_US = 30_000_000
 # Seconds. Cap backoff while retrying a dropped live pull.
@@ -11,23 +13,6 @@ def _text_attr(stream, name):
     if isinstance(value, str):
         return value.strip()
     return ""
-
-
-def is_safe_recording_url(url):
-    """Only allow http(s) stream URLs for FFmpeg -i inputs.
-
-    Rejects file:, concat:, pipe:, and other protocols that could read local
-    files or otherwise surprise the recorder if a stream URL is poisoned.
-    """
-    text = str(url or "").strip()
-    if not text:
-        return False
-    parsed = urlparse(text)
-    if parsed.scheme.lower() not in ("http", "https"):
-        return False
-    if not parsed.netloc:
-        return False
-    return True
 
 
 def _url_path(url):

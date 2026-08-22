@@ -908,7 +908,9 @@ class MediaDownloaderTest(unittest.TestCase):
             device_file = root / "mobile_device.json"
             with patch.object(media.httpx, "Client", return_value=client), patch.object(
                 media, "chrome_cdp_command", return_value={"cookies": cookies}
-            ), patch.object(media, "SESSION_FILE", session_file), patch.object(
+            ), patch.object(media, "close_cdp_browser") as close_browser, patch.object(
+                media, "SESSION_FILE", session_file
+            ), patch.object(
                 media, "MOBILE_SESSION_FILE", mobile_file
             ), patch.object(media, "MOBILE_DEVICE_FILE", device_file), patch.object(
                 media, "dpapi_protect", side_effect=lambda data: b"enc-" + data
@@ -917,6 +919,7 @@ class MediaDownloaderTest(unittest.TestCase):
             ):
                 result = media.import_chrome_session("http://127.0.0.1:9344")
 
+            close_browser.assert_called_once_with("http://127.0.0.1:9344")
             self.assertTrue(result["app_capable"])
             self.assertTrue(session_file.is_file())
             self.assertTrue(mobile_file.is_file())
@@ -936,6 +939,14 @@ class MediaDownloaderTest(unittest.TestCase):
                 info = media.saved_session_info()
             self.assertTrue(info["logged_in"])
             self.assertTrue(info["app_capable"])
+
+    def test_import_chrome_session_rejects_remote_cdp(self):
+        with self.assertRaises(RuntimeError):
+            media.import_chrome_session("http://192.168.1.5:9222")
+
+    def test_download_bytes_rejects_untrusted_host(self):
+        with self.assertRaises(ValueError):
+            media.download_bytes(object(), "https://evil.example/video.mp4", Path("out.mp4"))
 
     def test_fetch_posts_via_mobile_api_reuses_bound_device(self):
         payload = {
