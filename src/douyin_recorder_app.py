@@ -30,6 +30,8 @@ from streamget.platforms.douyin.live_stream import DouyinLiveStream
 from douyin_media_downloader import (
     CaptchaDetectedError,
     DEFAULT_CHROME_CDP,
+    clear_saved_session,
+    close_cdp_browser,
     download_profile,
     download_video_by_url,
     import_chrome_session,
@@ -39,8 +41,10 @@ from douyin_media_downloader import (
 from recording_urls import (
     ffmpeg_live_input_options,
     has_recording_url,
+    is_safe_recording_url,
     recording_input_url,
 )
+from security_utils import default_trusted_tool_roots, resolve_trusted_executable
 from i18n import LANGUAGE_CHOICES, set_language, t
 
 
@@ -423,8 +427,45 @@ def last_log_line(path):
     for line in reversed(lines):
         stripped = line.strip()
         if stripped:
-            return stripped[:180]
+            return redact_sensitive_text(stripped)[:180]
     return ""
+
+
+def redact_sensitive_text(text):
+    """Strip query strings from URLs so signed CDN tokens do not reach the UI."""
+    return re.sub(r"(https?://[^\s\"']+?)(\?[^\s\"']*)", r"\1?[redacted]", str(text or ""))
+
+
+def _looks_like_cookie_header(value):
+    text = str(value or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(name in lowered for name in ("sessionid=", "uid_tt=", "sid_tt=", "sid_guard=")):
+        return True
+    if ";" in text and "=" in text and not Path(text).suffix:
+        return True
+    return False
+
+
+def _trusted_tool_roots():
+    return default_trusted_tool_roots(APP_DIR, TOOLS_DIR)
+
+
+def resolve_ffmpeg_executable(path_text):
+    return resolve_trusted_executable(
+        path_text,
+        allowed_basenames={"ffmpeg.exe"},
+        trusted_roots=_trusted_tool_roots(),
+    )
+
+
+def resolve_ytdlp_executable(path_text):
+    return resolve_trusted_executable(
+        path_text,
+        allowed_basenames={"yt-dlp.exe"},
+        trusted_roots=_trusted_tool_roots(),
+    )
 
 
 def hidden_subprocess_kwargs():
@@ -915,6 +956,13 @@ class RecorderStore:
                 profile["container"] = "mkv"
                 migrated = True
             profile.setdefault("cookies", "")
+            # Never keep Douyin session cookie headers in profiles.json.
+            # Auth lives in DPAPI-encrypted session files only. YouTube may
+            # still use cookies as a Netscape cookie *file path*.
+            cookies_value = str(profile.get("cookies") or "").strip()
+            if cookies_value and _looks_like_cookie_header(cookies_value):
+                profile["cookies"] = ""
+                migrated = True
             profile.setdefault("proxy_addr", "")
             profile.setdefault("stream_orientation", 1)
             profile.setdefault("poll_interval_seconds", existing_interval)
@@ -1676,14 +1724,22 @@ class MonitorEngine:
         return "file '" + normalized + "'"
 
     def _validate_final_recording(self, path):
-        probe_path = Path(self.store.settings.get("ffprobe_path") or DEFAULT_FFPROBE_PATH)
+        probe_setting = self.store.settings.get("ffprobe_path") or str(DEFAULT_FFPROBE_PATH)
+        try:
+            probe_path = resolve_trusted_executable(
+                probe_setting,
+                allowed_basenames={"ffprobe.exe"},
+                trusted_roots=_trusted_tool_roots(),
+            )
+        except ValueError:
+            probe_path = ""
         if not path.exists() or path.stat().st_size <= 0:
             raise RuntimeError("Final MKV was not created or is empty")
-        if not probe_path.exists():
+        if not probe_path:
             return
         result = subprocess.run(
             [
-                str(probe_path),
+                probe_path,
                 "-v",
                 "error",
                 "-show_entries",
@@ -1727,7 +1783,7 @@ class MonitorEngine:
             recording["stop_reason"] = reason
             self._save_recording_manifest(recording)
             command = [
-                self.store.settings["ffmpeg_path"],
+                resolve_ffmpeg_executable(self.store.settings["ffmpeg_path"]),
                 "-hide_banner",
                 "-nostdin",
                 "-loglevel",
@@ -2025,7 +2081,7 @@ class MonitorEngine:
 
     def _run_ytdlp_json(self, profile, url):
         cmd = [
-            self.store.settings.get("ytdlp_path", str(DEFAULT_YTDLP_PATH)),
+            resolve_ytdlp_executable(self.store.settings.get("ytdlp_path", str(DEFAULT_YTDLP_PATH))),
             "--dump-single-json",
             "--no-playlist",
             "--no-warnings",
@@ -2036,7 +2092,13 @@ class MonitorEngine:
         ]
         cookies = (profile.get("cookies") or "").strip()
         if cookies:
-            cmd[1:1] = ["--cookies", cookies]
+            cookie_path = Path(cookies)
+            if cookie_path.is_file():
+                cmd[1:1] = ["--cookies", str(cookie_path)]
+            else:
+                logging.warning(
+                    "Ignoring YouTube cookies value that is not an existing Netscape cookie file."
+                )
         result = subprocess.run(
             cmd,
             text=True,
@@ -2083,6 +2145,8 @@ class MonitorEngine:
         input_url, stream_kind = recording_input_url(stream)
         if not input_url:
             raise RuntimeError("Live stream did not include a recording URL")
+        if not is_safe_recording_url(input_url):
+            raise RuntimeError("Live stream URL uses an unsupported or unsafe protocol")
         recording = self.recordings.get(profile["id"])
         is_resume = bool(recording and recording.get("session_dir"))
         if not is_resume:
@@ -2104,7 +2168,7 @@ class MonitorEngine:
         )
 
         cmd = [
-            self.store.settings["ffmpeg_path"],
+            resolve_ffmpeg_executable(self.store.settings["ffmpeg_path"]),
             "-hide_banner",
             "-nostdin",
             "-loglevel",
@@ -2482,7 +2546,8 @@ class AdoptedProcess:
         if pid_is_running(self.pid, not_started_after=self._adopted_at):
             return None
         if self.returncode is None:
-            self.returncode = 0
+            # Unknown exit status for an adopted process — do not report success.
+            self.returncode = 1
         return self.returncode
 
     def terminate(self):
@@ -2745,7 +2810,12 @@ class ProfileDialog(Toplevel):
             "auto_download_videos": self.auto_videos_var.get() if platform == "douyin" else False,
             "auto_download_stories": self.auto_stories_var.get() if platform == "douyin" else False,
             "media_poll_interval_seconds": media_interval,
-            "cookies": self.profile.get("cookies", ""),
+            # Douyin auth is DPAPI session files only — never persist cookie headers here.
+            "cookies": "" if platform == "douyin" else (
+                self.profile.get("cookies", "")
+                if not _looks_like_cookie_header(self.profile.get("cookies", ""))
+                else ""
+            ),
             "proxy_addr": self.profile.get("proxy_addr", ""),
             "stream_orientation": self.profile.get("stream_orientation", 1),
         }
@@ -2798,6 +2868,7 @@ class DouyinSessionDialog(Toplevel):
         actions.grid(row=4, column=0, sticky="ew", pady=(18, 0))
         ttk.Button(actions, text=t("open_login"), command=self.open_login_browser).pack(side="left")
         ttk.Button(actions, text=t("check_login"), command=self.check_now).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text=t("logout_session"), command=self.logout_session).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text=t("close"), command=self.close_dialog).pack(side="right")
 
         self.refresh_saved_status()
@@ -2856,6 +2927,7 @@ class DouyinSessionDialog(Toplevel):
             self.checking = False
             if result.get("ok"):
                 self.auto_poll = False
+                self.cdp_url = ""
                 info = result["info"]
                 self.status_var.set(t("login_imported"))
                 self.detail_var.set(t("saved_cookies", count=info.get("cookie_count", 0)))
@@ -2869,8 +2941,26 @@ class DouyinSessionDialog(Toplevel):
         if self.winfo_exists():
             self.after(250, self.process_results)
 
+    def logout_session(self):
+        try:
+            clear_saved_session()
+        except Exception as exc:
+            logging.exception("Could not clear saved Douyin session")
+            messagebox.showerror(t("session_clear_failed"), str(exc), parent=self)
+            return
+        self.refresh_saved_status()
+        if self.on_change:
+            self.on_change()
+        messagebox.showinfo(t("session_title"), t("session_cleared"), parent=self)
+
     def close_dialog(self):
         self.auto_poll = False
+        if self.cdp_url:
+            try:
+                close_cdp_browser(self.cdp_url)
+            except Exception:
+                logging.debug("Could not close login browser on dialog close", exc_info=True)
+            self.cdp_url = ""
         self.destroy()
 
 
@@ -2948,8 +3038,8 @@ class SettingsDialog(Toplevel):
             updated_settings = dict(self.store.settings)
             previous_language = updated_settings.get("language") or "zh-CN"
             language_code = self.language_codes.get(self.language_var.get(), "zh-CN")
-            updated_settings["ffmpeg_path"] = self.ffmpeg_var.get().strip()
-            updated_settings["ytdlp_path"] = self.ytdlp_var.get().strip()
+            updated_settings["ffmpeg_path"] = resolve_ffmpeg_executable(self.ffmpeg_var.get().strip())
+            updated_settings["ytdlp_path"] = resolve_ytdlp_executable(self.ytdlp_var.get().strip())
             updated_settings["new_profile_poll_interval_seconds"] = poll
             updated_settings["container"] = "mkv"
             updated_settings["start_hidden_to_tray"] = self.hidden_var.get()

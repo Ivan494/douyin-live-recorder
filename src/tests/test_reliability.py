@@ -62,6 +62,8 @@ class ReliabilityTest(unittest.TestCase):
         self.assertFalse(app.pid_is_running(2_000_000_000))
 
     def test_pid_probe_rejects_a_process_created_after_the_lock(self):
+        if os.name != "nt":
+            self.skipTest("Windows PID creation-time probe only")
         unix_timestamp = 1_700_000_000
         creation_time = 116444736000000000 + (unix_timestamp * 10_000_000)
 
@@ -99,6 +101,8 @@ class ReliabilityTest(unittest.TestCase):
             with patch.object(engine, "_save_recording_manifest"), patch.object(
                 app, "open", return_value=log_handle
             ), patch.object(
+                app, "resolve_ffmpeg_executable", return_value="ffmpeg.exe"
+            ), patch.object(
                 app.subprocess, "Popen", side_effect=OSError("start failed")
             ):
                 with self.assertRaises(OSError):
@@ -121,6 +125,8 @@ class ReliabilityTest(unittest.TestCase):
             profile = {"id": "test", "name": "Test", "output_dir": temporary_directory}
             with patch.object(engine, "_save_recording_manifest"), patch.object(
                 app, "open", return_value=log_handle
+            ), patch.object(
+                app, "resolve_ffmpeg_executable", return_value="ffmpeg.exe"
             ), patch.object(
                 app.subprocess, "Popen", return_value=process
             ) as popen:
@@ -505,6 +511,31 @@ class ReliabilityTest(unittest.TestCase):
 
         self.assertFalse(store.profiles[0]["record_live"])
         self.assertTrue(store.profiles[0]["auto_download_videos"])
+
+    def test_profile_normalization_strips_session_cookie_headers(self):
+        store = object.__new__(app.RecorderStore)
+        store.settings = app.default_settings()
+        store.profiles = [{
+            "name": "Test",
+            "url": "https://live.douyin.com/123456",
+            "cookies": "sessionid=secret; uid_tt=secret",
+        }]
+
+        migrated = store.normalize()
+
+        self.assertTrue(migrated)
+        self.assertEqual("", store.profiles[0]["cookies"])
+
+    def test_redact_sensitive_text_strips_url_query_tokens(self):
+        text = "Opening https://cdn.example/live.flv?sign=super-secret&exp=1 for input"
+        redacted = app.redact_sensitive_text(text)
+        self.assertNotIn("super-secret", redacted)
+        self.assertIn("https://cdn.example/live.flv?[redacted]", redacted)
+
+    def test_adopted_process_reports_failure_when_pid_exits(self):
+        adopted = app.AdoptedProcess(2_000_000_000)
+        self.assertEqual(1, adopted.poll())
+        self.assertEqual(1, adopted.returncode)
 
     def test_wants_live_recording_defaults_on_and_respects_toggles(self):
         self.assertTrue(app.wants_live_recording({}))

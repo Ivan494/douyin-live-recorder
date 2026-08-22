@@ -25,12 +25,26 @@ jobs:
           pip install pyinstaller
 
       - name: Run tests
-        run: python -m pytest src/tests
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "src"
+          python -m pytest src/tests -q
 
       - name: Download ffmpeg
         shell: pwsh
         run: |
-          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          $zipUri = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          $shaUri = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256"
+          Invoke-WebRequest -Uri $zipUri -OutFile ffmpeg.zip
+          Invoke-WebRequest -Uri $shaUri -OutFile ffmpeg.zip.sha256
+          if ((Get-Item ffmpeg.zip).Length -lt 10MB) {
+            throw "ffmpeg.zip download looks truncated"
+          }
+          $expected = ((Get-Content ffmpeg.zip.sha256 -Raw).Trim() -split "\s+")[0].ToLowerInvariant()
+          $actual = (Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) {
+            throw "ffmpeg.zip SHA256 mismatch: expected $expected got $actual"
+          }
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg
           New-Item -ItemType Directory -Force -Path tools | Out-Null
           $bin = Get-ChildItem ffmpeg -Directory | Select-Object -First 1

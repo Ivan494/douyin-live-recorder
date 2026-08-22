@@ -14,6 +14,7 @@ from pathlib import Path
 from streamget.platforms.douyin.live_stream import DouyinLiveStream
 
 from recording_urls import has_recording_url, recording_extension, recording_input_url
+from security_utils import default_trusted_tool_roots, resolve_trusted_executable
 
 
 STOP = False
@@ -165,8 +166,13 @@ def run_ffmpeg(config, stream, logger):
 
     from recording_urls import ffmpeg_live_input_options
 
-    cmd = [
+    ffmpeg_path = resolve_trusted_executable(
         config["ffmpeg_path"],
+        allowed_basenames={"ffmpeg.exe"},
+        trusted_roots=default_trusted_tool_roots(APP_DIR, TOOLS_DIR),
+    )
+    cmd = [
+        ffmpeg_path,
         "-hide_banner",
         "-nostdin",
         "-loglevel",

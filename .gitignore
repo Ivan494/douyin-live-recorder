@@ -31,3 +31,10 @@ src/mobile_session.json
 **/mobile_session.json
 src/mobile_device.json
 **/mobile_device.json
+
+# Runtime / browser artifacts
+src/logs/
+**/media_browser_health.json
+**/media_circuit_breaker.json
+**/show_window.signal
+*.corrupt-*

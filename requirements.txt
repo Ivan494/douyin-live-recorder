@@ -4,6 +4,7 @@ Pillow>=10.0
 pystray>=0.19
 streamget>=4.0
 h2>=4.1
+pycryptodome>=3.20
 
 # dev / tests
 pytest>=8.0

@@ -24,6 +24,12 @@ import httpx
 from streamget.platforms.douyin.live_stream import DouyinLiveStream
 
 from douyin_abogus import ABogus, BrowserFingerprintGenerator
+from security_utils import (
+    follow_safe_redirects,
+    is_loopback_cdp_url,
+    is_safe_media_download_url,
+    is_safe_share_link_url,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -743,6 +749,7 @@ def load_session_cookie_header():
         encrypted = base64.b64decode(encoded)
         return dpapi_unprotect(encrypted).decode("utf-8")
     except Exception:
+        logging.warning("Saved Douyin session could not be decrypted; treating as logged out.")
         return ""
 
 
@@ -769,6 +776,7 @@ def load_mobile_session_cookie_header():
         encrypted = base64.b64decode(encoded)
         return dpapi_unprotect(encrypted).decode("utf-8")
     except Exception:
+        logging.warning("Saved mobile session could not be decrypted; treating as logged out.")
         return ""
 
 
@@ -895,6 +903,9 @@ class CdpSession:
         if self._sock is not None:
             return
         parsed = urllib.parse.urlparse(self.websocket_url)
+        host = (parsed.hostname or "").lower()
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            raise RuntimeError(f"Refusing CDP WebSocket host that is not loopback: {host or '?'}")
         sock = socket.create_connection((parsed.hostname, parsed.port or 80), timeout=self.timeout)
         sock.settimeout(self.timeout)
         key = base64.b64encode(os.urandom(16)).decode("ascii")
@@ -1122,6 +1133,7 @@ def _ensure_media_fetch_browser(port=FETCH_BROWSER_CDP_PORT):
         "--headless=new",
         "--disable-gpu",
         f"--remote-debugging-port={port}",
+        "--remote-debugging-address=127.0.0.1",
         f"--user-data-dir={FETCH_BROWSER_PROFILE_DIR}",
         "--profile-directory=Default",
         "--no-first-run",
@@ -1848,6 +1860,8 @@ def fetch_posts_via_browser(profile, sec_user_id, limit=0, progress_callback=Non
 
 
 def import_chrome_session(cdp_url=DEFAULT_CHROME_CDP):
+    if not is_loopback_cdp_url(cdp_url):
+        raise RuntimeError(f"Refusing non-loopback Chrome DevTools URL: {cdp_url}")
     endpoint = cdp_url.rstrip("/") + "/json/list"
     with httpx.Client(trust_env=False) as client:
         response = client.get(endpoint, timeout=10)
@@ -1892,6 +1906,10 @@ def import_chrome_session(cdp_url=DEFAULT_CHROME_CDP):
     save_session_cookie_header(cookie_header, cdp_url)
     save_mobile_session_cookie_header(cookie_header, source="edge-qr-app")
     _persistent_mobile_device()
+    try:
+        close_cdp_browser(cdp_url)
+    except Exception:
+        logging.debug("Could not close login browser after import", exc_info=True)
     return {
         "cookie_count": len(cookies),
         "source": cdp_url,
@@ -1929,8 +1947,30 @@ def saved_session_info():
 
 
 def clear_saved_session():
+    """Remove DPAPI session files, device binding, and Chromium cookie jars."""
     SESSION_FILE.unlink(missing_ok=True)
     MOBILE_SESSION_FILE.unlink(missing_ok=True)
+    MOBILE_DEVICE_FILE.unlink(missing_ok=True)
+    _wipe_fetch_browser_cookie_store()
+
+
+def _wipe_fetch_browser_cookie_store():
+    """Best-effort wipe of plaintext Chromium cookies left by the login browser."""
+    profile_root = FETCH_BROWSER_PROFILE_DIR
+    if not profile_root.exists():
+        return
+    targets = [
+        profile_root / "Default" / "Cookies",
+        profile_root / "Default" / "Cookies-journal",
+        profile_root / "Default" / "Network" / "Cookies",
+        profile_root / "Default" / "Network" / "Cookies-journal",
+        profile_root / "Default" / "Network" / "Cookies-encrypt",
+    ]
+    for path in targets:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logging.debug("Could not remove browser cookie file %s", path)
 
 
 def find_browser_executable():
@@ -1989,6 +2029,8 @@ def cdp_is_available(cdp_url):
 
 
 def close_cdp_browser(cdp_url, timeout=10):
+    if not is_loopback_cdp_url(cdp_url):
+        raise RuntimeError(f"Refusing non-loopback Chrome DevTools URL: {cdp_url}")
     endpoint = cdp_url.rstrip("/") + "/json/version"
     with httpx.Client(trust_env=False) as client:
         response = client.get(endpoint, timeout=5)
@@ -2036,6 +2078,7 @@ def launch_douyin_login_browser():
         command = [
             str(browser_path),
             f"--remote-debugging-port={port}",
+            "--remote-debugging-address=127.0.0.1",
             f"--user-data-dir={FETCH_BROWSER_PROFILE_DIR}",
             "--profile-directory=Default",
             "--no-first-run",
@@ -2103,13 +2146,25 @@ def map_config_strings(data, mapper):
 def load_json(path, fallback):
     if not path.exists():
         return fallback
-    with open(path, "r", encoding="utf-8-sig") as fh:
-        return map_config_strings(json.load(fh), expand_portable_path)
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            return map_config_strings(json.load(fh), expand_portable_path)
+    except OSError as exc:
+        logging.warning("Could not read JSON file %s: %s", path, exc)
+        return fallback
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        corrupt_name = path.with_suffix(path.suffix + f".corrupt-{int(time.time())}")
+        logging.error("JSON file %s is corrupt (%s); quarantining to %s", path, exc, corrupt_name.name)
+        try:
+            path.rename(corrupt_name)
+        except OSError:
+            pass
+        return fallback
 
 
 def save_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)
     tmp.replace(path)
@@ -2336,7 +2391,10 @@ def aweme_filename(aweme, suffix=".mp4"):
     if not _fallback_id:
         import random as _rnd
         _fallback_id = f"ts{int(time.time() * 1000)}_{_rnd.randint(1000, 9999)}"
-    aweme_id = _fallback_id
+    # Strict id sanitize: alnum/_/- only so separators and ".." cannot escape
+    # the download directory when the name is joined under target_dir.
+    aweme_id = re.sub(r"[^A-Za-z0-9_-]+", "_", _fallback_id).strip("_") or "unknown"
+    aweme_id = aweme_id[:64]
     # FIX-D1: Use (x or {}) to handle share_info being JSON null.
     desc = safe_name(aweme.get("desc") or (aweme.get("share_info") or {}).get("share_title") or aweme_id)
     # FIX-PATHLEN: Truncate description to prevent exceeding Windows MAX_PATH
@@ -2809,6 +2867,8 @@ def _verify_downloaded_file(output_path):
 
 
 def download_bytes(client, url, output_path, progress_callback=None, progress_details=None):
+    if not is_safe_media_download_url(url):
+        raise ValueError(f"Refusing unsafe media download URL: {url}")
     # FIX-6.3: Use PID-unique .part suffix to prevent concurrent download corruption.
     import os as _os_mod
     part_path = output_path.with_suffix(output_path.suffix + f".part.{_os_mod.getpid()}")
@@ -3954,8 +4014,14 @@ def resolve_share_link(client, url):
     aweme_id = extract_aweme_id(url)
     if aweme_id:
         return aweme_id
+    if not is_safe_share_link_url(url):
+        return ""
     try:
-        response = client.get(url, follow_redirects=True)
+        response = follow_safe_redirects(
+            client,
+            url,
+            url_validator=is_safe_share_link_url,
+        )
     except Exception:
         return ""
     candidates = [str(item.url) for item in response.history] + [str(response.url)]
@@ -4069,6 +4135,8 @@ def download_video_by_url(url, output_dir=None, progress_callback=None):
     link = extract_url_from_text((url or "").strip())
     if not link:
         return _single_video_result("error", "No Douyin link found in the pasted text.")
+    if not extract_aweme_id(link) and not is_safe_share_link_url(link):
+        return _single_video_result("error", "Refusing non-Douyin share link.")
     out_dir = (
         Path(output_dir).expanduser()
         if str(output_dir or "").strip()
