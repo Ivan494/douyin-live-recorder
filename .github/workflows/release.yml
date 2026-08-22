@@ -25,7 +25,10 @@ jobs:
           pip install pyinstaller
 
       - name: Run tests
-        run: python -m pytest src/tests
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "src"
+          python -m pytest src/tests -q
 
       - name: Download ffmpeg
         shell: pwsh
