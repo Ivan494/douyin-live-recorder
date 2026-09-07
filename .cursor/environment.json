@@ -1,0 +1,5 @@
+{
+  "name": "Douyin Live Recorder",
+  "user": "ubuntu",
+  "install": "bash .cursor/install.sh"
+}
