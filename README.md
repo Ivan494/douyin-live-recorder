@@ -213,4 +213,3 @@ rights of content creators. Not affiliated with Douyin or ByteDance.
 ## Maintaining a personal installation
 
 See [the maintenance guide](docs/MAINTENANCE.md) for the source-first workflow, code-only deployment, checkpoints, and rollback.
-
