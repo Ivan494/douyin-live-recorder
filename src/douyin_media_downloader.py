@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 from datetime import datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -47,7 +48,7 @@ FETCH_BROWSER_PROFILE_DIR = Path(os.environ.get("LOCALAPPDATA") or APP_DIR) / "D
 FETCH_BROWSER_CDP_PORT = 9344
 FETCH_BROWSER_CDP = f"http://127.0.0.1:{FETCH_BROWSER_CDP_PORT}"
 KNOWN_GOOD_EDGE_VERSION = "150.0.4078.83"
-MEDIA_BROWSER_LAUNCH_LOCK = threading.Lock()
+MEDIA_BROWSER_LAUNCH_LOCK = threading.RLock()
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1188,6 +1189,35 @@ def ensure_media_fetch_browser(port=FETCH_BROWSER_CDP_PORT):
         return _ensure_media_fetch_browser(port)
 
 
+@contextmanager
+def media_fetch_browser(cdp_url=None):
+    """Lease the dedicated fetch browser for one check, then release it.
+
+    Serialize checks through cleanup: they navigate a shared profile/tab.
+    An explicitly supplied, available browser belongs to the caller and is
+    never closed here. Automatic fallback always uses the reserved Edge port.
+    Normal cleanup preserves the browser profile and saved login data.
+    """
+    with MEDIA_BROWSER_LAUNCH_LOCK:
+        managed = False
+        try:
+            if not cdp_url or not cdp_is_available(cdp_url):
+                launched = ensure_media_fetch_browser()
+                cdp_url = launched["cdp_url"]
+                managed = True
+            yield cdp_url
+        finally:
+            if managed:
+                try:
+                    if cdp_is_available(cdp_url):
+                        close_cdp_browser(cdp_url)
+                        logging.info("Released on-demand Douyin media browser: %s", cdp_url)
+                except Exception:
+                    # A cleanup failure must not discard fetched media or mask
+                    # the original error. The next check can reuse the browser.
+                    logging.warning("Could not close idle Douyin media browser: %s", cdp_url, exc_info=True)
+
+
 
 # FIX-CAPTCHA-2: Track consecutive captcha resets to avoid vicious cycle.
 # Wiping cookies on EVERY captcha detection creates a loop:
@@ -1534,19 +1564,16 @@ def _cdp_click_profile_story_ring(session):
 
 
 def fetch_stories_via_browser(profile, sec_user_id, cdp_url=None):
+    with media_fetch_browser(cdp_url) as browser_url:
+        return _fetch_stories_from_browser(profile, sec_user_id, browser_url)
+
+
+def _fetch_stories_from_browser(profile, sec_user_id, cdp_url):
     """
     Open the profile in the logged-in fetch browser, click the story ring,
     and harvest story/life/detail API bodies. Returns (items, source) or
     (None, message). Never wipes the shared fetch-browser session.
     """
-    launched = None
-    if not cdp_url:
-        launched = ensure_media_fetch_browser()
-        cdp_url = launched["cdp_url"]
-    elif not cdp_is_available(cdp_url):
-        launched = ensure_media_fetch_browser()
-        cdp_url = launched["cdp_url"]
-
     page = _cdp_pick_page(cdp_url, prefer_douyin=False)
     if not page:
         try:
@@ -1660,20 +1687,17 @@ def _detect_browser_captcha(session):
 
 
 def fetch_posts_via_browser(profile, sec_user_id, limit=0, progress_callback=None, cdp_url=None):
+    with media_fetch_browser(cdp_url) as browser_url:
+        return _fetch_posts_from_browser(profile, sec_user_id, limit, progress_callback, browser_url)
+
+
+def _fetch_posts_from_browser(profile, sec_user_id, limit, progress_callback, cdp_url):
     """
     Capture profile works by reading the browser's own /aweme/post/ responses.
 
     Plain HTTP clients get HTTP 200 with an empty body (Argus). A real Edge/Chrome
     page signs requests correctly; we never re-issue those URLs ourselves.
     """
-    launched = None
-    if not cdp_url:
-        launched = ensure_media_fetch_browser()
-        cdp_url = launched["cdp_url"]
-    elif not cdp_is_available(cdp_url):
-        launched = ensure_media_fetch_browser()
-        cdp_url = launched["cdp_url"]
-
     page = _cdp_pick_page(cdp_url, prefer_douyin=False)
     if not page:
         # Open a blank page target.
