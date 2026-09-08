@@ -58,3 +58,19 @@ is logged and does not discard successfully fetched media.
 This does not remove CDP support: browser fallback still uses CDP briefly.
 It removes the need to keep Edge running between checks. No change to a live
 recording or to the existing CAPTCHA reset policy is part of this update.
+
+## Login and verification alerts
+
+Media checks prefer the saved-session mobile API and direct HTTP paths before
+using the on-demand browser fallback. Explicit login rejection is distinguished
+from an empty feed or a network failure. Video and story failures both update
+the profile status and request a local tray notification. If anonymous fallback
+succeeds after the app session is rejected, the login warning remains visible.
+Use **Douyin App Login** to sign in or complete verification, then refresh media.
+Repeated alerts for the same problem are limited to once per 30 minutes; a
+confirmed recovery rearms immediate notification. Failed checks back off.
+Windows notification delivery depends on tray availability and OS settings;
+these alerts are local and do not send messages to Codex or another service.
+
+Downloads prefer explicit H.264, then HEVC URLs over opaque codec variants.
+This avoids selecting unsupported ByteVC2 solely because its URL is shorter.

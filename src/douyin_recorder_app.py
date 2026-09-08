@@ -2264,6 +2264,7 @@ class MediaDownloadEngine:
         self.next_check = {}
         self.consecutive_failures = {}
         self._last_video_status = {}
+        self._media_alerts = {}
         # FIX-AUDIT-5: Load persisted circuit breaker state so restarts
         # don't reset backoff for profiles that were hitting captchas.
         self._load_circuit_breaker_state()
@@ -2450,6 +2451,29 @@ class MediaDownloadEngine:
             return t("captcha_required", label=label)
         return t("summary_status", label=label, status=status.replace("_", " "))
 
+    def _notify_media_attention(self, profile, summary):
+        statuses = {(summary.get(kind) or {}).get("status", "") for kind in ("videos", "stories")}
+        reason = "login_required" if "login_required" in statuses or summary.get("auth_warning") == "login_required" else "captcha" if "captcha" in statuses else ""
+        key = profile["id"]
+        if not reason:
+            # Only confirmed recovery rearms immediate alerts; transient errors
+            # must not create a repeated notification loop.
+            if statuses <= {"ok", "no_active_stories", "disabled", ""}:
+                self._media_alerts.pop(key, None)
+            return ""
+        now = time.monotonic()
+        previous, notified_at = self._media_alerts.get(key, ("", 0))
+        if previous != reason or now - notified_at >= 1800:
+            message = t("media_login_action" if reason == "login_required" else "media_captcha_action", name=profile.get("name", ""))
+            logging.warning("%s", message)
+            if self.notify_callback:
+                try:
+                    self.notify_callback(message)
+                except Exception:
+                    logging.warning("Could not deliver media notification", exc_info=True)
+            self._media_alerts[key] = (reason, now)
+        return reason
+
     def _check_profile(self, profile):
         videos = bool(profile.get("auto_download_videos"))
         stories = bool(profile.get("auto_download_stories"))
@@ -2482,22 +2506,17 @@ class MediaDownloadEngine:
             )
             video_status = (summary.get("videos") or {}).get("status", "")
             self._last_video_status[profile["id"]] = video_status
-            if video_status == "captcha" and self.notify_callback:
-                try:
-                    self.notify_callback(
-                        f"Douyin captcha detected on {profile.get('name', 'profile')} \u2014 "
-                        "media downloads paused. Open the fetch browser to solve it, "
-                        "or wait for automatic retry.",
-                    )
-                except Exception:
-                    pass
-            if video_status in ("error", "api_empty", "blocked", "captcha"):
+            attention = self._notify_media_attention(profile, summary)
+            statuses = {(summary.get(kind) or {}).get("status", "") for kind in ("videos", "stories")}
+            if attention or statuses.intersection({"error", "api_empty", "blocked", "captcha", "login_required"}):
                 self.consecutive_failures[profile["id"]] = self.consecutive_failures.get(profile["id"], 0) + 1
             else:
                 self.consecutive_failures[profile["id"]] = 0
             self._save_circuit_breaker_state()  # FIX-AUDIT-5
             parts = [part for part in (self.summarize_kind(summary, "videos"), self.summarize_kind(summary, "stories")) if part]
             media_status = "; ".join(parts) or t("no_media_work")
+            if summary.get("auth_warning") == "login_required":
+                media_status += "; " + t("media_login_action", name=profile.get("name", ""))
             self.emit(
                 profile["id"],
                 t("media_check", status=media_status),

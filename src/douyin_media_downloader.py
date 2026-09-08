@@ -329,6 +329,7 @@ def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header=""):
             data = response.json()
             if not isinstance(data, dict):
                 break
+            _raise_mobile_login_required(data)
             status_code = data.get("status_code")
             if status_code != 0:
                 msg = data.get("status_msg") or data.get("message") or ""
@@ -349,6 +350,8 @@ def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header=""):
                 break
             time.sleep(0.3)  # rate-limit courtesy
 
+    except LoginRequiredError:
+        raise
     except Exception as exc:
         if not stories:
             return None, f"mobile_post_api: {exc}"
@@ -475,6 +478,7 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                 continue
             if not isinstance(data, dict):
                 continue
+            _raise_mobile_login_required(data)
             status_code = data.get("status_code")
             if status_code not in (0, None):
                 last_message = (
@@ -566,6 +570,7 @@ def fetch_stories_via_mobile_life_feed(client, sec_user_id, user_id="", cookie_h
                 continue
             if not isinstance(data, dict):
                 continue
+            _raise_mobile_login_required(data)
             try:
                 status_code = int(data.get("status_code") or 0)
             except (TypeError, ValueError):
@@ -622,6 +627,7 @@ def fetch_posts_via_mobile_api(client, sec_user_id, limit=0, cookie_header=""):
             install_id,
         )
         data = response.json()
+        _raise_mobile_login_required(data)
         if not isinstance(data, dict) or data.get("status_code") != 0:
             if pages_fetched == 0:
                 msg = (data.get("status_msg") or data.get("message") or "") if isinstance(data, dict) else ""
@@ -2283,6 +2289,18 @@ def signed_douyin_url(path, params):
     return f"https://www.douyin.com{path}?{signed_query}", ua
 
 
+def _raise_mobile_login_required(data):
+    """Separate explicit expired/login-required responses from transport errors."""
+    if not isinstance(data, dict):
+        return
+    try:
+        code = int(data.get("status_code") or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if code in {8, 12, 2483} or response_has_login_tip(data):
+        raise LoginRequiredError("Douyin app login expired or requires sign-in. Open Douyin App Login and sign in again.")
+
+
 def response_has_login_tip(data):
     if not isinstance(data, dict):
         return False
@@ -2374,7 +2392,14 @@ def collect_video_urls(aweme):
             continue
         seen.add(url)
         deduped.append(url)
-    deduped.sort(key=lambda item: (("watermark" in item.lower()), ("douyin.com/aweme/v1/play" in item), len(item)))
+    # ByteVC2 variants can appear first (and have shorter URLs), but the
+    # bundled FFmpeg and many desktop players cannot decode them. Prefer
+    # explicitly advertised standard codecs before opaque/default variants.
+    codec_priority = {}
+    for rank, key in enumerate(("play_addr_h264", "play_addr_265")):
+        for url in iter_url_list(video.get(key)):
+            codec_priority.setdefault(url, rank)
+    deduped.sort(key=lambda item: (codec_priority.get(item, 2), ("watermark" in item.lower()), ("douyin.com/aweme/v1/play" in item), len(item)))
     return deduped
 
 
@@ -3846,6 +3871,7 @@ def download_profile(
                                 profile.get("name"),
                             )
                     except LoginRequiredError:
+                        summary["auth_warning"] = "login_required"
                         posts = None
                     except Exception as _mob_exc:
                         logging.debug(
@@ -3911,6 +3937,8 @@ def download_profile(
                             limit=limit,
                             progress_callback=progress_callback,
                         )
+                    except LoginRequiredError:
+                        raise
                     except (EmptyApiResponseError, Exception) as _browser_exc:
                         logging.debug(
                             "Browser fallback failed for %s (%s); trying mobile API.",
