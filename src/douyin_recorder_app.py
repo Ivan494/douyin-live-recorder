@@ -2,6 +2,8 @@
 import asyncio
 import base64
 import ctypes
+import copy
+from contextlib import nullcontext
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -298,6 +300,20 @@ def detect_platform(url):
     if "douyin.com" in lowered:
         return "douyin"
     return "unknown"
+
+
+def canonical_douyin_live_url(url):
+    """Extract a room URL without confusing a profile URL with a live link."""
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    if parsed.hostname == "live.douyin.com":
+        match = re.fullmatch(r"/(?:live/)?([A-Za-z0-9_-]+)/?", parsed.path)
+    elif parsed.hostname in {"www.douyin.com", "douyin.com"}:
+        match = re.fullmatch(r"/follow/live/([0-9]+)/?", parsed.path)
+    else:
+        return ""
+    return f"https://live.douyin.com/{match.group(1)}" if match else ""
 
 
 def platform_label(platform):
@@ -807,23 +823,10 @@ def default_profiles():
 
 
 def load_json(path, fallback):
-    if not path.exists():
-        return fallback
     try:
         with open(path, "r", encoding="utf-8-sig") as fh:
             return map_config_strings(json.load(fh), expand_portable_path)
-    except OSError as exc:
-        # FIX-H4: File deleted/locked between exists() and open() (antivirus, disk unmount).
-        logging.warning("Could not read config file %s: %s", path, exc)
-        return fallback
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
-        # FIX-T2: Quarantine corrupt file and fall back to defaults instead of crashing.
-        corrupt_name = path.with_suffix(path.suffix + f".corrupt-{int(time.time())}")
-        logging.error("Config file %s is corrupt (%s); quarantining to %s", path, exc, corrupt_name.name)
-        try:
-            path.rename(corrupt_name)
-        except OSError:
-            pass
+    except FileNotFoundError:
         return fallback
 
 
@@ -840,7 +843,7 @@ def _backup_config_file(path):
         backup_dir = path.parent / "config_backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        backup = backup_dir / f"{path.name}.{stamp}.{os.getpid()}.bak"
+        backup = backup_dir / f"{path.name}.{stamp}.{time.time_ns()}.{os.getpid()}.bak"
         shutil.copy2(path, backup)
         existing = sorted(
             backup_dir.glob(path.name + ".*.bak"),
@@ -855,36 +858,40 @@ def _backup_config_file(path):
         logging.exception("Could not back up config file %s", path)
 
 
-def save_json(path, data):
-    # FIX-M10: Wrap in try/except to prevent disk-full or locked-file errors
-    # from killing the monitor thread silently.
+def save_json(path, data, *, allow_empty=False):
+    # Log save errors and propagate them so callers cannot report a false save.
     # FIX-APP-1: Use unique tmp filename to prevent concurrent-save corruption.
     # FIX-BACKUP: snapshot the previous file first (rotating, kept in config_backups/).
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         _backup_config_file(path)
-        if isinstance(data, list) and not data and path.exists() and path.stat().st_size > 5:
+        if not allow_empty and isinstance(data, list) and not data and path.exists() and path.stat().st_size > 5:
             # FIX-GUARD: hard refusal to wipe a non-empty config with an empty
             # list. Two real incidents (2026-08-04) proved a stray process can
             # hold an empty in-memory list and persist it over the good file.
             # The previous file was already snapshotted above; keep it as-is.
             logging.error(
                 "REFUSED to overwrite %s with an EMPTY list; existing file kept "
-                "(snapshot also in config_backups/). To remove the last entry, "
-                "edit the file manually while the app is closed.",
+                "(snapshot also in config_backups/). Explicit profile deletion "
+                "must use allow_empty=True.",
                 path,
             )
-            return
+            return False
         tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}")
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(map_config_strings(data, portableize_path), fh, ensure_ascii=False, indent=2)
         tmp.replace(path)
+        return True
     except OSError:
         logging.exception("Could not save config file %s (disk full or locked?)", path)
+        raise
 
 class RecorderStore:
-    def __init__(self):
+    def __init__(self, *, read_only=False):
+        self.lock = threading.RLock()
         self.settings = load_json(SETTINGS_FILE, default_settings())
+        if not isinstance(self.settings, dict):
+            raise ValueError("settings.json must contain an object")
         set_language(self.settings.get("language"))
         if "start_with_windows" not in self.settings:
             self.settings["start_with_windows"] = is_autostart_enabled()
@@ -892,7 +899,7 @@ class RecorderStore:
         # shortcut is missing or broken (e.g. after a directory move or a
         # failed PowerShell read).  Failures here are non-fatal — the app can
         # still run; the user will see the toggle state in Settings.
-        if self.settings.get("start_with_windows") and not is_autostart_enabled():
+        if not read_only and self.settings.get("start_with_windows") and not is_autostart_enabled():
             try:
                 set_autostart_enabled(True)
             except Exception:
@@ -907,10 +914,12 @@ class RecorderStore:
             and isinstance(self.profiles[0].get("value"), list)
         ):
             self.profiles = self.profiles[0]["value"]
-        if self.normalize():
+        if self.normalize() and not read_only:
             self.save()
 
     def normalize(self):
+        if not isinstance(self.profiles, list) or any(not isinstance(p, dict) for p in self.profiles):
+            raise ValueError("profiles.json must contain a list of profile objects")
         migrated = False
         defaults = default_settings()
         for key, value in defaults.items():
@@ -976,12 +985,14 @@ class RecorderStore:
         return migrated
 
     def save(self):
-        save_json(SETTINGS_FILE, self.settings)
-        save_json(PROFILES_FILE, self.profiles)
+        with self.lock:
+            save_json(SETTINGS_FILE, self.settings)
+            self.save_profiles_only()
 
     def save_profiles_only(self):
-        """FIX-APP-9: Save only profiles (skip settings) for monitor-thread updates."""
-        save_json(PROFILES_FILE, self.profiles)
+        with self.lock:
+            if save_json(PROFILES_FILE, self.profiles) is False:
+                raise RuntimeError("Profile save was refused; existing profiles were preserved")
 
     def get_profile(self, profile_id):
         for profile in self.profiles:
@@ -990,19 +1001,28 @@ class RecorderStore:
         return None
 
     def upsert_profile(self, profile):
-        if not profile.get("id"):
-            profile["id"] = str(uuid.uuid4())
-        existing = self.get_profile(profile["id"])
-        if existing:
-            existing.update(profile)
-        else:
-            self.profiles.append(profile)
-        self.normalize()
-        self.save()
+        with self.lock:
+            profile = dict(profile)
+            profile.setdefault("id", str(uuid.uuid4()))
+            previous = self.profiles
+            self.profiles = [dict(p) for p in previous]
+            existing = self.get_profile(profile["id"])
+            if existing:
+                existing.update(profile)
+            else:
+                self.profiles.append(profile)
+            try:
+                self.normalize()
+                self.save_profiles_only()
+            except Exception:
+                self.profiles = previous
+                raise
 
     def remove_profile(self, profile_id):
-        self.profiles = [p for p in self.profiles if p["id"] != profile_id]
-        self.save()
+        with self.lock:
+            remaining = [p for p in self.profiles if p["id"] != profile_id]
+            save_json(PROFILES_FILE, remaining, allow_empty=True)
+            self.profiles = remaining
 
 
 class MonitorEngine:
@@ -1020,6 +1040,30 @@ class MonitorEngine:
         self.error_counts = {}
         self.last_error_kinds = {}
         self.finalizer_threads = []
+        self.lock = threading.RLock()
+        self.recording_error_counts = {}
+
+    @staticmethod
+    def profile_identity(profile):
+        keys = ("id", "url", "platform", "output_dir", "quality", "proxy_addr", "stream_orientation", "enabled", "record_live")
+        return tuple(profile.get(key) for key in keys)
+
+    def current_profile(self, profile):
+        current = next((p for p in self.store.profiles if p.get("id") == profile.get("id")), None)
+        if current is None or not wants_live_recording(current):
+            return None
+        return current if self.profile_identity(current) == self.profile_identity(profile) else None
+
+    def profile_changed(self, profile_id, previous=None):
+        with self.lock:
+            current = next((p for p in self.store.profiles if p.get("id") == profile_id), None)
+            if (not current or not wants_live_recording(current) or
+                    previous is not None and self.profile_identity(previous) != self.profile_identity(current)):
+                self.stop_profile_recording(profile_id, "Profile changed or removed")
+            self.next_check[profile_id] = 0
+            self.error_counts.pop(profile_id, None)
+            self.recording_error_counts.pop(profile_id, None)
+            self.wake_event.set()
 
     def is_running(self):
         return self.thread is not None and self.thread.is_alive()
@@ -1077,6 +1121,10 @@ class MonitorEngine:
         self.emit("engine", t("monitoring_stopping"))
 
     def stop_profile_recording(self, profile_id, reason="Live recording disabled"):
+        with self.lock:
+            self._stop_profile_recording_locked(profile_id, reason)
+
+    def _stop_profile_recording_locked(self, profile_id, reason):
         process = self.processes.get(profile_id)
         if process is not None and process.poll() is None:
             self.emit(profile_id, reason)
@@ -1138,7 +1186,7 @@ class MonitorEngine:
 
     def effective_interval_seconds(self, profile_id, profile):
         base_interval = self.interval_seconds(profile)
-        errors = self.error_counts.get(profile_id, 0)
+        errors = max(self.error_counts.get(profile_id, 0), self.recording_error_counts.get(profile_id, 0))
         if errors <= 0:
             return base_interval
         error_kind = self.last_error_kinds.get(profile_id)
@@ -1156,7 +1204,7 @@ class MonitorEngine:
             return min(base * (2 ** min(errors - 1, 4)), error_max)
         error_min = self.setting_seconds("error_min_backoff_seconds")
         error_max = self.setting_seconds("error_max_backoff_seconds")
-        return min(max(base_interval, error_min) * (2 ** (errors - 1)), error_max)
+        return min(max(base_interval, error_min) * (2 ** min(errors - 1, 10)), error_max)
 
     def setting_seconds(self, key):
         fallback = default_settings()[key]
@@ -1264,6 +1312,9 @@ class MonitorEngine:
             "status",
             "last_exit_code",
             "stop_reason",
+            "rotate_at",
+            "segment_started_at",
+            "profile_url",
         )
         return {key: recording.get(key) for key in keys}
 
@@ -1306,6 +1357,7 @@ class MonitorEngine:
         recording = {
             "profile_id": profile["id"],
             "profile_name": profile.get("name") or anchor,
+            "profile_url": profile.get("url", ""),
             "final_output": str(final_output),
             "output_file": "",
             "session_dir": str(session_dir),
@@ -1327,7 +1379,8 @@ class MonitorEngine:
     def _recover_session_manifest(self, profile_id, output_file):
         manifest_path = Path(output_file).parent / "session.json"
         manifest = self._read_recording_manifest(manifest_path)
-        if not manifest or manifest.get("profile_id") != profile_id:
+        if (not manifest or manifest.get("profile_id") != profile_id or
+                manifest.get("status") in {"finalizing", "complete", "failed"}):
             return None
         manifest["output_file"] = output_file
         manifest["manifest_path"] = str(manifest_path)
@@ -1338,6 +1391,14 @@ class MonitorEngine:
         manifest.setdefault("started_at", time.time())
         manifest.setdefault("last_growth_at", time.time())
         manifest.setdefault("last_size", 0)
+        now = time.time()
+        try:
+            output_modified_at = Path(output_file).stat().st_mtime
+        except OSError:
+            # FFmpeg may not have created the file yet when the app restarts.
+            output_modified_at = now
+        manifest["segment_started_at"] = manifest.get("segment_started_at") or output_modified_at
+        manifest["rotate_at"] = manifest.get("rotate_at") or now + self.setting_seconds("recording_segment_max_seconds")
         manifest["status"] = "recording"
         return manifest
 
@@ -1346,6 +1407,12 @@ class MonitorEngine:
         for process_info in self._active_ffmpeg_processes():
             pid = process_info.get("ProcessId")
             command_line = process_info.get("CommandLine") or ""
+            try:
+                arguments = [part.strip('"') for part in shlex.split(command_line, posix=False)]
+            except ValueError:
+                continue
+            if any(arguments[i:i + 2] == ["-f", "concat"] for i in range(len(arguments))):
+                continue
             for profile in self.store.profiles:
                 profile_id = profile["id"]
                 if profile_id in self.processes:
@@ -1355,6 +1422,11 @@ class MonitorEngine:
                     continue
                 output_file = self._output_from_command_line(command_line, output_dir)
                 if not output_file:
+                    continue
+                if ".finalizing." in Path(output_file).name.lower():
+                    continue
+                recovered = self._recover_session_manifest(profile_id, output_file)
+                if not recovered:
                     continue
                 stderr_path = str(Path(output_dir) / "logs" / f"{Path(output_file).stem}.ffmpeg.log")
                 try:
@@ -1366,7 +1438,6 @@ class MonitorEngine:
                     last_size = 0
                 process = AdoptedProcess(int(pid))
                 self.processes[profile_id] = process
-                recovered = self._recover_session_manifest(profile_id, output_file)
                 self.recordings[profile_id] = recovered or {
                     "output_file": output_file,
                     "stderr_path": stderr_path,
@@ -1493,7 +1564,10 @@ class MonitorEngine:
 
     def _run(self):
         while not self.stop_event.is_set():
-            self._poll_processes()
+            try:
+                self._poll_processes()
+            except Exception:
+                logging.exception("Recording supervision failed; retrying next cycle")
             now = time.monotonic()
             profiles = sorted(
                 list(self.store.profiles),
@@ -1535,9 +1609,18 @@ class MonitorEngine:
                     self.emit(profile_id, "Recording.", status="Recording", recording=True, **self.recording_snapshot(profile_id))
                     self.next_check[profile_id] = time.monotonic() + wait_seconds
                     continue
-                self._check_profile(profile)
+                try:
+                    self._check_profile(profile)
+                except Exception as exc:
+                    logging.exception("Profile check failed unexpectedly: %s", profile_id)
+                    self.emit(profile_id, f"Check failed: {exc}", status="Error")
+                    self.error_counts[profile_id] = self.error_counts.get(profile_id, 0) + 1
+                if self.current_profile(profile) is None:
+                    self.next_check[profile_id] = 0
+                    continue
                 wait_seconds = self.jittered_wait_seconds(profile_id, profile, self.effective_interval_seconds(profile_id, profile))
-                if self._has_recording_session(profile_id) and not self._is_recording(profile_id):
+                if (self._has_recording_session(profile_id) and not self._is_recording(profile_id)
+                        and not self.recording_error_counts.get(profile_id)):
                     wait_seconds = min(wait_seconds, 10)
                 self.next_check[profile_id] = time.monotonic() + wait_seconds
                 if self._is_recording(profile_id):
@@ -1564,6 +1647,10 @@ class MonitorEngine:
         return bool(recording.get("session_dir"))
 
     def _poll_processes(self):
+        with self.lock:
+            self._poll_processes_locked()
+
+    def _poll_processes_locked(self):
         for profile_id, process in list(self.processes.items()):
             if process.poll() is None:
                 recording = self.recordings.get(profile_id, {})
@@ -1659,15 +1746,15 @@ class MonitorEngine:
             segment_started = recording.get("segment_started_at") or 0
             segment_duration = time.time() - segment_started
             if segment_duration < 30 and not recording.get("finalize_on_exit"):
-                self.error_counts[profile_id] = self.error_counts.get(profile_id, 0) + 1
+                self.recording_error_counts[profile_id] = self.recording_error_counts.get(profile_id, 0) + 1
                 logging.warning(
                     "FFmpeg for %s died after only %.0fs (part %s); incrementing error count to %d.",
                     profile_id, segment_duration, recording.get("part_index"),
-                    self.error_counts[profile_id],
+                    self.recording_error_counts[profile_id],
                 )
-            else:
-                self.error_counts[profile_id] = 0
-            self.next_check[profile_id] = 0
+            self.next_check[profile_id] = (time.monotonic() + self.effective_interval_seconds(
+                profile_id, next((p for p in self.store.profiles if p["id"] == profile_id), {})
+            )) if self.recording_error_counts.get(profile_id) else 0
             if recording.pop("finalize_on_exit", False):
                 self._finalize_recording_session(
                     profile_id,
@@ -1692,12 +1779,16 @@ class MonitorEngine:
         try:
             current_size = Path(output_file).stat().st_size
         except OSError:
-            return False
+            current_size = 0
         now = time.time()
         last_size = recording.get("last_size")
         if last_size is None or current_size > last_size:
             recording["last_size"] = current_size
             recording["last_growth_at"] = now
+            if now - (recording.get("segment_started_at") or now) >= 30:
+                self.recording_error_counts[profile_id] = 0
+                self.error_counts[profile_id] = 0
+                self.last_error_kinds.pop(profile_id, None)
             recording.pop("stall_stop_requested", None)
             return False
         recording["last_size"] = current_size
@@ -1898,121 +1989,145 @@ class MonitorEngine:
         return f"{label} ({wait_seconds}s, x{errors})"
 
     def _check_profile(self, profile):
+        profile = copy.deepcopy(profile)
         try:
-            # FIX-APP-4: 30s timeout prevents a hanging Douyin API from blocking all profiles
             room, stream = asyncio.run(asyncio.wait_for(self._resolve(profile), timeout=30))
-            status = t("live") if stream.is_live else t("offline")
-            live_url = room.get("live_url") or ""
-            if live_url and profile.get("fallback_live_url") != live_url:
-                profile["fallback_live_url"] = live_url
-                # FIX-APP-8: Only save profiles (not settings) to reduce I/O
-                save_json(PROFILES_FILE, self.store.profiles)
-            self.emit(
-                profile["id"],
-                t("checked", status=status),
-                status=status,
-                recording=False,
-                last_checked=now_text(),
-                live_url=live_url,
-                title=room.get("title") or "",
-                anchor_name=room.get("anchor_name") or profile.get("name", ""),
-                pid="",
-                elapsed="",
-            )
-            recording = self.recordings.get(profile["id"])
-            if stream.is_live and has_recording_url(stream):
-                if recording and recording.get("session_dir"):
-                    recording["offline_since"] = None
-                    recording["offline_confirmations"] = 0
-                    recording["recovery_started_at"] = None
-                self._start_recording(profile, stream)
-            elif recording and recording.get("session_dir"):
-                now = time.time()
-                if not recording.get("offline_since"):
-                    recording["offline_since"] = now
-                    recording["offline_confirmations"] = 0
-                recording["offline_confirmations"] = int(recording.get("offline_confirmations") or 0) + 1
-                grace = self.setting_seconds("recording_offline_grace_seconds")
-                offline_for = now - recording["offline_since"]
-                recording["status"] = "offline_grace"
-                self._save_recording_manifest(recording)
-                if offline_for >= grace and recording["offline_confirmations"] >= 2:
-                    self._finalize_recording_session(profile["id"], "Live confirmed offline")
-                else:
-                    remaining = max(0, grace - int(offline_for))
-                    self.emit(
-                        profile["id"],
-                        f"Live appears offline; holding the MKV session open for {remaining}s.",
-                        status="Confirming offline",
-                        recording=False,
-                        next_check="Soon",
-                        cooldown="Offline grace",
-                        **self.recording_snapshot(profile["id"]),
-                    )
-            self.error_counts[profile["id"]] = 0
-            self.last_error_kinds.pop(profile["id"], None)
         except Exception as exc:
-            profile_id = profile["id"]
-            recording = self.recordings.get(profile_id)
-            if recording and recording.get("session_dir") and not self._is_recording(profile_id):
-                recording["status"] = "recovering"
-                recording.setdefault("recovery_started_at", time.time())
-                recording["stop_reason"] = f"URL refresh failed: {exc}"
-                # FIX-R1: Bound recovery to 30 minutes max, then finalize and abandon.
-                recovery_age = time.time() - recording["recovery_started_at"]
-                if recovery_age > 1800:
-                    logging.warning(
-                        "Session recovery for %s exceeded 30 min; finalizing.",
-                        profile_id,
-                    )
-                    self._finalize_recording_session(
-                        profile_id,
-                        f"Recovery abandoned after {int(recovery_age)}s: {exc}",
-                    )
-                    self.error_counts[profile_id] = self.error_counts.get(profile_id, 0) + 1
-                    error_kind, status = self.classify_error(exc)
-                    self.last_error_kinds[profile_id] = error_kind
-                    backoff = self.effective_interval_seconds(profile_id, profile)
-                    self.emit(
-                        profile_id,
-                        f"{status}: {exc}. Backing off {backoff}s.",
-                        status=status,
-                        recording=False,
-                        last_checked=now_text(),
-                        cooldown=self.cooldown_label(profile_id, profile, backoff),
-                        next_check=f"{backoff}s",
-                    )
-                    return
-                self._save_recording_manifest(recording)
-                logging.warning("Live URL refresh failed for active session %s: %s", profile_id, exc)
+            with getattr(self.store, "lock", nullcontext()), self.lock:
+                if self.current_profile(profile) is not None:
+                    self._handle_profile_error(profile, exc)
+            return
+        with getattr(self.store, "lock", nullcontext()), self.lock:
+            if self.stop_event.is_set() or self.current_profile(profile) is None:
+                self.next_check[profile["id"]] = 0
+                return
+            try:
+                self._apply_profile_result(profile, room, stream)
+            except Exception as exc:
+                self._handle_profile_error(profile, exc)
+
+    def _apply_profile_result(self, profile, room, stream):
+        status = t("live") if stream.is_live else t("offline")
+        live_url = room.get("live_url") or ""
+        if live_url and (profile.get("fallback_live_url") != live_url or
+                         profile.get("fallback_source_url") != profile["url"].strip()):
+            current = self.current_profile(profile)
+            current["fallback_live_url"] = live_url
+            current["fallback_source_url"] = profile["url"].strip()
+            # FIX-APP-8: Only save profiles (not settings) to reduce I/O
+            if hasattr(self.store, "save_profiles_only"):
+                self.store.save_profiles_only()
+        self.emit(
+            profile["id"],
+            t("checked", status=status),
+            status=status,
+            recording=False,
+            last_checked=now_text(),
+            live_url=live_url,
+            title=room.get("title") or "",
+            anchor_name=room.get("anchor_name") or profile.get("name", ""),
+            pid="",
+            elapsed="",
+        )
+        recording = self.recordings.get(profile["id"])
+        if stream.is_live and not has_recording_url(stream):
+            raise RuntimeError("Live stream did not include a recording URL")
+        if stream.is_live and has_recording_url(stream):
+            if recording and recording.get("session_dir"):
+                recording["offline_since"] = None
+                recording["offline_confirmations"] = 0
+            self._start_recording(profile, stream)
+        elif recording and recording.get("session_dir"):
+            now = time.time()
+            if not recording.get("offline_since"):
+                recording["offline_since"] = now
+                recording["offline_confirmations"] = 0
+            recording["offline_confirmations"] = int(recording.get("offline_confirmations") or 0) + 1
+            grace = self.setting_seconds("recording_offline_grace_seconds")
+            offline_for = now - recording["offline_since"]
+            recording["status"] = "offline_grace"
+            self._save_recording_manifest(recording)
+            if offline_for >= grace and recording["offline_confirmations"] >= 2:
+                self._finalize_recording_session(profile["id"], "Live confirmed offline")
+            else:
+                remaining = max(0, grace - int(offline_for))
+                self.emit(
+                    profile["id"],
+                    f"Live appears offline; holding the MKV session open for {remaining}s.",
+                    status="Confirming offline",
+                    recording=False,
+                    next_check="Soon",
+                    cooldown="Offline grace",
+                    **self.recording_snapshot(profile["id"]),
+                )
+        if not stream.is_live:
+            self.error_counts[profile["id"]] = 0
+        self.last_error_kinds.pop(profile["id"], None)
+
+    def _handle_profile_error(self, profile, exc):
+        profile_id = profile["id"]
+        recording = self.recordings.get(profile_id)
+        if recording and recording.get("session_dir") and not self._is_recording(profile_id):
+            recording["status"] = "recovering"
+            if not recording.get("recovery_started_at"):
+                recording["recovery_started_at"] = time.time()
+            recording["stop_reason"] = f"URL refresh failed: {exc}"
+            # FIX-R1: Bound recovery to 30 minutes max, then finalize and abandon.
+            recovery_age = time.time() - recording["recovery_started_at"]
+            if recovery_age > 1800:
+                logging.warning(
+                    "Session recovery for %s exceeded 30 min; finalizing.",
+                    profile_id,
+                )
+                self._finalize_recording_session(
+                    profile_id,
+                    f"Recovery abandoned after {int(recovery_age)}s: {exc}",
+                )
+                self.error_counts[profile_id] = self.error_counts.get(profile_id, 0) + 1
+                error_kind, status = self.classify_error(exc)
+                self.last_error_kinds[profile_id] = error_kind
+                backoff = self.effective_interval_seconds(profile_id, profile)
                 self.emit(
                     profile_id,
-                    f"Could not refresh the live URL yet; keeping MKV parts open: {exc}",
-                    status="Recovering",
+                    f"{status}: {exc}. Backing off {backoff}s.",
+                    status=status,
                     recording=False,
                     last_checked=now_text(),
-                    cooldown="Retrying URL refresh",
-                    next_check="Soon",
-                    **self.recording_snapshot(profile_id),
+                    cooldown=self.cooldown_label(profile_id, profile, backoff),
+                    next_check=f"{backoff}s",
                 )
                 return
-            self.error_counts[profile_id] = self.error_counts.get(profile_id, 0) + 1
-            error_kind, status = self.classify_error(exc)
-            self.last_error_kinds[profile_id] = error_kind
-            backoff = self.effective_interval_seconds(profile_id, profile)
-            if error_kind in {"captcha", "risk_control", "not_visible", "unsupported_stream", "empty_response"}:
-                logging.warning("Profile check warning for %s: %s", profile.get("name"), exc)
-            else:
-                logging.exception("Profile check failed for %s", profile.get("name"))
+            self._save_recording_manifest(recording)
+            logging.warning("Live URL refresh failed for active session %s: %s", profile_id, exc)
             self.emit(
                 profile_id,
-                f"{status}: {exc}. Backing off {backoff}s.",
-                status=status,
+                f"Could not refresh the live URL yet; keeping MKV parts open: {exc}",
+                status="Recovering",
                 recording=False,
                 last_checked=now_text(),
-                cooldown=self.cooldown_label(profile_id, profile, backoff),
-                next_check=future_text(backoff),
+                cooldown="Retrying URL refresh",
+                next_check="Soon",
+                **self.recording_snapshot(profile_id),
             )
+            return
+        self.error_counts[profile_id] = self.error_counts.get(profile_id, 0) + 1
+        error_kind, status = self.classify_error(exc)
+        self.last_error_kinds[profile_id] = error_kind
+        backoff = self.effective_interval_seconds(profile_id, profile)
+        if error_kind in {"captcha", "risk_control", "not_visible", "unsupported_stream", "empty_response"}:
+            logging.warning("Profile check warning for %s: %s", profile.get("name"), exc)
+        else:
+            logging.exception("Profile check failed for %s", profile.get("name"))
+        self.emit(
+            profile_id,
+            f"{status}: {exc}. Backing off {backoff}s.",
+            status=status,
+            recording=False,
+            last_checked=now_text(),
+            cooldown=self.cooldown_label(profile_id, profile, backoff),
+            next_check=future_text(backoff),
+        )
+
 
     async def _resolve(self, profile):
         if profile.get("platform") == "youtube" or detect_platform(profile.get("url", "")) == "youtube":
@@ -2026,11 +2141,12 @@ class MonitorEngine:
             stream_orientation=int(profile.get("stream_orientation") or 1),
         )
         url = profile["url"].strip()
-        if "live.douyin.com/" in url:
-            room = await live.fetch_web_stream_data(url)
+        direct_url = canonical_douyin_live_url(url)
+        if direct_url:
+            room = await live.fetch_web_stream_data(direct_url)
         else:
             fallback_url = profile.get("fallback_live_url", "").strip()
-            if fallback_url:
+            if fallback_url and profile.get("fallback_source_url") == url:
                 try:
                     room = await live.fetch_web_stream_data(fallback_url)
                 except Exception:
@@ -2147,6 +2263,7 @@ class MonitorEngine:
             raise RuntimeError("Live stream did not include a recording URL")
         if not is_safe_recording_url(input_url):
             raise RuntimeError("Live stream URL uses an unsupported or unsafe protocol")
+        ffmpeg_executable = resolve_ffmpeg_executable(self.store.settings["ffmpeg_path"])
         recording = self.recordings.get(profile["id"])
         is_resume = bool(recording and recording.get("session_dir"))
         if not is_resume:
@@ -2168,7 +2285,7 @@ class MonitorEngine:
         )
 
         cmd = [
-            resolve_ffmpeg_executable(self.store.settings["ffmpeg_path"]),
+            ffmpeg_executable,
             "-hide_banner",
             "-nostdin",
             "-loglevel",
@@ -2251,6 +2368,30 @@ class MonitorEngine:
             cooldown="Recording",
             next_check="Recording",
         )
+
+
+class ProfileCancellation:
+    """Cancel work when monitoring stops or the owning profile is replaced."""
+    def __init__(self, stop_event, store, profile):
+        self.stop_event = stop_event
+        self.store = store
+        self.profile = dict(profile)
+
+    def is_set(self):
+        if self.stop_event.is_set():
+            return True
+        current = self.store.get_profile(self.profile["id"])
+        keys = ("url", "original_profile_url", "output_dir", "enabled", "auto_download_videos", "auto_download_stories", "proxy_addr")
+        return current is None or any(current.get(key) != self.profile.get(key) for key in keys)
+
+    def wait(self, timeout):
+        deadline = time.monotonic() + timeout
+        while not self.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self.stop_event.wait(min(remaining, 0.1))
+        return True
 
 
 class MediaDownloadEngine:
@@ -2475,6 +2616,10 @@ class MediaDownloadEngine:
         return reason
 
     def _check_profile(self, profile):
+        profile = dict(profile)
+        cancellation = ProfileCancellation(self.stop_event, self.store, profile)
+        if cancellation.is_set():
+            return
         videos = bool(profile.get("auto_download_videos"))
         stories = bool(profile.get("auto_download_stories"))
         last_progress = ""
@@ -2482,7 +2627,7 @@ class MediaDownloadEngine:
         def on_progress(progress):
             nonlocal last_progress
             # FIX-APP-7: Abort long downloads on shutdown
-            if self.stop_event.is_set():
+            if cancellation.is_set():
                 raise InterruptedError("Shutdown requested during media download")
             progress_text = media_progress_text(progress)
             if not progress_text or progress_text == last_progress:
@@ -2498,14 +2643,16 @@ class MediaDownloadEngine:
 
         try:
             summary = download_profile(
-                self.store.get_profile(profile["id"]) or profile,
+                profile,
                 self.store.settings,
                 videos=videos,
                 stories=stories,
                 progress_callback=on_progress,
+                cancel_event=cancellation,
             )
             video_status = (summary.get("videos") or {}).get("status", "")
-            self._last_video_status[profile["id"]] = video_status
+            media_statuses = {(summary.get(kind) or {}).get("status", "") for kind in ("videos", "stories")}
+            self._last_video_status[profile["id"]] = "captcha" if "captcha" in media_statuses else video_status
             attention = self._notify_media_attention(profile, summary)
             statuses = {(summary.get(kind) or {}).get("status", "") for kind in ("videos", "stories")}
             if attention or statuses.intersection({"error", "api_empty", "blocked", "captcha", "login_required"}):
@@ -2525,6 +2672,8 @@ class MediaDownloadEngine:
                 media_last_checked=now_text(),
                 media_next_check="",
             )
+        except InterruptedError:
+            self.emit(profile["id"], "Media download cancelled.", media_status="Stopped", media_progress="Stopped")
         except CaptchaDetectedError as exc:
             # FIX-APP-6: CaptchaDetectedError must set captcha status for circuit breaker
             logging.warning("Media captcha detected for %s: %s", profile.get("name"), exc)
@@ -2769,8 +2918,9 @@ class ProfileDialog(Toplevel):
 
     async def resolve_room(self, url, quality=None):
         live = DouyinLiveStream()
-        if "live.douyin.com/" in url:
-            room = await live.fetch_web_stream_data(url)
+        direct_url = canonical_douyin_live_url(url)
+        if direct_url:
+            room = await live.fetch_web_stream_data(direct_url)
         else:
             room = await live.fetch_app_stream_data(url)
         stream = await live.fetch_stream_url(room, quality or self.store.settings["quality"])
@@ -2822,7 +2972,12 @@ class ProfileDialog(Toplevel):
             "url": url,
             "original_profile_url": original_profile_url if platform == "douyin" else "",
             "platform": platform,
-            "fallback_live_url": url if platform == "douyin" and "live.douyin.com/" in url else self.profile.get("fallback_live_url", ""),
+            "fallback_live_url": (canonical_douyin_live_url(url) or
+                                  (self.profile.get("fallback_live_url", "")
+                                   if url == self.profile.get("url", "").strip() else "")) if platform == "douyin" else "",
+            "fallback_source_url": (url if canonical_douyin_live_url(url) else
+                                    self.profile.get("fallback_source_url", "")
+                                    if url == self.profile.get("url", "").strip() else "") if platform == "douyin" else "",
             "output_dir": output_dir,
             "quality": self.quality_var.get(),
             "poll_interval_seconds": poll_interval,
@@ -3531,13 +3686,14 @@ class RecorderApp:
         if not profile:
             messagebox.showinfo(t("select_profile"), t("select_profile_edit"))
             return
+        previous = dict(profile)
         dialog = ProfileDialog(self.root, self.store, profile)
         self.root.wait_window(dialog)
         if dialog.result:
             self.store.upsert_profile(dialog.result)
             Path(dialog.result["output_dir"]).mkdir(parents=True, exist_ok=True)
-            if not wants_live_recording(dialog.result):
-                self.engine.stop_profile_recording(dialog.result["id"], t("live_recording_off_detail"))
+            self.engine.profile_changed(dialog.result["id"], previous)
+            self.media_engine.refresh_profile(dialog.result["id"])
             self.engine.wake_event.set()
             self.media_engine.wake_event.set()
             self.refresh_profiles()
@@ -3552,6 +3708,7 @@ class RecorderApp:
             return
         if messagebox.askyesno(t("remove_profile_title"), t("remove_profile_body", name=profile["name"])):
             self.store.remove_profile(profile["id"])
+            self.engine.profile_changed(profile["id"], profile)
             self.rows.pop(profile["id"], None)
             self.refresh_profiles()
 
@@ -3687,15 +3844,17 @@ class RecorderApp:
 def run_check():
     setup_logging(console=True)
     install_exception_hooks()
-    store = RecorderStore()
+    store = RecorderStore(read_only=True)
     events = queue.Queue()
     engine = MonitorEngine(store, events)
     for profile in store.profiles:
         if wants_live_recording(profile):
-            engine._check_profile(profile)
-    while not events.empty():
-        event = events.get()
-        print_console(f"{event['time']} {event['profile_id']} {event['message']} {event.get('state', {})}")
+            try:
+                room, stream = asyncio.run(asyncio.wait_for(engine._resolve(dict(profile)), timeout=30))
+                print_console(f"{profile.get('name', '')}: anchor={room.get('anchor_name', '')} live={stream.is_live}")
+            except Exception as exc:
+                print_console(f"{profile.get('name', '')}: {redact_sensitive_text(exc)}")
+
 
 
 def main():
@@ -3717,6 +3876,10 @@ def main():
         return 0
     except Exception:
         logging.exception("Application crashed")
+        try:
+            messagebox.showerror("Recorder could not start", "The recorder could not start. Check logs/app.log; existing configuration files were preserved.")
+        except Exception:
+            pass
         raise
     finally:
         release_app_lock()

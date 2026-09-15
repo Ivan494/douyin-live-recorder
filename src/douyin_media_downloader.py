@@ -14,6 +14,8 @@ import sys
 import threading
 import time
 import urllib.parse
+import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 from datetime import datetime
@@ -27,13 +29,14 @@ from streamget.platforms.douyin.live_stream import DouyinLiveStream
 from douyin_abogus import ABogus, BrowserFingerprintGenerator
 from security_utils import (
     follow_safe_redirects,
+    stream_safe_redirects,
     is_loopback_cdp_url,
     is_safe_media_download_url,
     is_safe_share_link_url,
 )
 
 
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 PACK_ROOT = APP_DIR.parent.parent
 ROOT_DOWNLOAD_DIR = APP_DIR.parent
 TOOLS_DIR = PACK_ROOT / "youtube-dl"
@@ -49,6 +52,33 @@ FETCH_BROWSER_CDP_PORT = 9344
 FETCH_BROWSER_CDP = f"http://127.0.0.1:{FETCH_BROWSER_CDP_PORT}"
 KNOWN_GOOD_EDGE_VERSION = "150.0.4078.83"
 MEDIA_BROWSER_LAUNCH_LOCK = threading.RLock()
+MEDIA_STATE_LOCK = threading.RLock()
+_cancellation = threading.local()
+
+
+def check_cancelled():
+    event = getattr(_cancellation, "event", None)
+    if event is not None and event.is_set():
+        raise InterruptedError("Media download cancelled")
+
+
+@contextmanager
+def cancellation_scope(event):
+    previous = getattr(_cancellation, "event", None)
+    _cancellation.event = event
+    try:
+        check_cancelled()
+        yield
+    finally:
+        _cancellation.event = previous
+
+
+def _cancel_wait(seconds):
+    event = getattr(_cancellation, "event", None)
+    if event is None:
+        time.sleep(seconds)
+    elif event.wait(seconds):
+        check_cancelled()
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -149,6 +179,8 @@ def _check_mobile_signer():
     try:
         from signer.gorgon import get_xgorgon  # noqa: F401
         _mobile_signer_available = True
+    except InterruptedError:
+        raise
     except Exception:
         _mobile_signer_available = False
     return _mobile_signer_available
@@ -229,6 +261,8 @@ def _mobile_signed_get(client, path, extra_params, cookie_header,
                 aid=MOBILE_API_AID,
             )
             headers["X-Ladon"] = Ladon.encrypt(khronos, "1611921764", MOBILE_API_AID)
+        except InterruptedError:
+            raise
         except Exception:
             logging.debug("Argus/Ladon signing unavailable for %s", path, exc_info=True)
     url = f"{MOBILE_API_HOST}{path}?{query_string}"
@@ -271,6 +305,8 @@ def _mobile_signed_request(client, method, path, extra_params, cookie_header,
                 aid=MOBILE_API_AID,
             )
             headers["X-Ladon"] = Ladon.encrypt(khronos, "1611921764", MOBILE_API_AID)
+        except InterruptedError:
+            raise
         except Exception:
             logging.debug("Argus/Ladon signing unavailable for %s %s", method, path, exc_info=True)
     url = f"{(host or MOBILE_API_HOST)}{path}?{query_string}"
@@ -348,9 +384,11 @@ def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header=""):
 
             if not has_more:
                 break
-            time.sleep(0.3)  # rate-limit courtesy
+            _cancel_wait(0.3)  # rate-limit courtesy
 
     except LoginRequiredError:
+        raise
+    except InterruptedError:
         raise
     except Exception as exc:
         if not stories:
@@ -473,6 +511,8 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                     full_sign=True,
                 )
                 data = response.json()
+            except InterruptedError:
+                raise
             except Exception as exc:
                 last_message = f"mobile_story_feed: {host}{path}: {exc}"
                 continue
@@ -565,6 +605,8 @@ def fetch_stories_via_mobile_life_feed(client, sec_user_id, user_id="", cookie_h
                     full_sign=True,
                 )
                 data = response.json()
+            except InterruptedError:
+                raise
             except Exception as exc:
                 last_message = f"{host}{LIFE_FEED_PATH}: {exc}"
                 continue
@@ -643,7 +685,7 @@ def fetch_posts_via_mobile_api(client, sec_user_id, limit=0, cookie_header=""):
         if not data.get("has_more", 0):
             break
         max_cursor = str(data.get("max_cursor", 0))
-        time.sleep(0.3)
+        _cancel_wait(0.3)
 
     if not all_items:
         raise EmptyApiResponseError("mobile_post_api: no posts returned")
@@ -682,10 +724,13 @@ _HTTP_FASTPATH_COOLDOWN = 600  # seconds (10 min) before retrying HTTP path
 
 
 def report_progress(callback, **progress):
+    check_cancelled()
     if not callback:
         return
     try:
         callback(progress)
+    except InterruptedError:
+        raise
     except Exception:
         # UI progress must never be able to interrupt a media download.
         pass
@@ -755,6 +800,8 @@ def load_session_cookie_header():
     try:
         encrypted = base64.b64decode(encoded)
         return dpapi_unprotect(encrypted).decode("utf-8")
+    except InterruptedError:
+        raise
     except Exception:
         logging.warning("Saved Douyin session could not be decrypted; treating as logged out.")
         return ""
@@ -782,6 +829,8 @@ def load_mobile_session_cookie_header():
     try:
         encrypted = base64.b64decode(encoded)
         return dpapi_unprotect(encrypted).decode("utf-8")
+    except InterruptedError:
+        raise
     except Exception:
         logging.warning("Saved mobile session could not be decrypted; treating as logged out.")
         return ""
@@ -834,15 +883,18 @@ def _read_http_headers(sock):
 
 
 def _masked_websocket_text(payload):
-    data = payload.encode("utf-8")
+    return _masked_websocket_frame(payload.encode("utf-8"), 1)
+
+
+def _masked_websocket_frame(data, opcode):
     mask = os.urandom(4)
     length = len(data)
     if length < 126:
-        header = bytes((0x81, 0x80 | length))
+        header = bytes((0x80 | opcode, 0x80 | length))
     elif length < 65536:
-        header = bytes((0x81, 0x80 | 126)) + length.to_bytes(2, "big")
+        header = bytes((0x80 | opcode, 0x80 | 126)) + length.to_bytes(2, "big")
     else:
-        header = bytes((0x81, 0x80 | 127)) + length.to_bytes(8, "big")
+        header = bytes((0x80 | opcode, 0x80 | 127)) + length.to_bytes(8, "big")
     masked = bytes(value ^ mask[index % 4] for index, value in enumerate(data))
     return header + mask + masked
 
@@ -897,6 +949,8 @@ class CdpSession:
         self._next_id = random.randint(1000, 999999)
         self._pending = {}
         self._events = []
+        self._frames = deque()
+        self._fragments = bytearray()
 
     def __enter__(self):
         self.connect()
@@ -936,9 +990,14 @@ class CdpSession:
     def close(self):
         sock = self._sock
         self._sock = None
+        self._frames.clear()
+        self._fragments.clear()
+        self._buffered = b""
         if sock is not None:
             try:
                 sock.close()
+            except InterruptedError:
+                raise
             except Exception:
                 pass
 
@@ -946,34 +1005,42 @@ class CdpSession:
         if self._sock is None:
             raise RuntimeError("CDP session is not connected")
         deadline = time.time() + (self.timeout if timeout is None else timeout)
-        fragments = bytearray()
         while True:
+            check_cancelled()
             remaining = deadline - time.time()
             if remaining <= 0:
                 raise TimeoutError("Timed out waiting for Chrome debugging message")
-            self._sock.settimeout(max(0.1, remaining))
+            self._sock.settimeout(min(0.5, max(0.01, remaining)))
             frames, self._buffered = _extract_websocket_frames(self._buffered)
-            for opcode, final, payload in frames:
+            self._frames.extend(frames)
+            while self._frames:
+                opcode, final, payload = self._frames.popleft()
                 if opcode == 0x8:
                     raise RuntimeError("Chrome closed the debugging connection")
                 if opcode == 0x1:
-                    fragments = bytearray(payload)
+                    self._fragments = bytearray(payload)
                 elif opcode == 0x0:
-                    fragments.extend(payload)
+                    self._fragments.extend(payload)
+                elif opcode == 0x9:
+                    self._sock.sendall(_masked_websocket_frame(payload, 0xA))
+                    continue
                 else:
                     continue
                 if not final:
                     continue
-                return json.loads(fragments.decode("utf-8"))
+                message = json.loads(self._fragments.decode("utf-8"))
+                self._fragments.clear()
+                return message
             try:
                 chunk = self._sock.recv(65536)
-            except socket.timeout as exc:
-                raise TimeoutError("Timed out waiting for Chrome debugging message") from exc
+            except socket.timeout:
+                continue
             if not chunk:
                 raise RuntimeError("Chrome closed the debugging connection")
             self._buffered += chunk
 
     def call(self, method, params=None, timeout=None):
+        check_cancelled()
         if self._sock is None:
             self.connect()
         request_id = self._next_id
@@ -1011,11 +1078,15 @@ class CdpSession:
                 elif message.get("id") is not None:
                     # Unexpected late response; keep as event-like payload.
                     events.append(message)
+        except InterruptedError:
+            raise
         except Exception:
             pass
         finally:
             try:
                 self._sock.settimeout(self.timeout)
+            except InterruptedError:
+                raise
             except Exception:
                 pass
         return events
@@ -1176,12 +1247,14 @@ def _ensure_media_fetch_browser(port=FETCH_BROWSER_CDP_PORT):
                 "profile_dir": str(FETCH_BROWSER_PROFILE_DIR),
                 **info,
             }
-        time.sleep(0.25)
+        _cancel_wait(0.25)
     # FIX-6.1: Kill the orphaned process to prevent it from holding the
     # user-data-dir lock and blocking future browser launches.
     try:
         process.kill()
         process.wait(timeout=5)
+    except InterruptedError:
+        raise
     except Exception:
         pass
     raise RuntimeError(
@@ -1215,9 +1288,12 @@ def media_fetch_browser(cdp_url=None):
         finally:
             if managed:
                 try:
-                    if cdp_is_available(cdp_url):
-                        close_cdp_browser(cdp_url)
-                        logging.info("Released on-demand Douyin media browser: %s", cdp_url)
+                    with cancellation_scope(None):
+                        if cdp_is_available(cdp_url):
+                            close_cdp_browser(cdp_url)
+                            logging.info("Released on-demand Douyin media browser: %s", cdp_url)
+                except InterruptedError:
+                    raise
                 except Exception:
                     # A cleanup failure must not discard fetched media or mask
                     # the original error. The next check can reuse the browser.
@@ -1270,6 +1346,8 @@ def _reset_media_fetch_browser_inner(port):
                     )
                     logging.info("Killed media fetch browser (PID %d) after captcha.", pid)
                     break
+    except InterruptedError:
+        raise
     except Exception:
         logging.debug("Could not kill media fetch browser by port.", exc_info=True)
     # Also try the CDP /json/close endpoint as a graceful fallback.
@@ -1280,6 +1358,8 @@ def _reset_media_fetch_browser_inner(port):
                 tid = target.get("id")
                 if tid:
                     client.get(cdp_url.rstrip("/") + f"/json/close/{tid}", timeout=3)
+    except InterruptedError:
+        raise
     except Exception:
         pass
     # FIX-CAPTCHA-2b: Only wipe cookies/cache after repeated captcha hits.
@@ -1294,11 +1374,15 @@ def _reset_media_fetch_browser_inner(port):
         for cookie_file in ("Cookies", "Cookies-journal"):
             try:
                 (FETCH_BROWSER_PROFILE_DIR / "Default" / cookie_file).unlink(missing_ok=True)
+            except InterruptedError:
+                raise
             except Exception:
                 pass
         for cache_dir in ("Cache", "Code Cache", "GPUCache"):
             try:
                 shutil.rmtree(FETCH_BROWSER_PROFILE_DIR / "Default" / cache_dir, ignore_errors=True)
+            except InterruptedError:
+                raise
             except Exception:
                 pass
         logging.info(
@@ -1312,7 +1396,7 @@ def _reset_media_fetch_browser_inner(port):
             "Captcha reset %d/%d - keeping cookies (wipe after %d consecutive).",
             _captcha_reset_count, _CAPTCHA_RESET_WIPE_THRESHOLD, _CAPTCHA_RESET_WIPE_THRESHOLD,
         )
-    time.sleep(1)
+    _cancel_wait(1)
 
 
 def _cdp_apply_session_cookies(session, cookie_header):
@@ -1341,6 +1425,8 @@ def _cdp_apply_session_cookies(session, cookie_header):
                     timeout=5,
                 )
                 applied += 1
+            except InterruptedError:
+                raise
             except Exception:
                 continue
     return applied
@@ -1383,12 +1469,16 @@ def _cdp_collect_post_payloads(session, sec_user_id, *, timeout=25):
                             {"requestId": request_id},
                             timeout=10,
                         )
+                    except InterruptedError:
+                        raise
                     except Exception:
                         continue
                     raw = result.get("body") or ""
                     if result.get("base64Encoded"):
                         try:
                             raw = base64.b64decode(raw).decode("utf-8", errors="replace")
+                        except InterruptedError:
+                            raise
                         except Exception:
                             continue
                     if not raw:
@@ -1430,12 +1520,16 @@ def _cdp_collect_post_payloads(session, sec_user_id, *, timeout=25):
                     {"requestId": request_id},
                     timeout=10,
                 )
+            except InterruptedError:
+                raise
             except Exception:
                 continue
             raw = result.get("body") or ""
             if result.get("base64Encoded"):
                 try:
                     raw = base64.b64decode(raw).decode("utf-8", errors="replace")
+                except InterruptedError:
+                    raise
                 except Exception:
                     continue
             if not raw:
@@ -1495,12 +1589,16 @@ def _cdp_collect_json_payloads(session, url_predicate, *, timeout=12):
                             {"requestId": request_id},
                             timeout=8,
                         )
+                    except InterruptedError:
+                        raise
                     except Exception:
                         continue
                     raw = result.get("body") or ""
                     if result.get("base64Encoded"):
                         try:
                             raw = base64.b64decode(raw).decode("utf-8", errors="replace")
+                        except InterruptedError:
+                            raise
                         except Exception:
                             continue
                     if not raw:
@@ -1585,9 +1683,11 @@ def _fetch_stories_from_browser(profile, sec_user_id, cdp_url):
         try:
             with httpx.Client(trust_env=False) as client:
                 client.put(cdp_url.rstrip("/") + "/json/new?about:blank", timeout=5)
+        except InterruptedError:
+            raise
         except Exception:
             pass
-        time.sleep(0.4)
+        _cancel_wait(0.4)
         page = _cdp_pick_page(cdp_url, prefer_douyin=False)
     if not page:
         return None, "browser_story: no open page target"
@@ -1602,7 +1702,7 @@ def _fetch_stories_from_browser(profile, sec_user_id, cdp_url):
             if cookie_header:
                 _cdp_apply_session_cookies(session, cookie_header)
             session.call("Page.navigate", {"url": profile_url}, timeout=30)
-            time.sleep(2)
+            _cancel_wait(2)
             if _detect_browser_captcha(session):
                 return None, "browser_story: captcha"
             click = _cdp_click_profile_story_ring(session)
@@ -1610,7 +1710,7 @@ def _fetch_stories_from_browser(profile, sec_user_id, cdp_url):
                 session, _is_story_capture_url, timeout=10 if click.get("ok") else 4
             )
             if click.get("ok") and not payloads:
-                time.sleep(1.5)
+                _cancel_wait(1.5)
                 payloads.extend(
                     _cdp_collect_json_payloads(session, _is_story_capture_url, timeout=6)
                 )
@@ -1619,6 +1719,8 @@ def _fetch_stories_from_browser(profile, sec_user_id, cdp_url):
                 if not packed:
                     packed = normalize_items(payload)
                 items.extend(item for item in packed if isinstance(item, dict))
+    except InterruptedError:
+        raise
     except Exception as exc:
         return None, f"browser_story: {exc}"
 
@@ -1688,6 +1790,8 @@ def _detect_browser_captcha(session):
         )
         value = (result.get("result") or {}).get("value") or ""
         return str(value)
+    except InterruptedError:
+        raise
     except Exception:
         return ""
 
@@ -1710,9 +1814,11 @@ def _fetch_posts_from_browser(profile, sec_user_id, limit, progress_callback, cd
         try:
             with httpx.Client(trust_env=False) as client:
                 client.put(cdp_url.rstrip("/") + "/json/new?about:blank", timeout=5)
+        except InterruptedError:
+            raise
         except Exception:
             pass
-        time.sleep(0.4)
+        _cancel_wait(0.4)
         page = _cdp_pick_page(cdp_url, prefer_douyin=False)
     if not page:
         raise RuntimeError("Media fetch browser has no open page target")
@@ -1736,14 +1842,14 @@ def _fetch_posts_from_browser(profile, sec_user_id, limit, progress_callback, cd
         # ?? Captcha gate: check before waiting for API payloads ??
         # FIX-AUDIT-3: Wait for SPA to render before checking captcha.
         # Pre-loaded SDK elements are briefly visible right after navigate.
-        time.sleep(2)
+        _cancel_wait(2)
         captcha_reason = _detect_browser_captcha(session)
         if captcha_reason:
             logging.warning("Captcha detected on initial load (reason: %s)", captcha_reason)
             # Give the page a moment in case the captcha is transient, then retry.
-            time.sleep(4)  # OPT-A: reduced from 12s; circuit breaker handles cycle skip
+            _cancel_wait(4)  # OPT-A: reduced from 12s; circuit breaker handles cycle skip
             session.call("Page.reload", {"ignoreCache": True}, timeout=20)
-            time.sleep(2)  # OPT-A: reduced from 5s
+            _cancel_wait(2)  # OPT-A: reduced from 5s
             captcha_reason = _detect_browser_captcha(session)
             if captcha_reason:
                 logging.warning("Captcha confirmed after reload (reason: %s)", captcha_reason)
@@ -1851,6 +1957,8 @@ def _fetch_posts_from_browser(profile, sec_user_id, limit, progress_callback, cd
                     },
                     timeout=10,
                 )
+            except InterruptedError:
+                raise
             except Exception:
                 pass
             more = _cdp_collect_post_payloads(session, sec_user_id, timeout=12)
@@ -1883,6 +1991,8 @@ def _fetch_posts_from_browser(profile, sec_user_id, limit, progress_callback, cd
     # This reduces cross-profile fingerprinting and stale-captcha carry-over.
     try:
         session.call("Page.navigate", {"url": "about:blank"}, timeout=5)
+    except InterruptedError:
+        raise
     except Exception:
         pass
 
@@ -1938,6 +2048,8 @@ def import_chrome_session(cdp_url=DEFAULT_CHROME_CDP):
     _persistent_mobile_device()
     try:
         close_cdp_browser(cdp_url)
+    except InterruptedError:
+        raise
     except Exception:
         logging.debug("Could not close login browser after import", exc_info=True)
     return {
@@ -1999,6 +2111,8 @@ def _wipe_fetch_browser_cookie_store():
     for path in targets:
         try:
             path.unlink(missing_ok=True)
+        except InterruptedError:
+            raise
         except OSError:
             logging.debug("Could not remove browser cookie file %s", path)
 
@@ -2054,6 +2168,8 @@ def cdp_is_available(cdp_url):
         with httpx.Client(trust_env=False) as client:
             response = client.get(cdp_url.rstrip("/") + "/json/version", timeout=2)
         return response.status_code == 200 and bool(response.json().get("webSocketDebuggerUrl"))
+    except InterruptedError:
+        raise
     except Exception:
         return False
 
@@ -2071,6 +2187,8 @@ def close_cdp_browser(cdp_url, timeout=10):
 
     try:
         chrome_cdp_command(websocket_url, "Browser.close", timeout=3)
+    except InterruptedError:
+        raise
     except (OSError, RuntimeError, TimeoutError):
         # A successful Browser.close commonly drops the socket before replying.
         pass
@@ -2079,7 +2197,7 @@ def close_cdp_browser(cdp_url, timeout=10):
     while time.time() < deadline:
         if not cdp_is_available(cdp_url):
             return
-        time.sleep(0.1)
+        _cancel_wait(0.1)
     raise RuntimeError(f"Browser at {cdp_url} did not close in time")
 
 
@@ -2091,6 +2209,8 @@ def available_cdp_port(preferred=9223):
         try:
             probe.bind(("127.0.0.1", preferred))
             return int(probe.getsockname()[1])
+        except InterruptedError:
+            raise
         except OSError:
             probe.bind(("127.0.0.1", 0))
             return int(probe.getsockname()[1])
@@ -2135,7 +2255,7 @@ def launch_douyin_login_browser():
                 raise RuntimeError(
                     "Microsoft Edge exited before the Douyin login connection was ready"
                 )
-            time.sleep(0.1)
+            _cancel_wait(0.1)
         raise RuntimeError(
             f"Douyin login browser started but debugging port {port} never became ready"
         )
@@ -2179,6 +2299,8 @@ def load_json(path, fallback):
     try:
         with open(path, "r", encoding="utf-8-sig") as fh:
             return map_config_strings(json.load(fh), expand_portable_path)
+    except InterruptedError:
+        raise
     except OSError as exc:
         logging.warning("Could not read JSON file %s: %s", path, exc)
         return fallback
@@ -2187,6 +2309,8 @@ def load_json(path, fallback):
         logging.error("JSON file %s is corrupt (%s); quarantining to %s", path, exc, corrupt_name.name)
         try:
             path.rename(corrupt_name)
+        except InterruptedError:
+            raise
         except OSError:
             pass
         return fallback
@@ -2213,6 +2337,8 @@ def cookie_value(cookie_header, name):
     cookie = SimpleCookie()
     try:
         cookie.load(cookie_header)
+    except InterruptedError:
+        raise
     except Exception:
         return ""
     morsel = cookie.get(name)
@@ -2453,6 +2579,8 @@ def aweme_filename(aweme, suffix=".mp4"):
         desc = desc[:80].rstrip("_ ")
     try:
         stamp = datetime.fromtimestamp(int(aweme.get("create_time") or time.time())).strftime("%Y-%m-%d_%H-%M-%S")
+    except InterruptedError:
+        raise
     except (TypeError, ValueError, OSError):
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     return f"{stamp}_{aweme_id}_{desc}{suffix}"
@@ -2470,8 +2598,12 @@ def load_state(output_dir):
 
 
 def save_state(state_path, state):
-    state["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    save_json(state_path, state)
+    with MEDIA_STATE_LOCK:
+        previous = load_json(state_path, {})
+        for key in ("downloaded_video_ids", "downloaded_story_ids"):
+            state[key] = sorted(set(map(str, state.get(key, []))) | set(map(str, previous.get(key, []))))
+        state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        save_json(state_path, state)
 
 
 
@@ -2517,6 +2649,8 @@ def _get_fresh_ttwid():
                         logging.debug("Refreshed ttwid cookie (cached 30 min).")
                         return _ttwid_cache["value"]
             logging.warning("ttwid registration returned no ttwid cookie.")
+        except InterruptedError:
+            raise
         except Exception as exc:
             logging.warning("Failed to fetch fresh ttwid: %s", exc)
     return _ttwid_cache["value"]  # return stale if refresh failed
@@ -2565,6 +2699,8 @@ def _session_authentication_status(client, cookies, ua):
         if response.status_code != 200 or not response.content:
             return None
         data = response.json()
+    except InterruptedError:
+        raise
     except Exception:
         return None
     if not isinstance(data, dict):
@@ -2749,6 +2885,8 @@ def resolve_numeric_user_id(client, profile, sec_user_id):
         user = data.get("user") if isinstance(data, dict) else None
         if isinstance(user, dict) and user.get("uid"):
             return str(user["uid"])
+    except InterruptedError:
+        raise
     except Exception:
         pass
     return ""
@@ -2803,6 +2941,8 @@ def request_life_feed(client, profile, sec_user_id, user_id=""):
                     fp=BrowserFingerprintGenerator.generate_fingerprint("Chrome"),
                     user_agent=USER_AGENT,
                 ).generate_abogus(query, body_text)
+            except InterruptedError:
+                raise
             except Exception as exc:
                 last_message = f"{LIFE_FEED_PATH}: sign failed: {exc}"
                 continue
@@ -2819,6 +2959,8 @@ def request_life_feed(client, profile, sec_user_id, user_id=""):
                     headers=headers,
                     content=body_text.encode("utf-8"),
                 )
+            except InterruptedError:
+                raise
             except Exception as exc:
                 last_message = f"{host}{LIFE_FEED_PATH}: {exc}"
                 continue
@@ -2827,6 +2969,8 @@ def request_life_feed(client, profile, sec_user_id, user_id=""):
                 continue
             try:
                 data = response.json()
+            except InterruptedError:
+                raise
             except Exception as exc:
                 last_message = f"{host}{LIFE_FEED_PATH}: bad json ({exc})"
                 continue
@@ -2861,10 +3005,10 @@ _MIN_IMAGE_BYTES = 512        # 512 B ? real images are always larger
 _MP4_FTYP_SIGNATURES = (b"ftyp", b"moov", b"mdat", b"free", b"skip")
 
 
-def _verify_downloaded_file(output_path):
+def _verify_downloaded_file(output_path, suffix=None):
     """Raise ValueError if a freshly downloaded file looks truncated or corrupt."""
     size = output_path.stat().st_size
-    suffix = output_path.suffix.lower()
+    suffix = suffix or output_path.suffix.lower()
     if suffix in (".mp4", ".mov", ".m4v", ".webm", ".mkv"):
         if size < _MIN_VIDEO_BYTES:
             raise ValueError(
@@ -2916,77 +3060,51 @@ def _verify_downloaded_file(output_path):
 
 
 def download_bytes(client, url, output_path, progress_callback=None, progress_details=None):
+    check_cancelled()
     if not is_safe_media_download_url(url):
-        raise ValueError(f"Refusing unsafe media download URL: {url}")
-    # FIX-6.3: Use PID-unique .part suffix to prevent concurrent download corruption.
-    import os as _os_mod
-    part_path = output_path.with_suffix(output_path.suffix + f".part.{_os_mod.getpid()}")
+        raise ValueError("Refusing unsafe media download URL")
+    part_path = output_path.with_suffix(output_path.suffix + f".part.{os.getpid()}.{uuid.uuid4().hex}")
     headers = {
-        "User-Agent": USER_AGENT,
-        "Referer": "https://www.douyin.com/",
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",
-        "Range": "bytes=0-",
+        "User-Agent": USER_AGENT, "Referer": "https://www.douyin.com/",
+        "Accept": "*/*", "Accept-Encoding": "identity", "Range": "bytes=0-",
     }
-    with client.stream("GET", url, headers=headers) as response:
-        response.raise_for_status()
-        try:
-            total_bytes = int(response.headers.get("content-length") or 0)
-        except (TypeError, ValueError):
-            total_bytes = 0
-        details = dict(progress_details or {})
-        report_progress(
-            progress_callback,
-            phase="downloading",
-            bytes_downloaded=0,
-            bytes_total=total_bytes,
-            **details,
-        )
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        downloaded_bytes = 0
-        reported_bytes = 0
-        with open(part_path, "wb") as fh:
-            for chunk in response.iter_bytes(1024 * 1024):
-                if chunk:
-                    fh.write(chunk)
-                    downloaded_bytes += len(chunk)
-                    if downloaded_bytes - reported_bytes >= 4 * 1024 * 1024:
-                        report_progress(
-                            progress_callback,
-                            phase="downloading",
-                            bytes_downloaded=downloaded_bytes,
-                            bytes_total=total_bytes,
-                            **details,
-                        )
-                        reported_bytes = downloaded_bytes
-        if downloaded_bytes != reported_bytes:
-            report_progress(
-                progress_callback,
-                phase="downloading",
-                bytes_downloaded=downloaded_bytes,
-                bytes_total=total_bytes,
-                **details,
-            )
-        # FIX-6.1: Detect silent truncation when server closes early.
-        if total_bytes > 0 and downloaded_bytes != total_bytes:
-            part_path.unlink(missing_ok=True)
-            raise IOError(
-                f"Download truncated: got {downloaded_bytes} of {total_bytes} bytes"
-            )
-        # FIX-6.2: Detect zero-byte writes (disk full or permission error).
-        if downloaded_bytes == 0 and total_bytes == 0:
+    try:
+        with stream_safe_redirects(client, url, url_validator=is_safe_media_download_url, headers=headers) as response:
             try:
-                if part_path.stat().st_size == 0:
-                    part_path.unlink(missing_ok=True)
-                    raise IOError("Download produced 0 bytes (possible disk full or blocked CDN)")
-            except OSError:
-                pass
-        part_path.replace(output_path)
+                total_bytes = int(response.headers.get("content-length") or 0)
+            except (TypeError, ValueError):
+                total_bytes = 0
+            details = dict(progress_details or {})
+            report_progress(progress_callback, phase="downloading", bytes_downloaded=0, bytes_total=total_bytes, **details)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            downloaded_bytes = 0
+            reported_bytes = 0
+            with open(part_path, "wb") as fh:
+                for chunk in response.iter_bytes(1024 * 1024):
+                    check_cancelled()
+                    if chunk:
+                        fh.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        if downloaded_bytes - reported_bytes >= 4 * 1024 * 1024:
+                            report_progress(progress_callback, phase="downloading", bytes_downloaded=downloaded_bytes,
+                                            bytes_total=total_bytes, **details)
+                            reported_bytes = downloaded_bytes
+            report_progress(progress_callback, phase="downloading", bytes_downloaded=downloaded_bytes,
+                            bytes_total=total_bytes, **details)
+            if total_bytes > 0 and downloaded_bytes != total_bytes:
+                raise IOError(f"Download truncated: got {downloaded_bytes} of {total_bytes} bytes")
+            if downloaded_bytes == 0:
+                raise IOError("Download produced 0 bytes")
+            _verify_downloaded_file(part_path, suffix=output_path.suffix.lower())
+            check_cancelled()
+            part_path.replace(output_path)
+    finally:
         try:
-            _verify_downloaded_file(output_path)
-        except ValueError:
-            output_path.unlink(missing_ok=True)
+            part_path.unlink(missing_ok=True)
+        except InterruptedError:
             raise
+        except OSError:
+            logging.warning("Could not remove partial download %s", part_path.name)
 
 
 @dataclass
@@ -3132,6 +3250,8 @@ def download_aweme_items(
                 saved = output_path.stat().st_size > 0
                 if saved:
                     saved_files.append(output_path)
+            except InterruptedError:
+                raise
             except OSError:
                 saved = False
         if not saved and video_urls:
@@ -3159,10 +3279,10 @@ def download_aweme_items(
                     saved = True
                     saved_files.append(output_path)
                     break
+                except InterruptedError:
+                    raise
                 except Exception as exc:
                     # FIX-6.3b: Clean up PID-suffixed .part files
-                    for _pf in output_path.parent.glob(output_path.name + ".part.*"):
-                        _pf.unlink(missing_ok=True)
                     report_progress(
                         progress_callback,
                         phase="retrying",
@@ -3211,9 +3331,9 @@ def download_aweme_items(
                         saved = True
                         saved_files.append(output_path)
                         logging.info("CDN fallback succeeded for %s via play API.", item_label)
+                    except InterruptedError:
+                        raise
                     except Exception as _fb_exc:
-                        for _pf in output_path.parent.glob(output_path.name + ".part.*"):
-                            _pf.unlink(missing_ok=True)
                         logging.warning(
                             "CDN fallback play API also failed for %s: %s: %s",
                             item_label, type(_fb_exc).__name__, _fb_exc,
@@ -3244,10 +3364,10 @@ def download_aweme_items(
                     )
                     saved = True
                     saved_files.append(image_path)
+                except InterruptedError:
+                    raise
                 except Exception as exc:
                     _image_failures += 1
-                    for _pf in image_path.parent.glob(image_path.name + ".part.*"):
-                        _pf.unlink(missing_ok=True)
                     report_progress(
                         progress_callback,
                         phase="retrying",
@@ -3503,6 +3623,8 @@ def fetch_stories_via_emulator(sec_user_id, user_id=""):
             encoding="utf-8",
             errors="replace",
         )
+    except InterruptedError:
+        raise
     except Exception as exc:
         return None, f"emulator_story: {exc}"
     if ADB_SERIAL not in (devices.stdout or ""):
@@ -3513,14 +3635,14 @@ def fetch_stories_via_emulator(sec_user_id, user_id=""):
     else:
         deep = f"https://www.douyin.com/user/{sec_user_id}"
     _adb(["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", deep])
-    time.sleep(2.5)
+    _cancel_wait(2.5)
     if not _adb_tap_label(("日常", "最近 24")):
         return None, "emulator_story: 日常 tab not found"
-    time.sleep(1.2)
+    _cancel_wait(1.2)
     if not _adb_tap_label(("小时前", "图片", "视频")):
         # Cover may have no text; tap a typical first-cell region.
         _adb(["shell", "input", "tap", "160", "780"])
-    time.sleep(2.0)
+    _cancel_wait(2.0)
     share_blk = Path(os.environ.get("TEMP") or APP_DIR) / "share_command.blk"
     _adb(
         [
@@ -3534,9 +3656,9 @@ def fetch_stories_via_emulator(sec_user_id, user_id=""):
         share_url = _parse_share_command_blk(share_blk.read_bytes())
     if not share_url:
         _adb_tap_label(("分享",))
-        time.sleep(0.8)
+        _cancel_wait(0.8)
         _adb_tap_label(("分享链接", "复制链接"))
-        time.sleep(0.8)
+        _cancel_wait(0.8)
         _adb(
             [
                 "pull",
@@ -3555,6 +3677,8 @@ def fetch_stories_via_emulator(sec_user_id, user_id=""):
         try:
             with httpx.Client(timeout=15, follow_redirects=True) as client:
                 aweme_id = resolve_share_link(client, share_url)
+        except InterruptedError:
+            raise
         except Exception:
             aweme_id = extract_aweme_id(share_url)
     aweme = {
@@ -3597,6 +3721,8 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
             last_message = mobile_source
     except LoginRequiredError:
         raise
+    except InterruptedError:
+        raise
     except Exception as exc:
         last_message = f"mobile_post_api: {exc}"
 
@@ -3634,6 +3760,8 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
                 supported_message = feed_source
     except LoginRequiredError:
         raise
+    except InterruptedError:
+        raise
     except Exception as exc:
         last_message = f"mobile_story_feed: {exc}"
 
@@ -3668,6 +3796,8 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
                 supported_message = life_source
     except LoginRequiredError:
         raise
+    except InterruptedError:
+        raise
     except Exception as exc:
         last_message = f"mobile_life_feed: {exc}"
 
@@ -3675,6 +3805,8 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
     try:
         life_data, life_source = request_life_feed(client, profile, sec_user_id, user_id=user_id)
     except LoginRequiredError:
+        raise
+    except InterruptedError:
         raise
     except Exception as exc:
         life_data, life_source = None, f"{LIFE_FEED_PATH}: {exc}"
@@ -3707,6 +3839,8 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
     for path in STORY_PATH_CANDIDATES:
         try:
             data = request_json(client, profile, path, sec_user_id, 0, 20, path_kind="story")
+        except InterruptedError:
+            raise
         except Exception as exc:
             last_message = f"{path}: {exc}"
             continue
@@ -3749,6 +3883,8 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
         ring_active = profile_has_active_story(client, profile, sec_user_id)
     except LoginRequiredError:
         raise
+    except InterruptedError:
+        raise
     except Exception:
         ring_active = False
 
@@ -3776,6 +3912,8 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
                 last_message = browser_source
         except LoginRequiredError:
             raise
+        except InterruptedError:
+            raise
         except Exception as exc:
             last_message = f"browser_story: {exc}"
 
@@ -3796,7 +3934,14 @@ def result_to_dict(result):
     }
 
 
-def download_profile(
+def download_profile(profile, settings=None, *, videos=True, stories=False, limit=0,
+                     progress_callback=None, cancel_event=None):
+    with cancellation_scope(cancel_event):
+        return _download_profile(profile, settings, videos=videos, stories=stories,
+                                 limit=limit, progress_callback=progress_callback)
+
+
+def _download_profile(
     profile,
     settings=None,
     *,
@@ -3839,7 +3984,8 @@ def download_profile(
     summary["user_id"] = identity.get("user_id", "")
     summary["resolved_name"] = identity.get("nickname", "")
     timeout = httpx.Timeout(30, connect=10, read=20, write=20, pool=20)
-    with httpx.Client(timeout=timeout, follow_redirects=True, http2=True, proxy=proxy) as client:
+    with httpx.Client(timeout=timeout, follow_redirects=True, http2=True, proxy=proxy,
+                      event_hooks={"request": [lambda request: check_cancelled()]}) as client:
         if videos:
             try:
                 report_progress(
@@ -3873,6 +4019,8 @@ def download_profile(
                     except LoginRequiredError:
                         summary["auth_warning"] = "login_required"
                         posts = None
+                    except InterruptedError:
+                        raise
                     except Exception as _mob_exc:
                         logging.debug(
                             "App login mobile post API failed for %s: %s",
@@ -3920,6 +4068,8 @@ def download_profile(
                         except EmptyApiResponseError as _fp_exc:
                             logging.debug("HTTP fast-path got %s for %s; falling through to browser.", type(_fp_exc).__name__, profile.get("name"))
                             posts = None  # expected - fall through to browser
+                        except InterruptedError:
+                            raise
                         except Exception as _fp_exc:
                             logging.debug("HTTP fast-path unexpected %s for %s; falling through to browser.", type(_fp_exc).__name__, profile.get("name"))
                             posts = None  # any other HTTP failure - browser fallback
@@ -3938,6 +4088,8 @@ def download_profile(
                             progress_callback=progress_callback,
                         )
                     except LoginRequiredError:
+                        raise
+                    except InterruptedError:
                         raise
                     except (EmptyApiResponseError, Exception) as _browser_exc:
                         logging.debug(
@@ -3960,6 +4112,8 @@ def download_profile(
                                 "Mobile API fallback returned %d posts for %s.",
                                 len(posts), profile.get("name"),
                             )
+                    except InterruptedError:
+                        raise
                     except Exception as _mob_exc:
                         logging.debug(
                             "Mobile API fallback also failed for %s: %s",
@@ -3982,6 +4136,8 @@ def download_profile(
                 result = MediaResult(status="login_required", message=str(exc))
             except EmptyApiResponseError as exc:
                 result = MediaResult(status="api_empty", message=str(exc))
+            except InterruptedError:
+                raise
             except Exception as exc:
                 result = MediaResult(status="error", message=str(exc))
             summary["videos"] = result_to_dict(result)
@@ -4018,6 +4174,8 @@ def download_profile(
                 result = MediaResult(status="login_required", message=str(exc))
             except EmptyApiResponseError as exc:
                 result = MediaResult(status="api_empty", message=str(exc))
+            except InterruptedError:
+                raise
             except Exception as exc:
                 result = MediaResult(status="error", message=str(exc))
             summary["stories"] = result_to_dict(result)
@@ -4074,6 +4232,8 @@ def resolve_share_link(client, url):
             url,
             url_validator=is_safe_share_link_url,
         )
+    except InterruptedError:
+        raise
     except Exception:
         return ""
     candidates = [str(item.url) for item in response.history] + [str(response.url)]
@@ -4084,6 +4244,8 @@ def resolve_share_link(client, url):
     # Some links land on a discovery/landing page that embeds the id in markup.
     try:
         body = response.text
+    except InterruptedError:
+        raise
     except Exception:
         body = ""
     for pattern in (
@@ -4153,6 +4315,8 @@ def fetch_aweme_detail_via_share_page(client, aweme_id):
         share_url = f"https://www.iesdouyin.com/share/{kind}/{aweme_id}/"
         try:
             response = client.get(share_url, headers={"User-Agent": USER_AGENT})
+        except InterruptedError:
+            raise
         except Exception:
             continue
         if response.status_code != 200:
@@ -4196,6 +4360,8 @@ def download_video_by_url(url, output_dir=None, progress_callback=None):
     )
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
+    except InterruptedError:
+        raise
     except OSError as exc:
         return _single_video_result("error", f"Cannot create output folder: {exc}", output_dir=str(out_dir))
     cookies = _mobile_cookie_header()
@@ -4211,12 +4377,16 @@ def download_video_by_url(url, output_dir=None, progress_callback=None):
             errors = []
             try:
                 aweme = fetch_aweme_detail(client, aweme_id, cookies)
+            except InterruptedError:
+                raise
             except Exception as exc:
                 errors.append(f"detail API {type(exc).__name__}: {exc}")
                 logging.warning("aweme detail fetch failed for %s: %s", aweme_id, exc)
             if not isinstance(aweme, dict):
                 try:
                     aweme = fetch_aweme_detail_via_share_page(client, aweme_id)
+                except InterruptedError:
+                    raise
                 except Exception as exc:
                     errors.append(f"share page {type(exc).__name__}: {exc}")
                 if not isinstance(aweme, dict):
@@ -4224,12 +4394,13 @@ def download_video_by_url(url, output_dir=None, progress_callback=None):
                     return _single_video_result(
                         "error", f"Could not fetch video details: {detail}", output_dir=str(out_dir)
                     )
-            state_path, _existing_state = load_state(out_dir)
-            fresh_state = {"downloaded_video_ids": [], "downloaded_story_ids": []}
+            state_path, fresh_state = load_state(out_dir)
             media_result = download_aweme_items(
                 client, {"cookies": cookies}, [aweme], out_dir, fresh_state, "video", progress_callback
             )
             save_state(state_path, fresh_state)
+    except InterruptedError:
+        raise
     except Exception as exc:
         logging.exception("Single video download failed for %s", link)
         return _single_video_result("error", f"{type(exc).__name__}: {exc}", output_dir=str(out_dir))

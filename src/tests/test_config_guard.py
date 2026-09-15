@@ -1,4 +1,4 @@
-﻿import json
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -56,17 +56,6 @@ class ConfigGuardTest(unittest.TestCase):
 
             self.assertEqual([], json.loads(target.read_text(encoding="utf-8")))
 
-    def test_shipped_settings_do_not_enable_windows_autostart(self):
-        settings_path = Path(__file__).resolve().parents[1] / "settings.json"
-        data = json.loads(settings_path.read_text(encoding="utf-8"))
-        self.assertFalse(data.get("start_with_windows"))
-        self.assertEqual("mkv", data.get("container"))
-        self.assertEqual("zh-CN", data.get("language"))
-
-    def test_shipped_profiles_are_empty(self):
-        profiles_path = Path(__file__).resolve().parents[1] / "profiles.json"
-        data = json.loads(profiles_path.read_text(encoding="utf-8"))
-        self.assertEqual([], data)
 
 
 if __name__ == "__main__":

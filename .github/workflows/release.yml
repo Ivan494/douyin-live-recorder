@@ -24,12 +24,6 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Run tests
-        shell: pwsh
-        run: |
-          $env:PYTHONPATH = "src"
-          python -m pytest src/tests -q
-
       - name: Download ffmpeg
         shell: pwsh
         run: |
@@ -50,6 +44,13 @@ jobs:
           $bin = Get-ChildItem ffmpeg -Directory | Select-Object -First 1
           Copy-Item (Join-Path $bin.FullName "bin\ffmpeg.exe") tools/
           Copy-Item (Join-Path $bin.FullName "bin\ffprobe.exe") tools/
+
+      - name: Run tests including recording lifecycle
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "src"
+          $env:DOUYIN_TEST_TOOLS_DIR = (Resolve-Path tools).Path
+          python -m pytest src/tests scripts/test_release_defaults.py -q
 
       - name: Build release zip
         shell: pwsh

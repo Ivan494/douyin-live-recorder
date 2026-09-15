@@ -28,4 +28,4 @@ jobs:
         shell: pwsh
         run: |
           $env:PYTHONPATH = "src"
-          python -m pytest src/tests -q
+          python -m pytest src/tests scripts/test_release_defaults.py -q

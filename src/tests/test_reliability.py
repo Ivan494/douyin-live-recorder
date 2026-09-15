@@ -1,3 +1,4 @@
+import gc
 import os
 import tempfile
 import time
@@ -290,20 +291,29 @@ class ReliabilityTest(unittest.TestCase):
                 "output_dir": str(root / "output"),
                 "container": "mkv",
             }
-            for index, source in enumerate(sources, start=1):
-                stream = SimpleNamespace(
-                    anchor_name="Anchor",
-                    title="Title",
-                    flv_url=str(source),
-                    record_url="",
-                    m3u8_url="",
-                )
-                engine._start_recording(profile, stream)
-                engine.processes[profile["id"]].wait(timeout=15)
-                engine._poll_processes()
-                self.assertIn(profile["id"], engine.recordings)
-                self.assertEqual(index, len(engine.recordings[profile["id"]]["parts"]))
-                self.assertEqual("recovering", engine.recordings[profile["id"]]["status"])
+            from tests.support import serve_media
+            import recording_urls
+            original_validator = recording_urls.is_safe_recording_url
+            with serve_media(root) as base_url:
+                def fixture_validator(url):
+                    return url.startswith(base_url + "/") or original_validator(url)
+                with patch.object(recording_urls, "is_safe_recording_url", side_effect=fixture_validator), patch.object(
+                    app, "is_safe_recording_url", side_effect=fixture_validator
+                ):
+                    for index, source in enumerate(sources, start=1):
+                        stream = SimpleNamespace(
+                            anchor_name="Anchor",
+                            title="Title",
+                            flv_url=f"{base_url}/{source.name}",
+                            record_url="",
+                            m3u8_url="",
+                        )
+                        engine._start_recording(profile, stream)
+                        engine.processes[profile["id"]].wait(timeout=15)
+                        engine._poll_processes()
+                        self.assertIn(profile["id"], engine.recordings)
+                        self.assertEqual(index, len(engine.recordings[profile["id"]]["parts"]))
+                        self.assertEqual("recovering", engine.recordings[profile["id"]]["status"])
 
             recording = engine.recordings[profile["id"]]
             final_output = Path(recording["final_output"])
@@ -355,6 +365,7 @@ class ReliabilityTest(unittest.TestCase):
             "offline_since": time.time() - 100,
             "offline_confirmations": 1,
         }
+        store.profiles = [profile]
         room = {"live_url": profile["url"]}
         stream = SimpleNamespace(is_live=False)
         with patch.object(engine, "_resolve", AsyncMock(return_value=(room, stream))), patch.object(
@@ -420,6 +431,8 @@ class ReliabilityTest(unittest.TestCase):
             self.assertLessEqual(column_width, recorder.tree.winfo_width())
         finally:
             recorder.root.destroy()
+            del recorder
+            gc.collect()
 
     def test_media_progress_text_covers_scan_transfer_and_retry(self):
         from i18n import set_language

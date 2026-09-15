@@ -6,6 +6,7 @@ import ipaddress
 import os
 import shutil
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -170,6 +171,24 @@ def follow_safe_redirects(client, url, *, url_validator, max_hops=10):
         response = client.get(current, follow_redirects=False)
     response.raise_for_status()
     return response
+
+
+@contextmanager
+def stream_safe_redirects(client, url, *, url_validator, headers=None, max_hops=10):
+    """Validate each location before opening a streaming HTTP response."""
+    current = str(url)
+    for hop in range(max_hops + 1):
+        if not url_validator(current):
+            raise ValueError("Refusing unsafe media URL or redirect")
+        with client.stream("GET", current, headers=headers, follow_redirects=False) as response:
+            if not response.is_redirect:
+                response.raise_for_status()
+                yield response
+                return
+            location = response.headers.get("location")
+            if not location or hop == max_hops:
+                raise ValueError("Invalid or excessive media redirects")
+            current = str(response.url.join(location))
 
 
 def resolve_trusted_executable(path_text, *, allowed_basenames=None, trusted_roots=()):
