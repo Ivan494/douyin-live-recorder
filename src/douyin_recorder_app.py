@@ -3860,7 +3860,11 @@ def run_check():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="Run one profile check without opening the UI.")
+    parser.add_argument("--self-test-report", help="Run an offline packaging self-test and write its JSON result.")
     args = parser.parse_args()
+    if args.self_test_report:
+        from release_selftest import run_self_test
+        return run_self_test(args.self_test_report, APP_DIR)
     if args.check:
         run_check()
         return 0

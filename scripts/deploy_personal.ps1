@@ -25,7 +25,7 @@ if (Invoke-Git $target @('status', '--porcelain')) { throw 'Personal source has 
 # Deliberate allowlist: never copy JSON settings, sessions, logs, recordings,
 # browser profiles, executables, dependencies, or the public .git directory.
 $files = @('douyin_abogus.py', 'douyin_live_watcher.py', 'douyin_media_downloader.py',
-    'douyin_recorder_app.py', 'i18n.py', 'recording_urls.py', 'security_utils.py')
+    'douyin_recorder_app.py', 'i18n.py', 'recording_urls.py', 'security_utils.py', 'release_selftest.py')
 $files += @(Get-ChildItem -LiteralPath (Join-Path $source 'tests') -Filter '*.py' -File |
     ForEach-Object { 'tests/' + $_.Name })
 foreach ($file in $files) {

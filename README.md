@@ -89,11 +89,16 @@ python -m pytest src/tests
 ## 打包 Windows 压缩包
 
 ```text
-pip install -r requirements.txt pyinstaller
-pwsh ./scripts/build_release.ps1 -Version 1.2.0 -FfmpegDir <含 ffmpeg.exe 的目录>
+pip install -r requirements-release.txt
+pwsh ./scripts/build_release.ps1 -Version 1.2.3 -FfmpegDir <含 ffmpeg.exe 和 ffprobe.exe 的目录>
 ```
 
 推送 `v*` 标签会在 GitHub Actions 上走同样的打包流程。
+
+发布流程使用独立的锁定依赖环境，验证源码与默认配置，只打包白名单文件，
+解压到中文/空格路径后运行 EXE 自检。下载时可用 `SHA256SUMS.txt` 校验压缩包。
+发布包不包含个人资料、登录态、设备标识、浏览器配置、日志或录制文件。
+PR 会先验证完整构建；标签构建通过后才会公开发布。
 
 ## 声明
 

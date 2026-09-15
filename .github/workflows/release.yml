@@ -1,67 +1,111 @@
 name: build-release
 
 on:
+  pull_request:
+    branches: [main]
   push:
-    tags:
-      - "v*"
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '仅构建验证，不发布（X.Y.Z）'
+        required: true
+        default: '1.2.3'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Install dependencies
+          python-version: '3.11'
+      - name: Validate version
+        id: version
+        shell: pwsh
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: Download ffmpeg
+          $version = '1.2.3'
+          if ($env:GITHUB_REF_TYPE -eq 'tag') { $version = $env:GITHUB_REF_NAME -replace '^v', '' }
+          elseif ($env:REQUESTED_VERSION) { $version = $env:REQUESTED_VERSION }
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid release version' }
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Install locked build dependencies
+        run: python -m pip install -r requirements-release.txt
+      - name: Download and verify FFmpeg
         shell: pwsh
         run: |
-          $zipUri = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-          $shaUri = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256"
-          Invoke-WebRequest -Uri $zipUri -OutFile ffmpeg.zip
-          Invoke-WebRequest -Uri $shaUri -OutFile ffmpeg.zip.sha256
-          if ((Get-Item ffmpeg.zip).Length -lt 10MB) {
-            throw "ffmpeg.zip download looks truncated"
-          }
-          $expected = ((Get-Content ffmpeg.zip.sha256 -Raw).Trim() -split "\s+")[0].ToLowerInvariant()
-          $actual = (Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($expected -ne $actual) {
-            throw "ffmpeg.zip SHA256 mismatch: expected $expected got $actual"
-          }
+          $uri = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+          Invoke-WebRequest -Uri $uri -OutFile ffmpeg.zip
+          Invoke-WebRequest -Uri "$uri.sha256" -OutFile ffmpeg.zip.sha256
+          $expected = ((Get-Content ffmpeg.zip.sha256 -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+          if ($expected -notmatch '^[a-f0-9]{64}$') { throw 'Invalid FFmpeg checksum' }
+          if ((Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'FFmpeg checksum mismatch' }
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg
           New-Item -ItemType Directory -Force -Path tools | Out-Null
-          $bin = Get-ChildItem ffmpeg -Directory | Select-Object -First 1
-          Copy-Item (Join-Path $bin.FullName "bin\ffmpeg.exe") tools/
-          Copy-Item (Join-Path $bin.FullName "bin\ffprobe.exe") tools/
-
-      - name: Run tests including recording lifecycle
+          $bins = @(Get-ChildItem ffmpeg -Recurse -Filter ffmpeg.exe -File)
+          if ($bins.Count -ne 1) { throw 'Unexpected FFmpeg archive layout' }
+          Copy-Item -LiteralPath $bins[0].FullName -Destination tools/
+          Copy-Item -LiteralPath (Join-Path $bins[0].DirectoryName 'ffprobe.exe') -Destination tools/
+      - name: Verify source privacy and run regression tests
         shell: pwsh
         run: |
-          $env:PYTHONPATH = "src"
+          $env:PYTHONPATH = 'src'
           $env:DOUYIN_TEST_TOOLS_DIR = (Resolve-Path tools).Path
-          python -m pytest src/tests scripts/test_release_defaults.py -q
-
-      - name: Build release zip
+          python scripts/release_artifacts.py --source
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pytest src/tests scripts/test_release_defaults.py scripts/test_release_artifacts.py -q -W error::pytest.PytestUnraisableExceptionWarning
+      - name: Build, inspect, extract and run release self-test
         shell: pwsh
-        run: |
-          $ver = "${{ github.ref_name }}" -replace '^v',''
-          ./scripts/build_release.ps1 -Version $ver -FfmpegDir tools
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/build_release.ps1 -Version $env:RELEASE_VERSION -FfmpegDir tools
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-package
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            dist/DouyinLiveRecorder-v${{ steps.version.outputs.version }}-win64.zip
+            dist/SHA256SUMS.txt
 
-      - name: Publish release
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-package
+          path: release
+      - name: Verify assets and publish completed release
         shell: pwsh
-        run: |
-          $ver = "${{ github.ref_name }}" -replace '^v',''
-          gh release create "${{ github.ref_name }}" --title "抖音直播录制 v$ver" --notes-file .github/release-notes.md --latest "dist/DouyinLiveRecorder-v$ver-win64.zip"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          $zip = "release/DouyinLiveRecorder-v$env:RELEASE_VERSION-win64.zip"
+          $expected = ((Get-Content release/SHA256SUMS.txt -Raw).Trim() -split '\s+')[0]
+          if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Asset checksum mismatch' }
+          python scripts/release_artifacts.py --zip $zip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release create $env:GITHUB_REF_NAME --verify-tag --draft --title "抖音直播录制 v$env:RELEASE_VERSION" --notes-file .github/release-notes.md $zip release/SHA256SUMS.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release edit $env:GITHUB_REF_NAME --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
