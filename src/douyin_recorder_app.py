@@ -3714,14 +3714,45 @@ class RecorderApp:
 
     def open_folder(self):
         profile = self.selected_profile()
-        if profile:
-            path = profile["output_dir"]
-        else:
-            path = str(ROOT_DOWNLOAD_DIR)
-        os.startfile(path)
+        if not profile:
+            self.open_root_folder()
+            return
+        try:
+            path = Path(profile["output_dir"])
+            if not path.is_dir():
+                selected = filedialog.askdirectory(
+                    parent=self.root,
+                    title=t("locate_profile_folder", name=profile["name"]),
+                    initialdir=str(path.parent if path.parent.is_dir() else APP_DIR),
+                    mustexist=True,
+                )
+                if not selected:
+                    return
+                path = Path(selected).resolve()
+                if not path.is_dir():
+                    raise FileNotFoundError(str(path))
+                # A modal dialog runs Tk's event loop. Re-read the profile so
+                # selecting a folder cannot restore a deleted or stale profile.
+                with self.store.lock:
+                    current = self.store.get_profile(profile["id"])
+                    if current is None:
+                        return
+                    previous = dict(current)
+                    updated = dict(current, output_dir=str(path))
+                    self.store.upsert_profile(updated)
+                self.engine.profile_changed(updated["id"], previous)
+                self.media_engine.refresh_profile(updated["id"])
+                self.refresh_profiles()
+            os.startfile(str(path))
+        except (OSError, ValueError, RuntimeError) as exc:
+            messagebox.showerror(t("open_folder_failed"), str(exc), parent=self.root)
 
     def open_root_folder(self):
-        os.startfile(str(ROOT_DOWNLOAD_DIR))
+        try:
+            ROOT_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(ROOT_DOWNLOAD_DIR))
+        except OSError as exc:
+            messagebox.showerror(t("open_folder_failed"), str(exc), parent=self.root)
 
     def refresh_session_status(self):
         info = saved_session_info()

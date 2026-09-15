@@ -26,6 +26,7 @@ _MEDIA_FETCH_SUFFIXES = _SHARE_LINK_SUFFIXES + (
     ".bytecdn.cn",
     ".ibytedtos.com",
     ".douyincdn.com",
+    ".douyinvod.com",
     ".douyinpic.com",
     ".tiktokcdn.com",
     ".ixigua.com",
@@ -43,9 +44,9 @@ _MEDIA_FETCH_EXACT = frozenset(
     }
 )
 
-# Observed HTTPS destination returned by Douyin's api.amemv.com play endpoint.
-# Keep this exception specific to media downloads and to the verified host.
-_MEDIA_CDN_EXACT = frozenset({"v5-hl-mly-ov.zjcdn.com"})
+# Observed HTTPS destinations returned by Douyin's media/play endpoints.
+# Keep these exceptions specific to media downloads and to the verified hosts.
+_MEDIA_CDN_EXACT = frozenset({"v5-hl-mly-ov.zjcdn.com", "v3-dy-o.zjcdn.com"})
 
 _TRUSTED_TOOL_BASENAMES = frozenset(
     {

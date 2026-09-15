@@ -410,6 +410,21 @@ class ReliabilityTest(unittest.TestCase):
         )
 
     def test_main_table_columns_fit_supported_minimum_width(self):
+        # Tk/Tcl keeps process-wide state. Exercise the real application in a
+        # fresh process so earlier dialog tests cannot affect its initialization.
+        result = app.subprocess.run(
+            [app.sys.executable, "-c",
+             "from tests.test_reliability import ReliabilityTest; "
+             "ReliabilityTest()._check_main_table_layout()"],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True,
+            text=True,
+            timeout=45,
+            creationflags=getattr(app.subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
+    def _check_main_table_layout(self):
         with patch.object(app.RecorderStore, "save"), patch.object(
             app.RecorderApp, "_start_tray"
         ), patch.object(app.RecorderApp, "hide_to_tray"), patch.object(
