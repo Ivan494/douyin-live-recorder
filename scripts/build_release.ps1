@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.2.3",
+    [string]$Version = "1.2.4",
     [Parameter(Mandatory = $true)][string]$FfmpegDir,
     [string]$Python = "python"
 )

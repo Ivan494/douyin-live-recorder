@@ -10,7 +10,7 @@ on:
       version:
         description: '仅构建验证，不发布（X.Y.Z）'
         required: true
-        default: '1.2.3'
+        default: '1.2.4'
 
 permissions:
   contents: read
@@ -33,7 +33,7 @@ jobs:
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
         run: |
-          $version = '1.2.3'
+          $version = '1.2.4'
           if ($env:GITHUB_REF_TYPE -eq 'tag') { $version = $env:GITHUB_REF_NAME -replace '^v', '' }
           elseif ($env:REQUESTED_VERSION) { $version = $env:REQUESTED_VERSION }
           if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid release version' }
