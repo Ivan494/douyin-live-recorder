@@ -187,36 +187,30 @@ def run_ffmpeg(config, stream, logger):
     ]
 
     logger.info("Recording started: %s source=%s", output_file, stream_kind)
-    process = subprocess.Popen(
-        cmd,
-        cwd=str(output_dir),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-    )
-
-    while process.poll() is None:
-        if STOP:
-            logger.info("Stop requested; terminating FFmpeg.")
-            process.terminate()
-            try:
-                process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            break
-        time.sleep(5)
-
-    stderr = ""
-    if process.stderr:
-        try:
-            stderr = process.stderr.read()
-        except OSError:
-            stderr = ""
-
-    logger.info("Recording ended: returncode=%s file=%s", process.returncode, output_file)
-    if stderr.strip():
-        logger.info("FFmpeg stderr: %s", stderr.strip()[-2000:])
+    logs_dir = output_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    stderr_path = logs_dir / f"{output_file.stem}.ffmpeg.log"
+    with open(stderr_path, "a", encoding="utf-8") as stderr_file:
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(output_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        while process.poll() is None:
+            if STOP:
+                logger.info("Stop requested; terminating FFmpeg.")
+                process.terminate()
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                break
+            time.sleep(0.5)
+    logger.info("Recording ended: returncode=%s file=%s log=%s", process.returncode, output_file, stderr_path)
 
 
 async def watch(config, logger):

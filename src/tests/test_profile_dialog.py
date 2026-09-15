@@ -1,3 +1,4 @@
+import gc
 import os
 import tempfile
 import unittest
@@ -17,6 +18,39 @@ class FakeStore:
 
 @unittest.skipUnless(os.name == "nt", "Tk profile dialog smoke test is Windows-only")
 class ProfileDialogTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.root = Tk()
+        cls.root.withdraw()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.root.destroy()
+        del cls.root
+        gc.collect()
+
+    def tearDown(self):
+        # Release widget/Variable cycles on the Tk thread before later tests
+        # create workers that could otherwise trigger their garbage collection.
+        gc.collect()
+
+    def test_editing_url_discards_the_previous_room_cache(self):
+        profile = {
+            "id": "edit-cache", "name": "Test", "url": "https://live.douyin.com/old",
+            "fallback_live_url": "https://live.douyin.com/old",
+            "fallback_source_url": "https://live.douyin.com/old",
+        }
+        root = self.root
+        try:
+            dialog = ProfileDialog(root, FakeStore(), profile)
+            dialog.withdraw()
+            dialog.url_var.set("https://www.douyin.com/user/new")
+            dialog.save()
+            self.assertEqual("", dialog.result["fallback_live_url"])
+            self.assertEqual("", dialog.result["fallback_source_url"])
+        finally:
+            dialog.destroy()
+
     def test_save_preserves_media_profile_url_and_options(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             sec_uid = "MS4wLjABAAAA-test-profile"
@@ -37,15 +71,14 @@ class ProfileDialogTest(unittest.TestCase):
                 "auto_download_stories": True,
                 "platform": "douyin",
             }
-            root = Tk()
-            root.withdraw()
+            root = self.root
             try:
                 dialog = ProfileDialog(root, FakeStore(), profile)
                 dialog.withdraw()
                 dialog.save()
                 result = dialog.result
             finally:
-                root.destroy()
+                dialog.destroy()
 
         self.assertEqual(profile_url, result["original_profile_url"])
         self.assertFalse(result["record_live"])

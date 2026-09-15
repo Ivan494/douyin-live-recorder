@@ -17,6 +17,7 @@ dist/
 build/
 
 .venv/
+.venv-*/
 venv/
 env/
 *.egg-info/
@@ -38,3 +39,6 @@ src/logs/
 **/media_circuit_breaker.json
 **/show_window.signal
 *.corrupt-*
+
+# Personal deployment provenance
+**/deployed-source.json
