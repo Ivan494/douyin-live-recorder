@@ -3059,7 +3059,7 @@ def _verify_downloaded_file(output_path, suffix=None):
                 raise ValueError("Downloaded file does not have a WebP header")
 
 
-def download_bytes(client, url, output_path, progress_callback=None, progress_details=None):
+def download_bytes(client, url, output_path, progress_callback=None, progress_details=None, extra_headers=None):
     check_cancelled()
     if not is_safe_media_download_url(url):
         raise ValueError("Refusing unsafe media download URL")
@@ -3068,6 +3068,7 @@ def download_bytes(client, url, output_path, progress_callback=None, progress_de
         "User-Agent": USER_AGENT, "Referer": "https://www.douyin.com/",
         "Accept": "*/*", "Accept-Encoding": "identity", "Range": "bytes=0-",
     }
+    headers.update(extra_headers or {})
     try:
         with stream_safe_redirects(client, url, url_validator=is_safe_media_download_url, headers=headers) as response:
             try:
@@ -3157,6 +3158,7 @@ def download_aweme_items(
     progress_callback=None,
 ):
     result = MediaResult(checked=len(items))
+    download_kwargs = {"extra_headers": {"User-Agent": MOBILE_API_UA, "Cookie": _mobile_cookie_header((profile.get("cookies") or "").strip())}} if media_kind == "story" else {}
     state_key = "downloaded_story_ids" if media_kind == "story" else "downloaded_video_ids"
     downloaded_ids = set(str(item) for item in state.get(state_key, []))
     default_target_dir = Path(output_dir) / ("stories" if media_kind == "story" else "videos")
@@ -3275,6 +3277,7 @@ def download_aweme_items(
                         output_path,
                         progress_callback=progress_callback,
                         progress_details=details,
+                        **download_kwargs,
                     )
                     saved = True
                     saved_files.append(output_path)
@@ -3327,6 +3330,7 @@ def download_aweme_items(
                                 output_path,
                                 progress_callback=progress_callback,
                                 progress_details=_fb_details,
+                                **download_kwargs,
                             )
                         saved = True
                         saved_files.append(output_path)
@@ -3361,6 +3365,7 @@ def download_aweme_items(
                         image_path,
                         progress_callback=progress_callback,
                         progress_details=details,
+                        **download_kwargs,
                     )
                     saved = True
                     saved_files.append(image_path)
