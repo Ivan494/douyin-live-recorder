@@ -70,6 +70,9 @@ python src/douyin_recorder_app.py
 在界面里添加资料，或直接编辑 `src/profiles.json`。每个资料可单独设置输出目录、
 轮询间隔、清晰度和是否自动下载。
 
+朋友可见 / 互关可见的作品和日常需要当前登录账号有访问权限。
+资料单独设置的 Cookie 优先；未设置时使用已保存的抖音 App / 网页登录。
+
 ### 日常
 
 日常走移动端接口：优先 `/aweme/v1/story/profile/list/`，并回退到作品列表和
@@ -179,6 +182,9 @@ Path tokens:
 
 Add a profile in the GUI, or edit `src/profiles.json`. Each profile has its
 own output directory, poll interval, quality, and download flags.
+
+Friends-only works and stories require a login that can view them. A profile's
+explicit Cookie takes priority; otherwise downloads use the saved app/web login.
 
 ### Stories
 

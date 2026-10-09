@@ -48,6 +48,10 @@ _MEDIA_FETCH_EXACT = frozenset(
 # Keep these exceptions specific to media downloads and to the verified hosts.
 _MEDIA_CDN_EXACT = frozenset({"v5-hl-mly-ov.zjcdn.com", "v3-dy-o.zjcdn.com"})
 
+# Media access is broader than session access. Only Douyin's authenticated
+# API/play hosts may receive the saved login Cookie, never external CDNs.
+_MEDIA_AUTH_SUFFIXES = _SHARE_LINK_SUFFIXES + (".snssdk.com", ".amemv.com")
+
 _TRUSTED_TOOL_BASENAMES = frozenset(
     {
         "ffmpeg.exe",
@@ -154,6 +158,23 @@ def is_safe_media_download_url(url):
     return _host_allowed(parsed.hostname, exact_hosts=_MEDIA_FETCH_EXACT | _MEDIA_CDN_EXACT, suffixes=_MEDIA_FETCH_SUFFIXES)
 
 
+def is_safe_media_auth_url(url):
+    """Allow saved login cookies only on HTTPS Douyin API/play destinations."""
+    if not is_safe_media_download_url(url):
+        return False
+    parsed = urlparse(str(url or "").strip())
+    try:
+        return (
+            parsed.scheme.lower() == "https"
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.port in (None, 443)
+            and _host_matches_suffixes(parsed.hostname, _MEDIA_AUTH_SUFFIXES)
+        )
+    except ValueError:
+        return False
+
+
 def follow_safe_redirects(client, url, *, url_validator, max_hops=10):
     """Follow redirects manually, validating every hop."""
     current = str(url or "").strip()
@@ -179,13 +200,20 @@ def follow_safe_redirects(client, url, *, url_validator, max_hops=10):
 
 
 @contextmanager
-def stream_safe_redirects(client, url, *, url_validator, headers=None, max_hops=10):
-    """Validate each location before opening a streaming HTTP response."""
+def stream_safe_redirects(client, url, *, url_validator, headers=None, max_hops=10,
+                          cookie_url_validator=None):
+    """Validate each hop and optionally restrict cookies after client merging."""
     current = str(url)
     for hop in range(max_hops + 1):
         if not url_validator(current):
             raise ValueError("Refusing unsafe media URL or redirect")
-        with client.stream("GET", current, headers=headers, follow_redirects=False) as response:
+        request = client.build_request("GET", current, headers=headers)
+        if cookie_url_validator is not None and not cookie_url_validator(current):
+            # Explicit headers, client defaults, and the cookie jar are merged
+            # by build_request. Filter the resulting request at every hop.
+            request.headers.pop("Cookie", None)
+        response = client.send(request, stream=True, follow_redirects=False)
+        try:
             if not response.is_redirect:
                 response.raise_for_status()
                 yield response
@@ -194,6 +222,8 @@ def stream_safe_redirects(client, url, *, url_validator, headers=None, max_hops=
             if not location or hop == max_hops:
                 raise ValueError("Invalid or excessive media redirects")
             current = str(response.url.join(location))
+        finally:
+            response.close()
 
 
 def resolve_trusted_executable(path_text, *, allowed_basenames=None, trusted_roots=()):
