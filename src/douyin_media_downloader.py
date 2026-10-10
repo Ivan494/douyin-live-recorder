@@ -401,36 +401,77 @@ def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header=""):
     return None, "mobile_post_api: no time-limited stories in post feed"
 
 
+STORY_PAYLOAD_BUCKET_KEYS = (
+    "data",
+    "active_data",
+    "history_list",
+    "history_data",
+    "all_data",
+    "user_story_list",
+)
+STORY_PAYLOAD_NESTED_KEYS = (
+    "data",
+    "aweme_list",
+    "story_list",
+    "all_story_list",
+    "user_story_list",
+    "stories",
+    "item_list",
+    "items",
+    "moment_list",
+    "history_list",
+    "story",
+)
+
+
+def _story_payload_entries(bucket):
+    """Flatten one response bucket into the entry dicts it carries."""
+    if bucket in (None, [], {}):
+        return []
+    if isinstance(bucket, list):
+        queue = list(bucket)
+    elif isinstance(bucket, dict):
+        queue = [bucket]
+    else:
+        return []
+    entries = []
+    for node in queue:
+        if not isinstance(node, dict):
+            continue
+        entries.append(node)
+        for key in STORY_PAYLOAD_NESTED_KEYS:
+            nested = node.get(key)
+            if isinstance(nested, list):
+                entries.extend(item for item in nested if isinstance(item, dict))
+            elif isinstance(nested, dict) and nested:
+                entries.append(nested)
+    return entries
+
+
 def _story_items_from_feed_payload(data):
-    """Extract aweme dicts from /aweme/v1/story/feed/ or similar packs."""
+    """
+    Extract aweme dicts from /aweme/v1/story/feed/ and similar packs.
+
+    The 日常 endpoints answer with the same pack under different keys: the
+    story feed returns it under ``data``, the profile tab nests it under
+    ``active_data``. Reading only one of them dropped the other, which
+    presented as a profile showing three 日常 while the app only ever saw the
+    recent ones. Both shapes are collected here and de-duplicated by aweme id.
+    """
     if not isinstance(data, dict):
         return []
     items = []
-    raw = data.get("data")
-    active = data.get("active_data")
-    if raw in (None, [], {}) and isinstance(active, dict):
-        raw = active.get("data") if active.get("data") not in (None, [], {}) else active
-    entries = []
-    if isinstance(raw, list):
-        entries = raw
-    elif isinstance(raw, dict):
-        entries = [raw]
-        for key in ("aweme_list", "story_list", "all_story_list", "user_story_list", "items", "data"):
-            nested = raw.get(key)
-            if isinstance(nested, list):
-                entries.extend(nested)
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        packed = _story_items_from_user_entry(entry)
-        if packed:
-            items.extend(packed)
-            continue
-        aweme = entry.get("aweme") or entry.get("aweme_info")
-        if isinstance(aweme, dict) and (aweme.get("aweme_id") or aweme.get("group_id")):
-            items.append(aweme)
-        elif entry.get("aweme_id") or entry.get("group_id"):
-            items.append(entry)
+    for key in STORY_PAYLOAD_BUCKET_KEYS:
+        for entry in _story_payload_entries(data.get(key)):
+            packed = _story_items_from_user_entry(entry)
+            if packed:
+                items.extend(packed)
+                continue
+            aweme = entry.get("aweme") or entry.get("aweme_info")
+            if isinstance(aweme, dict) and (aweme.get("aweme_id") or aweme.get("group_id")):
+                items.append(aweme)
+            elif entry.get("aweme_id") or entry.get("group_id"):
+                items.append(entry)
     if not items:
         items = normalize_items(data)
     seen = set()
@@ -468,7 +509,14 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
     device_id, install_id = _persistent_mobile_device()
     own_uid = _mobile_device_profile().get("own_uid") or ""
 
-    path_variants = []
+    # 两组请求形态，语义完全不同，不能混在一起轮流试：
+    #  * profile_variants —— 按"作者"维度查（to_uid）。profile/list 给还在 TTL 内的
+    #    日常，story/feed 给更早的「历史日常」。两者是互补的，必须合并，不能谁先
+    #    命中就 return（以前正是这样，所以主页挂 3 条日常只拿得到 1 条）。
+    #  * tray_variants —— 按"观看者的关注页托盘"维度查（cursor/insert_ids）。返回的
+    #    是观看者好友的日常，只在作者维度整条链都失败时才兜底。
+    profile_variants = []
+    tray_variants = []
     if numeric_uid.isdigit():
         # Captured from the app's Story25Api.getFeeds (profile 日常 tab).
         profile_extra = {
@@ -480,7 +528,21 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
             "insert_ids": "",
             "delete_ids": "",
         }
-        path_variants.append((STORY_PROFILE_LIST_PATH, profile_extra))
+        profile_variants.append((STORY_PROFILE_LIST_PATH, profile_extra))
+        # 历史日常（App 里「日常 → 历史日常作品」那个跳转页）。
+        # profile/list 只回 TTL 内那一条；用户翻到更早的日常时，App 走的是同一个
+        # story/feed，但按作者维度传 to_uid，而不是关注页托盘的 cursor 形态。
+        # 实测：带 to_uid 能拿到 profile/list 看不到的往期日常（is_24_story=1 /
+        # story_ttl=0 的归档条目）；带托盘参数则一条都拿不到。
+        history_extra = {
+            "to_uid": numeric_uid,
+            "offset": "0",
+            "count": "20",
+            "story_ttl": "0",
+            "insert_ids": "",
+            "delete_ids": "",
+        }
+        profile_variants.append((STORY_FEED_PATH, history_extra))
 
     insert_json = json.dumps([int(numeric_uid)]) if numeric_uid.isdigit() else ""
     viewer_uid = own_uid if own_uid.isdigit() else numeric_uid
@@ -492,11 +554,16 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
         tray_extra["filter_warn"] = "0"
         tray_extra["user_per_page"] = "0"
     for path in (STORY_FEED_PATH, NEW_STORY_FEED_PATH, NEW_STORY_FEED_V2_PATH):
-        path_variants.append((path, dict(tray_extra)))
+        tray_variants.append((path, dict(tray_extra)))
 
     last_message = "mobile_story_feed: no items"
     hosts = (MOBILE_API_HOST, "https://api3-social-m-lf.amemv.com")
-    for path, extra in path_variants:
+
+    # —— 第 1 组：作者维度，profile/list 与 story/feed 的结果合并 ——
+    collected = []
+    seen_ids = set()
+    answered_clean = False
+    for path, extra in profile_variants:
         try_hosts = hosts if path == STORY_PROFILE_LIST_PATH else (MOBILE_API_HOST,)
         for host in try_hosts:
             try:
@@ -527,16 +594,69 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                     f"{(data.get('status_msg') or data.get('message') or '')}"
                 )
                 continue
+            # status 0 是一次可信答复：这个变体不用再换 host 了。
+            answered_clean = True
             items = _story_items_from_feed_payload(data)
             if not items:
                 items = normalize_items(data)
             if items:
-                return items, f"{host}{path}"
-            last_message = f"{host}{path}: empty pack"
-            # profile/list is the real 日常 tab. status 0 + no items means
-            # there is no active story, even if web story_tab_empty is false.
-            if path == STORY_PROFILE_LIST_PATH:
-                return None, last_message
+                for item in items:
+                    aweme_id = str(item.get("aweme_id") or item.get("group_id") or "")
+                    if aweme_id and aweme_id in seen_ids:
+                        continue
+                    if aweme_id:
+                        seen_ids.add(aweme_id)
+                    collected.append(item)
+            else:
+                last_message = f"{host}{path}: empty pack"
+            break
+
+    if collected:
+        return collected, (
+            f"{MOBILE_API_HOST}{STORY_PROFILE_LIST_PATH} + {STORY_FEED_PATH} (profile 日常)"
+        )
+
+    if answered_clean:
+        # profile/list 已经从作者维度给出干净答复：这个主页当前没有可见日常。
+        # 不要退回到关注页托盘，那会抓到观看者好友的日常，张冠李戴。
+        return None, f"{MOBILE_API_HOST}{STORY_PROFILE_LIST_PATH}: empty pack"
+
+    # —— 第 2 组：关注页托盘兜底（仅当作者维度整条链都没能给出答复）——
+    for path, extra in tray_variants:
+        try:
+            response = _mobile_signed_request(
+                client,
+                "GET",
+                path,
+                extra,
+                cookie_header,
+                device_id,
+                install_id,
+                host=MOBILE_API_HOST,
+                full_sign=True,
+            )
+            data = response.json()
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            last_message = f"mobile_story_feed: {MOBILE_API_HOST}{path}: {exc}"
+            continue
+        if not isinstance(data, dict):
+            continue
+        _raise_mobile_login_required(data)
+        status_code = data.get("status_code")
+        if status_code not in (0, None):
+            last_message = (
+                f"mobile_story_feed: {path}: status_code={status_code} "
+                f"{(data.get('status_msg') or data.get('message') or '')}"
+            )
+            continue
+        items = _story_items_from_feed_payload(data)
+        if not items:
+            items = normalize_items(data)
+        if items:
+            return items, f"{MOBILE_API_HOST}{path}"
+        last_message = f"{MOBILE_API_HOST}{path}: empty pack"
     return None, last_message
 
 
@@ -2465,7 +2585,11 @@ def profile_has_active_story(client, profile, sec_user_id):
 
 
 def extract_sec_uid_from_url(url):
-    match = re.search(r"douyin\.com/user/([^/?#]+)", url or "")
+    # Both shapes occur in the wild: the web profile surface
+    # (``www.douyin.com/user/<sec_uid>``) and the share landing page that
+    # v.douyin.com short links redirect to
+    # (``www.iesdouyin.com/share/user/<sec_uid>``).
+    match = re.search(r"douyin\.com/(?:share/)?user/([^/?#]+)", url or "")
     return urllib.parse.unquote(match.group(1)) if match else ""
 
 
@@ -2507,8 +2631,12 @@ def iter_url_list(source):
                     yield item
 
 
-def collect_video_urls(aweme):
-    video = aweme.get("video") if isinstance(aweme, dict) else {}
+def _video_urls_from_video(video):
+    """Collect candidate mp4 URLs from a douyin ``video`` dict.
+
+    Shared by the top-level post video and by the per-image Live Photo video
+    (``images[i].video``), which is where 动图 (animated photo) payloads live.
+    """
     if not isinstance(video, dict):
         return []
     candidates = []
@@ -2535,11 +2663,24 @@ def collect_video_urls(aweme):
     return deduped
 
 
-def collect_image_urls(aweme):
+def collect_video_urls(aweme):
+    video = aweme.get("video") if isinstance(aweme, dict) else {}
+    return _video_urls_from_video(video)
+
+
+def collect_image_entries(aweme):
+    """Return one entry per image-work item, still/动图 payloads side by side.
+
+    Each entry is ``{"url": <still image url>, "video_urls": [...],
+    "live_photo": bool}``. ``video_urls`` is non-empty for 动图 (Live Photo)
+    items, whose animated payload is served from ``images[i].video``. The
+    top-level ``aweme["video"]`` of such works is only the BGM (an .mp3), so it
+    must never be used as a substitute for a missing animated payload.
+    """
     if not isinstance(aweme, dict):
         return []
     images = aweme.get("images") or (aweme.get("image_post_info") or {}).get("images") or []
-    result = []
+    entries = []
     seen = set()
     for image in images:
         if not isinstance(image, dict):
@@ -2548,22 +2689,77 @@ def collect_image_urls(aweme):
         for key in ("display_image", "download_url", "owner_watermark_image", "thumbnail"):
             candidates.extend(iter_url_list(image.get(key)))
         candidates = [url for url in candidates if url and url not in seen]
-        if not candidates:
-            continue
-        candidates.sort(
-            key=lambda url: (
-                "water" in url.lower(),
-                not any(ext in url.lower().split("?", 1)[0] for ext in (".jpg", ".jpeg")),
-                len(url),
+        selected = ""
+        if candidates:
+            candidates.sort(
+                key=lambda url: (
+                    "water" in url.lower(),
+                    not any(ext in url.lower().split("?", 1)[0] for ext in (".jpg", ".jpeg")),
+                    len(url),
+                )
             )
-        )
-        selected = candidates[0]
-        seen.add(selected)
-        result.append(selected)
-    return result
+            selected = candidates[0]
+            seen.add(selected)
+        video_urls = _video_urls_from_video(image.get("video"))
+        if not selected and not video_urls:
+            continue
+        entries.append({
+            "url": selected,
+            "video_urls": video_urls,
+            "live_photo": bool(video_urls),
+        })
+    return entries
 
 
-def aweme_filename(aweme, suffix=".mp4"):
+def collect_image_urls(aweme):
+    return [entry["url"] for entry in collect_image_entries(aweme) if entry.get("url")]
+
+
+# FIX-PATHLEN: Windows' legacy path APIs reject anything at or beyond 260
+# chars, and NTFS caps a single name component at 255.  A long CJK caption
+# combined with the staging suffix pushed a real path past that limit, so
+# open() failed with a
+# misleading FileNotFoundError and the item was counted as a download failure
+# even though the CDN response was perfectly fine.
+#
+# Two independent defences now exist:
+#   1. _extended_path() wraps long paths in the Win32 extended-length prefix,
+#      which lifts the 260-char ceiling entirely, so captions no longer have to
+#      be truncated.
+#   2. aweme_filename() budgets the caption against the real base directory for
+#      callers that do not opt into extended paths (and as a safety net).
+_MAX_PATH_LEGACY = 260
+_PATH_LENGTH_BUDGET = 255   # stay clear of the 260 limit
+_PATH_TAIL_RESERVE = 32     # "_01.jpg"/".mp4" + ".part.<pid>.<8-hex>"
+_MAX_NAME_COMPONENT = 255   # NTFS per-component limit
+
+
+def _extended_path(path):
+    """Return an extended-length path when the plain one would be rejected.
+
+    Windows' legacy path APIs refuse anything at or beyond 260 chars, and the
+    error they raise (FileNotFoundError) looks exactly like a missing file.
+    The Win32 extended-length prefix bypasses that limit.  Short paths are
+    returned unchanged, so the common case keeps plain behaviour and takes on no
+    new risk.
+
+    Callers must use this helper consistently: a file written through the
+    prefix is invisible to plain ``os.path`` / ``Path`` calls, so existence
+    checks and reads have to go through it as well.
+    """
+    raw = str(path)
+    if os.name != "nt" or raw.startswith("\\\\?\\"):
+        return raw
+    if len(raw) < _MAX_PATH_LEGACY:
+        return raw
+    raw = os.path.abspath(raw)
+    if raw.startswith("\\\\"):                 # UNC share
+        return "\\\\?\\UNC\\" + raw[2:]
+    return "\\\\?\\" + raw
+
+
+def _aweme_id_for_name(aweme):
+    """Sanitized id, shared by filenames and per-item subdirectories."""
     # FIX-D2: Use millisecond timestamp to reduce collision risk for items
     # without aweme_id. Same-second collisions caused silent data loss.
     _fallback_id = str(aweme.get("aweme_id") or "")
@@ -2575,21 +2771,77 @@ def aweme_filename(aweme, suffix=".mp4"):
     # Strict id sanitize: alnum/_/- only so separators and ".." cannot escape
     # the download directory when the name is joined under target_dir.
     aweme_id = re.sub(r"[^A-Za-z0-9_-]+", "_", _fallback_id).strip("_") or "unknown"
-    aweme_id = aweme_id[:64]
+    return aweme_id[:64]
+
+
+def aweme_filename(aweme, suffix=".mp4", base_dir=None, include_id=True, keep_full_title=False):
+    """Build the file name for a single item.
+
+    ``include_id=False`` drops the aweme id, for layouts where the id already
+    names the parent directory.  ``keep_full_title=True`` keeps the caption
+    intact and leaves the 260-char ceiling to :func:`_extended_path` (the name
+    is still capped at NTFS' 255-char component limit).  Otherwise the caption is
+    budgeted against ``base_dir``; that 80-char fallback and the truncating
+    default are kept so existing callers are unaffected.
+    """
+    aweme_id = _aweme_id_for_name(aweme)
     # FIX-D1: Use (x or {}) to handle share_info being JSON null.
     desc = safe_name(aweme.get("desc") or (aweme.get("share_info") or {}).get("share_title") or aweme_id)
-    # FIX-PATHLEN: Truncate description to prevent exceeding Windows MAX_PATH
-    # (260 chars).  Base dir (~95) + timestamp (19) + id (19) + separators +
-    # suffix + .part.PID overhead ? 150 chars reserved; cap desc at 80.
-    if len(desc) > 80:
-        desc = desc[:80].rstrip("_ ")
     try:
         stamp = datetime.fromtimestamp(int(aweme.get("create_time") or time.time())).strftime("%Y-%m-%d_%H-%M-%S")
     except InterruptedError:
         raise
     except (TypeError, ValueError, OSError):
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    return f"{stamp}_{aweme_id}_{desc}{suffix}"
+    prefix = f"{stamp}_{aweme_id}_" if include_id else f"{stamp}_"
+    if keep_full_title:
+        # The caller opted into extended-length paths; only the NTFS
+        # per-component limit still applies.
+        budget = max(_MAX_NAME_COMPONENT - len(prefix) - len(suffix) - 1, 16)
+        if len(desc) > budget:
+            desc = desc[:budget].rstrip("_ ")
+    elif base_dir is not None:
+        # FIX-PATHLEN: budget the caption against the *real* base directory.
+        # The old fixed 80-char cap assumed a ~95-char download root; a portable
+        # install where the root already carries a per-profile folder plus a
+        # "videos" level is ~135 chars, which made long-caption works fail.
+        budget = max(
+            _PATH_LENGTH_BUDGET
+            - len(str(base_dir))
+            - 1                     # path separator
+            - len(prefix)
+            - _PATH_TAIL_RESERVE,
+            16,
+        )
+        if len(desc) > budget:
+            desc = desc[:budget].rstrip("_ ")
+    elif len(desc) > 80:
+        desc = desc[:80].rstrip("_ ")
+    return f"{prefix}{desc}{suffix}"
+
+
+def media_item_path(target_dir, aweme, suffix=".mp4", subdir_by_aweme_id=False, keep_full_title=True):
+    """Resolve the on-disk path for one item's payload.
+
+    ``subdir_by_aweme_id`` groups every payload of a work under
+    ``<target_dir>/<aweme_id>/`` instead of prefixing each file name with the
+    id.  ``keep_full_title`` keeps the caption intact; the writable ceiling is
+    then handled by :func:`_extended_path` at I/O time.
+    """
+    target_dir = Path(target_dir)
+    if subdir_by_aweme_id:
+        base = target_dir / _aweme_id_for_name(aweme)
+        name = aweme_filename(
+            aweme, suffix=suffix, base_dir=base, include_id=False,
+            keep_full_title=keep_full_title,
+        )
+        return base / name
+    name = aweme_filename(
+        aweme, suffix=suffix, base_dir=target_dir,
+        keep_full_title=keep_full_title,
+    )
+    return target_dir / name
+
 
 
 def load_state(output_dir):
@@ -3013,7 +3265,10 @@ _MP4_FTYP_SIGNATURES = (b"ftyp", b"moov", b"mdat", b"free", b"skip")
 
 def _verify_downloaded_file(output_path, suffix=None):
     """Raise ValueError if a freshly downloaded file looks truncated or corrupt."""
-    size = output_path.stat().st_size
+    # FIX-PATHLEN: read back through the extended-length helper so files staged
+    # in an over-long directory are actually visible here.
+    fs_path = _extended_path(output_path)
+    size = os.path.getsize(fs_path)
     suffix = suffix or output_path.suffix.lower()
     if suffix in (".mp4", ".mov", ".m4v", ".webm", ".mkv"):
         if size < _MIN_VIDEO_BYTES:
@@ -3021,7 +3276,7 @@ def _verify_downloaded_file(output_path, suffix=None):
                 f"Downloaded video is only {size} bytes ? likely truncated"
             )
         # Check ISO base media container header (first 12 bytes).
-        with open(output_path, "rb") as fh:
+        with open(fs_path, "rb") as fh:
             header = fh.read(12)
         if suffix in (".mp4", ".mov", ".m4v") and len(header) >= 8:
             box_type = header[4:8]
@@ -3041,7 +3296,7 @@ def _verify_downloaded_file(output_path, suffix=None):
             raise ValueError(
                 f"Downloaded image is only {size} bytes ? likely truncated"
             )
-        with open(output_path, "rb") as fh:
+        with open(fs_path, "rb") as fh:
             magic = fh.read(12)
         if suffix in (".jpg", ".jpeg") and magic[:2] != b"\xff\xd8":
             # Douyin's mobile CDN often serves HEIC content regardless of the
@@ -3069,7 +3324,15 @@ def download_bytes(client, url, output_path, progress_callback=None, progress_de
     check_cancelled()
     if not is_safe_media_download_url(url):
         raise ValueError("Refusing unsafe media download URL")
-    part_path = output_path.with_suffix(output_path.suffix + f".part.{os.getpid()}.{uuid.uuid4().hex}")
+    # FIX-PATHLEN: an 8-hex staging suffix instead of a full uuid spares 24
+    # chars, which on its own is enough to bring most long captions back under
+    # the 260-char ceiling.  Collisions stay vanishingly unlikely: the suffix is
+    # already scoped by the destination name and by the pid.
+    part_path = output_path.with_suffix(
+        output_path.suffix + f".part.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    )
+    part_fs = _extended_path(part_path)
+    output_fs = _extended_path(output_path)
     headers = {
         "User-Agent": USER_AGENT, "Referer": "https://www.douyin.com/",
         "Accept": "*/*", "Accept-Encoding": "identity", "Range": "bytes=0-",
@@ -3086,10 +3349,13 @@ def download_bytes(client, url, output_path, progress_callback=None, progress_de
                 total_bytes = 0
             details = dict(progress_details or {})
             report_progress(progress_callback, phase="downloading", bytes_downloaded=0, bytes_total=total_bytes, **details)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
+            # FIX-PATHLEN: a too-long destination only exists through the
+            # extended-length API, so create/write/verify/rename all go through
+            # it or the file would be written somewhere plain calls cannot see.
+            os.makedirs(_extended_path(output_path.parent), exist_ok=True)
             downloaded_bytes = 0
             reported_bytes = 0
-            with open(part_path, "wb") as fh:
+            with open(part_fs, "wb") as fh:
                 for chunk in response.iter_bytes(1024 * 1024):
                     check_cancelled()
                     if chunk:
@@ -3107,12 +3373,14 @@ def download_bytes(client, url, output_path, progress_callback=None, progress_de
                 raise IOError("Download produced 0 bytes")
             _verify_downloaded_file(part_path, suffix=output_path.suffix.lower())
             check_cancelled()
-            part_path.replace(output_path)
+            os.replace(part_fs, output_fs)
     finally:
         try:
-            part_path.unlink(missing_ok=True)
+            os.unlink(part_fs)
         except InterruptedError:
             raise
+        except FileNotFoundError:
+            pass
         except OSError:
             logging.warning("Could not remove partial download %s", part_path.name)
 
@@ -3157,6 +3425,61 @@ def _extract_video_id(aweme):
     return None
 
 
+def _expected_live_photo_paths(target_dir, aweme, subdir_by_aweme_id=False, keep_full_title=True):
+    """Paths of the 动图 payloads (``<stem>_NN.mp4``) this work should own."""
+    stem = media_item_path(
+        target_dir, aweme, suffix="",
+        subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title,
+    )
+    return [
+        Path(f"{stem}_{index:02d}.mp4")
+        for index, entry in enumerate(collect_image_entries(aweme), start=1)
+        if entry.get("video_urls")
+    ]
+
+
+def _saved_file_exists(path):
+    """True when ``path`` holds a non-empty file, honouring long paths.
+
+    FIX-PATHLEN: a file written through the extended-length helper is invisible
+    to plain ``Path.is_file``/``stat``, which would make every check re-download.
+    """
+    try:
+        fs_path = _extended_path(path)
+        return os.path.isfile(fs_path) and os.path.getsize(fs_path) > 0
+    except OSError:
+        return False
+
+
+def _already_saved_media_file(output_path, image_urls, target_dir, aweme,
+                              subdir_by_aweme_id=False, keep_full_title=True):
+    """
+    Return the on-disk file that proves this item was saved by an earlier run.
+
+    Video items live at output_path. Image works are written as
+    ``<stem>_01.jpg``, ``<stem>_02.jpg`` ... so the .mp4-shaped output_path
+    never exists for them; probe the first image instead. Live Photo (动图)
+    works additionally require every ``<stem>_NN.mp4`` payload, so a run that
+    predates animated-photo support still has its 动图 fetched. Returns None
+    when anything is missing (or only a zero-byte leftover).
+    """
+    if image_urls:
+        first_image = Path(
+            f"{media_item_path(target_dir, aweme, suffix='', subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title)}_01.jpg"
+        )
+        if not _saved_file_exists(first_image):
+            return None
+        for live_path in _expected_live_photo_paths(
+            target_dir, aweme, subdir_by_aweme_id, keep_full_title
+        ):
+            if not _saved_file_exists(live_path):
+                return None
+        return first_image
+    if _saved_file_exists(output_path):
+        return output_path
+    return None
+
+
 def download_aweme_items(
     client,
     profile,
@@ -3165,6 +3488,9 @@ def download_aweme_items(
     state,
     media_kind,
     progress_callback=None,
+    subdir_by_aweme_id=False,
+    keep_full_title=True,
+    save_metadata_json=False,
 ):
     result = MediaResult(checked=len(items))
     # Restricted posts and stories need the same login used for their metadata.
@@ -3191,27 +3517,52 @@ def download_aweme_items(
         aweme_id = str(aweme.get("aweme_id") or "")
         if not aweme_id:  # FIX-3.3: only fall back to group_id when aweme_id is truly absent
             aweme_id = str(aweme.get("group_id") or "")
-        if aweme_id and aweme_id in downloaded_ids:
-            result.skipped += 1
-            if result.skipped % 25 == 0 or item_index == total_items:
-                report_progress(
-                    progress_callback,
-                    phase="downloading",
-                    media_kind=media_kind,
-                    current=item_index,
-                    total=total_items,
-                    downloaded=result.downloaded,
-                    skipped=result.skipped,
-                    failed=result.failed,
-                )
-            continue
-        image_urls = collect_image_urls(aweme)
+        image_entries = collect_image_entries(aweme)
+        image_urls = [entry["url"] for entry in image_entries if entry.get("url")]
         # Image works (notably aweme_type 68) expose their BGM through
         # video.play_addr. Prefer the actual images instead of saving that audio
-        # response with an .mp4 extension.
-        video_urls = [] if image_urls else collect_video_urls(aweme)
+        # response with an .mp4 extension. 动图 (Live Photo) payloads live in
+        # images[i].video and are saved next to their still further down.
+        video_urls = [] if image_entries else collect_video_urls(aweme)
         local_media = Path(str(aweme.get("_local_media_path") or ""))
-        if not video_urls and not image_urls and not (local_media.is_file() and local_media.stat().st_size > 0):
+        target_dir = (
+            Path(output_dir) / "images"
+            if media_kind != "story" and image_entries
+            else default_target_dir
+        )
+        output_path = media_item_path(
+            target_dir, aweme,
+            subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title,
+        )
+        # FIX-STATE-RESIDUE: the state file only ever grows (save_state merges it
+        # forward), so a recorded id can outlive the file it points at - the
+        # folder was cleaned up by hand, files were moved, or an earlier run left
+        # the id behind without media. Skipping on the state alone stranded those
+        # items forever, so confirm against the filesystem before trusting it.
+        if aweme_id and aweme_id in downloaded_ids:
+            if _already_saved_media_file(
+                output_path, image_urls, target_dir, aweme,
+                subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title,
+            ) is not None:
+                result.skipped += 1
+                if result.skipped % 25 == 0 or item_index == total_items:
+                    report_progress(
+                        progress_callback,
+                        phase="downloading",
+                        media_kind=media_kind,
+                        current=item_index,
+                        total=total_items,
+                        downloaded=result.downloaded,
+                        skipped=result.skipped,
+                        failed=result.failed,
+                    )
+                continue
+            downloaded_ids.discard(aweme_id)
+            logging.info(
+                "%s was recorded as downloaded but its file is missing; downloading it again.",
+                aweme_id,
+            )
+        if not video_urls and not image_entries and not (local_media.is_file() and local_media.stat().st_size > 0):
             result.failed += 1
             report_progress(
                 progress_callback,
@@ -3224,19 +3575,13 @@ def download_aweme_items(
                 failed=result.failed,
             )
             continue
-        target_dir = (
-            Path(output_dir) / "images"
-            if media_kind != "story" and image_urls
-            else default_target_dir
-        )
-        output_path = target_dir / aweme_filename(aweme)
         item_label = safe_name(
             aweme.get("desc")
             or (aweme.get("share_info") or {}).get("share_title")
             or aweme_id
             or output_path.stem
         )[:56]
-        if output_path.exists() and output_path.stat().st_size > 0:
+        if _saved_file_exists(output_path):
             result.skipped += 1
             if aweme_id:
                 downloaded_ids.add(aweme_id)
@@ -3252,16 +3597,19 @@ def download_aweme_items(
                     failed=result.failed,
                 )
             continue
-        if output_path.exists():
-            output_path.unlink(missing_ok=True)
+        if os.path.exists(_extended_path(output_path)):
+            try:
+                os.unlink(_extended_path(output_path))
+            except FileNotFoundError:
+                pass
         saved = False
         saved_files = []
         local_media = Path(str(aweme.get("_local_media_path") or ""))
         if local_media.is_file() and local_media.stat().st_size > 0:
             try:
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(local_media, output_path)
-                saved = output_path.stat().st_size > 0
+                os.makedirs(_extended_path(output_path.parent), exist_ok=True)
+                shutil.copy2(_extended_path(local_media), _extended_path(output_path))
+                saved = os.path.getsize(_extended_path(output_path)) > 0
                 if saved:
                     saved_files.append(output_path)
             except InterruptedError:
@@ -3355,11 +3703,58 @@ def download_aweme_items(
                             item_label, type(_fb_exc).__name__, _fb_exc,
                         )
         else:
-            stem = target_dir / aweme_filename(aweme, suffix="")
+            stem = media_item_path(
+                target_dir, aweme, suffix="",
+                subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title,
+            )
             _image_failures = 0  # FIX-3.2: track partial image set failures
-            for index, url in enumerate(image_urls, start=1):
+            _payload_total = sum(1 for entry in image_entries if entry.get("url")) + sum(
+                1 for entry in image_entries if entry.get("video_urls")
+            )
+            for index, entry in enumerate(image_entries, start=1):
+                url = entry.get("url") or ""
                 image_path = Path(f"{stem}_{index:02d}.jpg")
-                details = {
+                if url:
+                    details = {
+                        "media_kind": media_kind,
+                        "current": item_index,
+                        "total": total_items,
+                        "downloaded": result.downloaded,
+                        "skipped": result.skipped,
+                        "failed": result.failed,
+                        "item": item_label,
+                        "attempt": index,
+                        "attempts": _payload_total,
+                    }
+                    try:
+                        download_bytes(
+                            client,
+                            url,
+                            image_path,
+                            progress_callback=progress_callback,
+                            progress_details=details,
+                            **download_kwargs,
+                        )
+                        saved = True
+                        saved_files.append(image_path)
+                    except InterruptedError:
+                        raise
+                    except Exception as exc:
+                        _image_failures += 1
+                        report_progress(
+                            progress_callback,
+                            phase="retrying",
+                            error=type(exc).__name__,
+                            **details,
+                        )
+                # 动图 / Live Photo: the animated payload is images[i].video,
+                # saved next to the still as <stem>_NN.mp4. A missing payload
+                # fails the item so the next cycle retries it.
+                live_urls = entry.get("video_urls") or []
+                if not live_urls:
+                    continue
+                live_path = Path(f"{stem}_{index:02d}.mp4")
+                live_details = {
                     "media_kind": media_kind,
                     "current": item_index,
                     "total": total_items,
@@ -3368,35 +3763,45 @@ def download_aweme_items(
                     "failed": result.failed,
                     "item": item_label,
                     "attempt": index,
-                    "attempts": len(image_urls),
+                    "attempts": _payload_total,
                 }
-                try:
-                    download_bytes(
-                        client,
-                        url,
-                        image_path,
-                        progress_callback=progress_callback,
-                        progress_details=details,
-                        **download_kwargs,
-                    )
-                    saved = True
-                    saved_files.append(image_path)
-                except InterruptedError:
-                    raise
-                except Exception as exc:
+                live_saved = False
+                for live_url in live_urls[:8]:
+                    try:
+                        download_bytes(
+                            client,
+                            live_url,
+                            live_path,
+                            progress_callback=progress_callback,
+                            progress_details=live_details,
+                            **download_kwargs,
+                        )
+                        live_saved = True
+                        saved = True
+                        saved_files.append(live_path)
+                        break
+                    except InterruptedError:
+                        raise
+                    except Exception as exc:
+                        report_progress(
+                            progress_callback,
+                            phase="retrying",
+                            error=type(exc).__name__,
+                            **live_details,
+                        )
+                        continue
+                if not live_saved:
                     _image_failures += 1
-                    report_progress(
-                        progress_callback,
-                        phase="retrying",
-                        error=type(exc).__name__,
-                        **details,
+                    logging.warning(
+                        "Live photo payload %s _%02d.mp4: all %d candidates failed.",
+                        item_label, index, len(live_urls[:8]),
                     )
             # FIX-3.2: If any images failed, don't mark the post as fully downloaded
             # so failed images get retried on the next check cycle.
             if _image_failures > 0:
                 logging.warning(
-                    "Image set %s: %d/%d images failed; will retry next cycle.",
-                    item_label, _image_failures, len(image_urls),
+                    "Image set %s: %d/%d payloads failed; will retry next cycle.",
+                    item_label, _image_failures, _payload_total,
                 )
                 saved = False  # prevent marking as downloaded
         if not saved:
@@ -3413,8 +3818,11 @@ def download_aweme_items(
                 item=item_label,
             )
             continue
-        meta_path = saved_files[0].with_suffix(saved_files[0].suffix + ".json")
-        save_json(meta_path, aweme)
+        # OPT-META: opt-in sidecar with the raw aweme payload. Off by default so
+        # the download folder holds media only.
+        if save_metadata_json:
+            meta_path = saved_files[0].with_suffix(saved_files[0].suffix + ".json")
+            save_json(meta_path, aweme)
         result.downloaded += 1
         result.files.extend(str(path) for path in saved_files)
         if aweme_id:
@@ -3718,9 +4126,15 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
     supported_message = ""
     mobile_cookie = _profile_cookie_header(profile)
 
-    # 1) Mobile post API — only time-limited 日常 that also appear as posts.
-    #    Regular 图文 (aweme_type=68 without story markers) stay in the
-    #    profile feed forever and must not hide an active 24h ring.
+    # 1) Mobile post API — 作品流里的"疑似日常"，只作最后的兜底。
+    #    NOTE: 这一级的判定是启发式的（is_time_limited_story）：普通图文作品只要
+    #    身上带一个含 story/moment 的字段就会被算成日常——实测某主页 2 条 2024 年
+    #    的图文作品就是这样被收进 stories/ 的。所以它**不能**再像以前那样"命中即
+    #    return"：那会把真正的 24h/日常 接口（第 2~7 级）整条挡在门外，表现就是
+    #    "主页明明挂着日常，程序却一条都抓不到"。这里只把它暂存，等所有真实
+    #    story 接口都试过仍无结果时，再作为兜底返回。
+    post_fallback = []
+    post_fallback_source = ""
     try:
         mobile_items, mobile_source = fetch_stories_via_mobile_post_api(
             client, sec_user_id, cookie_header=mobile_cookie,
@@ -3733,7 +4147,13 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
                 require_author_match=True,
             )
             if items:
-                return items, mobile_source, True
+                post_fallback = items
+                post_fallback_source = mobile_source
+                logging.info(
+                    "story step1 (post feed) held %d candidate(s) as fallback: %s",
+                    len(items),
+                    [str(i.get("aweme_id") or "") for i in items],
+                )
         if mobile_source and "not available" not in mobile_source:
             last_message = mobile_source
     except LoginRequiredError:
@@ -3770,6 +4190,7 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
                 return items, feed_source, True
         if feed_source:
             last_message = feed_source
+            logging.info("story step2 (mobile story feed): %s", feed_source)
             if STORY_PROFILE_LIST_PATH in feed_source and "empty pack" in feed_source:
                 return [], feed_source, True
             if "empty pack" in feed_source or feed_source.startswith("http"):
@@ -3808,6 +4229,7 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
                 return items, life_source, True
         if life_source:
             last_message = life_source
+            logging.info("story step3 (mobile life feed): %s", life_source)
             if "empty pack" in life_source or life_source.startswith("http"):
                 supported = True
                 supported_message = life_source
@@ -3851,6 +4273,7 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
         message = life_source if "no active" in life_source else f"{LIFE_FEED_PATH}: no active visible stories"
         last_message = message
         supported_message = message
+        logging.info("story step4 (web life feed): %s", message)
 
     # 5) Web candidates (familiar friend posts, legacy moment paths).
     for path in STORY_PATH_CANDIDATES:
@@ -3934,6 +4357,17 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
         except Exception as exc:
             last_message = f"browser_story: {exc}"
 
+    # 7) Last resort — the post-feed heuristic candidates collected in step 1.
+    #    Only served when every real story endpoint came back empty, so the
+    #    heuristic can no longer mask the real 24h/日常 APIs (that is exactly
+    #    what made "主页有日常却抓不到" happen before).
+    if post_fallback:
+        logging.info(
+            "story fallback: serving %d post-feed candidate(s) after all real endpoints failed",
+            len(post_fallback),
+        )
+        return post_fallback, f"{post_fallback_source} (post-feed fallback)", True
+
     if ring_active:
         return [], MOBILE_ONLY_STORY_MESSAGE, False
     return [], supported_message or last_message or "No supported story endpoint returned items", supported
@@ -3972,6 +4406,16 @@ def _download_profile(
     # Live-room probes stay cookieless and are not part of this path.
     profile = dict(profile)
     settings = settings or {}
+    # FIX-PATHLEN: how media files are laid out on disk.
+    #  * media_keep_full_title keeps the caption intact and lets Windows'
+    #    extended-length paths carry the overflow instead of truncating it.
+    #  * media_subdir_by_aweme_id groups a work's payloads under <aweme_id>/.
+    subdir_by_aweme_id = bool(settings.get("media_subdir_by_aweme_id", False))
+    keep_full_title = bool(settings.get("media_keep_full_title", True))
+    # OPT-META: the raw aweme payload sidecar (<file>.json) is opt-in. It used to
+    # be written unconditionally, which cluttered the download folder with one
+    # metadata file per work that most users never look at.
+    save_metadata_json = bool(settings.get("media_save_metadata_json", False))
     output_dir = Path(profile.get("output_dir") or ROOT_DOWNLOAD_DIR / safe_name(profile.get("name")))
     output_dir.mkdir(parents=True, exist_ok=True)
     state_path, state = load_state(output_dir)
@@ -4145,6 +4589,9 @@ def _download_profile(
                     state,
                     "video",
                     progress_callback=progress_callback,
+                    subdir_by_aweme_id=subdir_by_aweme_id,
+                    keep_full_title=keep_full_title,
+                    save_metadata_json=save_metadata_json,
                 )
                 result.status = "ok"
             except CaptchaDetectedError as exc:
@@ -4175,6 +4622,9 @@ def _download_profile(
                     state,
                     "story",
                     progress_callback=progress_callback,
+                    subdir_by_aweme_id=subdir_by_aweme_id,
+                    keep_full_title=keep_full_title,
+                    save_metadata_json=save_metadata_json,
                 )
                 if story_items:
                     result.status = "ok"
@@ -4226,6 +4676,73 @@ def extract_url_from_text(text):
     if not match:
         return ""
     return match.group(0).rstrip(".,;!?)]}\u3002\uff0c\uff09\uff01")
+
+
+# Bare host without a scheme, as pasted by some clients (``v.douyin.com/xxx``).
+_SHARE_HOST_RE = re.compile(
+    r"(?:v\.douyin\.com|live\.douyin\.com|(?:www\.)?douyin\.com|(?:www\.)?iesdouyin\.com)"
+    r"/[^\s\u4e00-\u9fff\"'<>]+"
+)
+
+
+def normalize_pasted_link(text):
+    """Pull the real URL out of a pasted Douyin share blob.
+
+    The app's "copy link" action copies a whole sentence, for example::
+
+        1- 长按复制此条消息，打开抖音搜索，查看TA的更多作品。 https://v.douyin.com/xxx/ 2@2.com :4pm
+
+    Feeding that blob straight to an HTTP client fails with
+    ``Request URL is missing an 'http://' or 'https://' protocol``, which is
+    exactly what happened when it was typed into the "live/profile URL" field.
+    Returns "" when no link is present at all.
+    """
+    url = extract_url_from_text(text)
+    if url:
+        return url
+    match = _SHARE_HOST_RE.search(text or "")
+    return f"https://{match.group(0)}" if match else ""
+
+
+def canonical_douyin_profile_url(url):
+    """Normalize any Douyin profile shape to ``https://www.douyin.com/user/<sec_uid>``.
+
+    Collapses the share landing page (``www.iesdouyin.com/share/user/<sec_uid>``)
+    and query-string noise into the canonical form the rest of the app stores in
+    ``original_profile_url``. Returns "" when the URL is not a profile.
+    """
+    sec_uid = extract_sec_uid_from_url(url)
+    return f"https://www.douyin.com/user/{sec_uid}" if sec_uid else ""
+
+
+def expand_douyin_short_link(url, timeout=10):
+    """Follow a ``v.douyin.com`` short link to the URL it actually lands on.
+
+    Short links carry no hint of what they point at, so the caller cannot tell a
+    profile from a live room until the redirect chain is walked. Returns the
+    input unchanged when it is already concrete, is not a trusted share link, or
+    the chain cannot be followed.
+    """
+    target = (url or "").strip()
+    if not target:
+        return ""
+    if extract_aweme_id(target) or extract_sec_uid_from_url(target):
+        return target
+    if not is_safe_share_link_url(target):
+        return target
+    try:
+        try:
+            timeout = max(2, int(timeout))
+        except (TypeError, ValueError):
+            timeout = 10
+        limits = httpx.Timeout(timeout, connect=min(8, timeout), read=timeout, write=timeout, pool=timeout)
+        with httpx.Client(timeout=limits, follow_redirects=False, http2=False) as client:
+            response = follow_safe_redirects(client, target, url_validator=is_safe_share_link_url)
+        return str(response.url) or target
+    except InterruptedError:
+        raise
+    except Exception:
+        return target
 
 
 def extract_aweme_id(url):

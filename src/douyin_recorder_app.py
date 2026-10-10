@@ -32,12 +32,15 @@ from streamget.platforms.douyin.live_stream import DouyinLiveStream
 from douyin_media_downloader import (
     CaptchaDetectedError,
     DEFAULT_CHROME_CDP,
+    canonical_douyin_profile_url,
     clear_saved_session,
     close_cdp_browser,
     download_profile,
     download_video_by_url,
+    expand_douyin_short_link,
     import_chrome_session,
     launch_douyin_login_browser,
+    normalize_pasted_link,
     saved_session_info,
 )
 from recording_urls import (
@@ -801,6 +804,15 @@ def default_settings():
         "priority_poll_jitter_seconds": 2,
         "poll_jitter_seconds": 8,
         "media_poll_interval_seconds": DEFAULT_MEDIA_INTERVAL,
+        # FIX-PATHLEN: long captions used to be truncated so the full path could
+        # fit Windows' 260-char MAX_PATH.  Keep the caption intact and let
+        # extended-length paths carry the overflow; optionally group every
+        # payload of a work under <output>/<aweme_id>/.
+        "media_keep_full_title": True,
+        "media_subdir_by_aweme_id": False,
+        # OPT-META: write the raw aweme payload next to each work's first file
+        # (<file>.json). Off by default; the folder then holds media only.
+        "media_save_metadata_json": False,
         "adopt_existing_ffmpeg": True,
         "recording_stall_timeout_seconds": 300,
         "recording_offline_grace_seconds": 90,
@@ -2850,11 +2862,26 @@ class ProfileDialog(Toplevel):
     def resolve_link(self, show_errors=True):
         if self.resolving:
             return None
-        url = self.url_var.get().strip()
-        if "douyin.com/user/" in url:
-            self.profile_url_var.set(url.split("?", 1)[0])
+        raw = self.url_var.get().strip()
+        # "Copy link" on mobile copies a whole sentence rather than a URL, e.g.
+        #   "1- 长按复制此条消息，打开抖音搜索，查看TA的更多作品。 https://v.douyin.com/xxx/ 2@2.com :4pm"
+        # Handing that straight to the HTTP layer raised "Request URL is missing
+        # an 'http://' or 'https://' protocol", so pull the link out first.
+        url = normalize_pasted_link(raw)
+        if not url:
+            if show_errors:
+                messagebox.showerror(
+                    t("invalid_url"),
+                    t("no_link_in_pasted_text") if raw else t("enter_url"),
+                )
+            return None
+        if url != raw:
+            self.url_var.set(url)
+        profile_url = canonical_douyin_profile_url(url)
+        if profile_url:
+            self.profile_url_var.set(profile_url)
         platform = detect_platform(url)
-        if not url or platform not in ("douyin", "youtube"):
+        if platform not in ("douyin", "youtube"):
             if show_errors:
                 messagebox.showerror(t("invalid_url"), t("enter_url"))
             return None
@@ -2865,15 +2892,31 @@ class ProfileDialog(Toplevel):
 
         def worker():
             try:
+                # A v.douyin.com short link hides its target, so walk the
+                # redirect before deciding what we are looking at.
+                resolved_url = expand_douyin_short_link(url)
+                resolved_profile = canonical_douyin_profile_url(resolved_url) or profile_url
+                if resolved_profile and platform == "douyin":
+                    # A profile link is a perfectly usable monitor target on its
+                    # own; there is no live room to look up. Probing the live API
+                    # with one only produced a misleading "service busy" error.
+                    self.resolve_result_queue.put({
+                        "ok": True,
+                        "mode": "profile",
+                        "profile_url": resolved_profile,
+                        "url": resolved_profile,
+                        "source_url": url,
+                    })
+                    return
                 if platform == "youtube":
-                    room, stream = self.resolve_youtube(url, existing_name)
+                    room, stream = self.resolve_youtube(resolved_url, existing_name)
                 else:
-                    room, stream = asyncio.run(self.resolve_room(url, quality))
+                    room, stream = asyncio.run(self.resolve_room(resolved_url, quality))
                 self.resolve_result_queue.put({
                     "ok": True,
                     "room": room,
                     "stream": stream,
-                    "url": url,
+                    "url": resolved_url,
                     "platform": platform,
                 })
             except Exception as exc:
@@ -2894,13 +2937,21 @@ class ProfileDialog(Toplevel):
                 if result.get("show_errors"):
                     messagebox.showerror(t("resolve_failed"), result.get("error") or t("unknown_error"), parent=self)
             else:
-                room = result["room"]
-                platform = result["platform"]
+                room = result.get("room")
+                platform = result.get("platform")
                 url = result["url"]
-                name = room.get("anchor_name") or self.name_var.get().strip() or t("platform_profile", platform=platform_label(platform))
-                live_url = room.get("live_url") or url.split("?")[0]
+                if result.get("mode") == "profile":
+                    # Profile link: fill the profile/url fields directly. The
+                    # anchor name is unknown until a live check, so keep whatever
+                    # the user typed and fall back to the sec_uid slug.
+                    self.profile_url_var.set(result["profile_url"])
+                    self.url_var.set(url)
+                    name = self.name_var.get().strip() or fallback_name_from_url(url)
+                else:
+                    name = room.get("anchor_name") or self.name_var.get().strip() or t("platform_profile", platform=platform_label(platform))
+                    live_url = room.get("live_url") or url.split("?")[0]
+                    self.url_var.set(live_url)
                 self.name_var.set(name)
-                self.url_var.set(live_url)
                 if not self.output_var.get().strip():
                     self.output_var.set(str(ROOT_DOWNLOAD_DIR / safe_name(name).rstrip(" .")))
         if self.winfo_exists():
@@ -2937,7 +2988,18 @@ class ProfileDialog(Toplevel):
         return MonitorEngine(self.store, queue.Queue())._resolve_youtube(profile)
 
     def save(self):
-        url = self.url_var.get().strip()
+        raw = self.url_var.get().strip()
+        # Never persist a raw share blob. Extract the link, then canonicalize it
+        # so live/media polling can actually use it.
+        url = normalize_pasted_link(raw) or raw
+        if url != raw:
+            self.url_var.set(url)
+        if url and detect_platform(url) == "douyin":
+            # Only short links hit the network here; concrete URLs return as-is.
+            profile_url = canonical_douyin_profile_url(expand_douyin_short_link(url, timeout=6))
+            if profile_url:
+                url = profile_url
+                self.url_var.set(url)
         name = self.name_var.get().strip()
         platform = detect_platform(url)
         if not url:
@@ -2955,8 +3017,12 @@ class ProfileDialog(Toplevel):
                 self.output_var.set(str(ROOT_DOWNLOAD_DIR / safe_name(name).rstrip(" .")))
         output_dir = self.output_var.get().strip() or str(ROOT_DOWNLOAD_DIR / safe_name(name).rstrip(" ."))
         original_profile_url = self.profile_url_var.get().strip()
-        if platform == "douyin" and not original_profile_url and "douyin.com/user/" in url:
-            original_profile_url = url.split("?", 1)[0]
+        if platform == "douyin" and not original_profile_url:
+            # Covers the canonical /user/<sec_uid> shape as well as a
+            # share/user landing page that the canonicalizer can normalize.
+            original_profile_url = canonical_douyin_profile_url(url) or (
+                url.split("?", 1)[0] if "douyin.com/user/" in url else ""
+            )
         try:
             poll_interval = max(15, int(self.interval_var.get()))
             media_interval = max(60, int(self.media_interval_var.get()))
@@ -3143,7 +3209,7 @@ class SettingsDialog(Toplevel):
         super().__init__(parent)
         self.store = store
         self.title(t("settings_title"))
-        self.geometry("560x470")
+        self.geometry("560x600")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -3160,6 +3226,10 @@ class SettingsDialog(Toplevel):
         self.priority_risk_backoff_var = StringVar(value=str(store.settings["priority_risk_control_backoff_seconds"]))
         self.standard_risk_backoff_var = StringVar(value=str(store.settings["standard_risk_control_backoff_seconds"]))
         self.stall_timeout_var = StringVar(value=str(store.settings.get("recording_stall_timeout_seconds", 300)))
+        # FIX-PATHLEN: media naming / on-disk layout.
+        self.keep_title_var = BooleanVar(value=store.settings.get("media_keep_full_title", True))
+        self.subdir_var = BooleanVar(value=store.settings.get("media_subdir_by_aweme_id", False))
+        self.save_metadata_var = BooleanVar(value=store.settings.get("media_save_metadata_json", False))
         self.language_labels = {code: label for code, label in LANGUAGE_CHOICES}
         self.language_codes = {label: code for code, label in LANGUAGE_CHOICES}
         initial_language = store.settings.get("language") or "zh-CN"
@@ -3193,9 +3263,12 @@ class SettingsDialog(Toplevel):
         ttk.Entry(frame, textvariable=self.stall_timeout_var, width=12).grid(row=7, column=1, sticky="w", pady=6)
         ttk.Checkbutton(frame, text=t("start_with_windows"), variable=self.autostart_var).grid(row=8, column=1, sticky="w", pady=6)
         ttk.Checkbutton(frame, text=t("start_hidden"), variable=self.hidden_var).grid(row=9, column=1, sticky="w", pady=6)
+        ttk.Checkbutton(frame, text=t("media_keep_full_title"), variable=self.keep_title_var).grid(row=10, column=1, sticky="w", pady=6)
+        ttk.Checkbutton(frame, text=t("media_subdir_by_aweme_id"), variable=self.subdir_var).grid(row=11, column=1, sticky="w", pady=6)
+        ttk.Checkbutton(frame, text=t("media_save_metadata_json"), variable=self.save_metadata_var).grid(row=12, column=1, sticky="w", pady=6)
 
         actions = ttk.Frame(frame)
-        actions.grid(row=10, column=0, columnspan=2, sticky="e", pady=(24, 0))
+        actions.grid(row=13, column=0, columnspan=2, sticky="e", pady=(24, 0))
         ttk.Button(actions, text=t("cancel"), command=self.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(actions, text=t("save"), command=self.save).pack(side="right")
 
@@ -3221,6 +3294,9 @@ class SettingsDialog(Toplevel):
             updated_settings["priority_risk_control_backoff_seconds"] = priority_risk_backoff
             updated_settings["standard_risk_control_backoff_seconds"] = standard_risk_backoff
             updated_settings["recording_stall_timeout_seconds"] = stall_timeout
+            updated_settings["media_keep_full_title"] = bool(self.keep_title_var.get())
+            updated_settings["media_subdir_by_aweme_id"] = bool(self.subdir_var.get())
+            updated_settings["media_save_metadata_json"] = bool(self.save_metadata_var.get())
             updated_settings["language"] = language_code
             if updated_settings["start_with_windows"] != is_autostart_enabled():
                 set_autostart_enabled(updated_settings["start_with_windows"])
