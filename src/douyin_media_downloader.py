@@ -320,9 +320,21 @@ def _is_mobile_post_story(aweme):
     """True when a post-feed item is itself a time-limited 日常, not just 图文."""
     if not isinstance(aweme, dict):
         return False
-    if aweme.get("aweme_type") == MOBILE_STORY_AWEME_TYPE and is_time_limited_story(aweme):
+    # Old ordinary posts can retain story_ttl=1 with every story flag zero.
+    # That metadata alone must not short-circuit the actual active story pack.
+    # Keep explicit story markers usable for retained items; only the ambiguous
+    # TTL-only post fallback requires a recent, known creation time.
+    markers = {key: value for key, value in aweme.items() if key != "story_ttl"}
+    if is_time_limited_story(markers):
         return True
-    return is_time_limited_story(aweme)
+    if not is_time_limited_story(aweme):
+        return False
+    try:
+        created = float(aweme.get("create_time") or 0)
+        age = time.time() - created
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return created > 0 and 0 <= age < 24 * 60 * 60
 
 
 def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header=""):
@@ -2712,7 +2724,65 @@ def collect_image_entries(aweme):
 
 
 def collect_image_urls(aweme):
-    return [entry["url"] for entry in collect_image_entries(aweme) if entry.get("url")]
+    if not isinstance(aweme, dict):
+        return []
+    images = aweme.get("images") or (aweme.get("image_post_info") or {}).get("images") or []
+    result = []
+    seen = set()
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        candidates = list(iter_url_list(image))
+        for key in ("display_image", "download_url", "owner_watermark_image", "thumbnail"):
+            candidates.extend(iter_url_list(image.get(key)))
+        candidates = [url for url in candidates if url and url not in seen]
+        if not candidates:
+            continue
+        candidates.sort(
+            key=lambda url: (
+                "water" in url.lower(),
+                not any(ext in url.lower().split("?", 1)[0] for ext in (".jpg", ".jpeg")),
+                len(url),
+            )
+        )
+        selected = candidates[0]
+        seen.add(selected)
+        result.append(selected)
+    return result
+
+
+def collect_image_motion_urls(aweme):
+    """Return Live Photo clip candidates keyed by their album position."""
+    if not isinstance(aweme, dict):
+        return []
+    images = aweme.get("images") or (aweme.get("image_post_info") or {}).get("images") or []
+    result = []
+    for index, image in enumerate(images, start=1):
+        video = image.get("video") if isinstance(image, dict) else None
+        if isinstance(video, dict) and video:
+            result.append((index, collect_video_urls({"video": video})))
+    return result
+
+
+def collect_indexed_image_urls(aweme):
+    """Keep each Live Photo cover's original position, including duplicates."""
+    if not isinstance(aweme, dict):
+        return []
+    images = aweme.get("images") or (aweme.get("image_post_info") or {}).get("images") or []
+    result = []
+    for index, image in enumerate(images, start=1):
+        urls = collect_image_urls({"images": [image]})
+        if urls:
+            result.append((index, urls[0]))
+    return result
+
+
+def _has_valid_media_file(path):
+    try:
+        _verify_downloaded_file(path, suffix=path.suffix.lower())
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 # FIX-PATHLEN: Windows' legacy path APIs reject anything at or beyond 260
@@ -3517,52 +3587,48 @@ def download_aweme_items(
         aweme_id = str(aweme.get("aweme_id") or "")
         if not aweme_id:  # FIX-3.3: only fall back to group_id when aweme_id is truly absent
             aweme_id = str(aweme.get("group_id") or "")
-        image_entries = collect_image_entries(aweme)
-        image_urls = [entry["url"] for entry in image_entries if entry.get("url")]
-        # Image works (notably aweme_type 68) expose their BGM through
-        # video.play_addr. Prefer the actual images instead of saving that audio
-        # response with an .mp4 extension. 动图 (Live Photo) payloads live in
-        # images[i].video and are saved next to their still further down.
-        video_urls = [] if image_entries else collect_video_urls(aweme)
-        local_media = Path(str(aweme.get("_local_media_path") or ""))
+        image_motion_urls = collect_image_motion_urls(aweme)
+        image_url_entries = (
+            collect_indexed_image_urls(aweme)
+            if image_motion_urls
+            else list(enumerate(collect_image_urls(aweme), start=1))
+        )
+        image_urls = [url for _index, url in image_url_entries]
         target_dir = (
             Path(output_dir) / "images"
-            if media_kind != "story" and image_entries
+            if media_kind != "story" and (image_urls or image_motion_urls)
             else default_target_dir
         )
-        output_path = media_item_path(
-            target_dir, aweme,
-            subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title,
-        )
-        # FIX-STATE-RESIDUE: the state file only ever grows (save_state merges it
-        # forward), so a recorded id can outlive the file it points at - the
-        # folder was cleaned up by hand, files were moved, or an earlier run left
-        # the id behind without media. Skipping on the state alone stranded those
-        # items forever, so confirm against the filesystem before trusting it.
-        if aweme_id and aweme_id in downloaded_ids:
-            if _already_saved_media_file(
-                output_path, image_urls, target_dir, aweme,
-                subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title,
-            ) is not None:
-                result.skipped += 1
-                if result.skipped % 25 == 0 or item_index == total_items:
-                    report_progress(
-                        progress_callback,
-                        phase="downloading",
-                        media_kind=media_kind,
-                        current=item_index,
-                        total=total_items,
-                        downloaded=result.downloaded,
-                        skipped=result.skipped,
-                        failed=result.failed,
-                    )
-                continue
+        stem = media_item_path(target_dir, aweme, suffix="", subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title)
+        # Older versions marked Live Photos complete after saving only stills.
+        # Check their required files so missing clips can be added on upgrade.
+        image_asset_paths = [Path(f"{stem}_{index:02d}.jpg")
+                             for index, _url in image_url_entries]
+        motion_asset_paths = [Path(f"{stem}_{index:02d}_live.mp4")
+                              for index, _urls in image_motion_urls]
+        if (aweme_id and aweme_id in downloaded_ids
+                and (not image_motion_urls or all(_has_valid_media_file(path)
+                     for path in image_asset_paths + motion_asset_paths))):
+            result.skipped += 1
+            if result.skipped % 25 == 0 or item_index == total_items:
+                report_progress(
+                    progress_callback,
+                    phase="downloading",
+                    media_kind=media_kind,
+                    current=item_index,
+                    total=total_items,
+                    downloaded=result.downloaded,
+                    skipped=result.skipped,
+                    failed=result.failed,
+                )
+            continue
+        if image_motion_urls:
             downloaded_ids.discard(aweme_id)
-            logging.info(
-                "%s was recorded as downloaded but its file is missing; downloading it again.",
-                aweme_id,
-            )
-        if not video_urls and not image_entries and not (local_media.is_file() and local_media.stat().st_size > 0):
+        # Image works (notably aweme_type 68) expose their BGM through
+        # video.play_addr. Live Photo motion is in each image's own video.
+        video_urls = [] if image_urls or image_motion_urls else collect_video_urls(aweme)
+        local_media = Path(str(aweme.get("_local_media_path") or ""))
+        if not video_urls and not image_urls and not image_motion_urls and not (local_media.is_file() and local_media.stat().st_size > 0):
             result.failed += 1
             report_progress(
                 progress_callback,
@@ -3575,13 +3641,14 @@ def download_aweme_items(
                 failed=result.failed,
             )
             continue
+        output_path = media_item_path(target_dir, aweme, subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title)
         item_label = safe_name(
             aweme.get("desc")
             or (aweme.get("share_info") or {}).get("share_title")
             or aweme_id
             or output_path.stem
         )[:56]
-        if _saved_file_exists(output_path):
+        if not image_motion_urls and output_path.exists() and output_path.stat().st_size > 0:
             result.skipped += 1
             if aweme_id:
                 downloaded_ids.add(aweme_id)
@@ -3597,19 +3664,16 @@ def download_aweme_items(
                     failed=result.failed,
                 )
             continue
-        if os.path.exists(_extended_path(output_path)):
-            try:
-                os.unlink(_extended_path(output_path))
-            except FileNotFoundError:
-                pass
+        if not image_motion_urls and output_path.exists():
+            output_path.unlink(missing_ok=True)
         saved = False
         saved_files = []
         local_media = Path(str(aweme.get("_local_media_path") or ""))
-        if local_media.is_file() and local_media.stat().st_size > 0:
+        if not image_motion_urls and local_media.is_file() and local_media.stat().st_size > 0:
             try:
-                os.makedirs(_extended_path(output_path.parent), exist_ok=True)
-                shutil.copy2(_extended_path(local_media), _extended_path(output_path))
-                saved = os.path.getsize(_extended_path(output_path)) > 0
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(local_media, output_path)
+                saved = output_path.stat().st_size > 0
                 if saved:
                     saved_files.append(output_path)
             except InterruptedError:
@@ -3703,18 +3767,54 @@ def download_aweme_items(
                             item_label, type(_fb_exc).__name__, _fb_exc,
                         )
         else:
-            stem = media_item_path(
-                target_dir, aweme, suffix="",
-                subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title,
-            )
             _image_failures = 0  # FIX-3.2: track partial image set failures
-            _payload_total = sum(1 for entry in image_entries if entry.get("url")) + sum(
-                1 for entry in image_entries if entry.get("video_urls")
-            )
-            for index, entry in enumerate(image_entries, start=1):
-                url = entry.get("url") or ""
+            for progress_index, (index, url) in enumerate(image_url_entries, start=1):
                 image_path = Path(f"{stem}_{index:02d}.jpg")
-                if url:
+                if image_motion_urls and _has_valid_media_file(image_path):
+                    saved = True
+                    saved_files.append(image_path)
+                    continue
+                details = {
+                    "media_kind": media_kind,
+                    "current": item_index,
+                    "total": total_items,
+                    "downloaded": result.downloaded,
+                    "skipped": result.skipped,
+                    "failed": result.failed,
+                    "item": item_label,
+                    "attempt": progress_index,
+                    "attempts": len(image_urls),
+                }
+                try:
+                    download_bytes(
+                        client,
+                        url,
+                        image_path,
+                        progress_callback=progress_callback,
+                        progress_details=details,
+                        **download_kwargs,
+                    )
+                    saved = True
+                    saved_files.append(image_path)
+                except InterruptedError:
+                    raise
+                except Exception as exc:
+                    _image_failures += 1
+                    report_progress(
+                        progress_callback,
+                        phase="retrying",
+                        error=type(exc).__name__,
+                        **details,
+                    )
+            for index, urls in image_motion_urls:
+                motion_path = Path(f"{stem}_{index:02d}_live.mp4")
+                if _has_valid_media_file(motion_path):
+                    saved = True
+                    saved_files.append(motion_path)
+                    continue
+                motion_saved = False
+                candidates = urls[:8]
+                for attempt, url in enumerate(candidates, start=1):
                     details = {
                         "media_kind": media_kind,
                         "current": item_index,
@@ -3723,85 +3823,35 @@ def download_aweme_items(
                         "skipped": result.skipped,
                         "failed": result.failed,
                         "item": item_label,
-                        "attempt": index,
-                        "attempts": _payload_total,
+                        "attempt": attempt,
+                        "attempts": len(candidates),
                     }
                     try:
                         download_bytes(
-                            client,
-                            url,
-                            image_path,
+                            client, url, motion_path,
                             progress_callback=progress_callback,
                             progress_details=details,
                             **download_kwargs,
                         )
+                        motion_saved = True
                         saved = True
-                        saved_files.append(image_path)
-                    except InterruptedError:
-                        raise
-                    except Exception as exc:
-                        _image_failures += 1
-                        report_progress(
-                            progress_callback,
-                            phase="retrying",
-                            error=type(exc).__name__,
-                            **details,
-                        )
-                # 动图 / Live Photo: the animated payload is images[i].video,
-                # saved next to the still as <stem>_NN.mp4. A missing payload
-                # fails the item so the next cycle retries it.
-                live_urls = entry.get("video_urls") or []
-                if not live_urls:
-                    continue
-                live_path = Path(f"{stem}_{index:02d}.mp4")
-                live_details = {
-                    "media_kind": media_kind,
-                    "current": item_index,
-                    "total": total_items,
-                    "downloaded": result.downloaded,
-                    "skipped": result.skipped,
-                    "failed": result.failed,
-                    "item": item_label,
-                    "attempt": index,
-                    "attempts": _payload_total,
-                }
-                live_saved = False
-                for live_url in live_urls[:8]:
-                    try:
-                        download_bytes(
-                            client,
-                            live_url,
-                            live_path,
-                            progress_callback=progress_callback,
-                            progress_details=live_details,
-                            **download_kwargs,
-                        )
-                        live_saved = True
-                        saved = True
-                        saved_files.append(live_path)
+                        saved_files.append(motion_path)
                         break
                     except InterruptedError:
                         raise
                     except Exception as exc:
                         report_progress(
-                            progress_callback,
-                            phase="retrying",
-                            error=type(exc).__name__,
-                            **live_details,
+                            progress_callback, phase="retrying",
+                            error=type(exc).__name__, **details,
                         )
-                        continue
-                if not live_saved:
+                if not motion_saved:
                     _image_failures += 1
-                    logging.warning(
-                        "Live photo payload %s _%02d.mp4: all %d candidates failed.",
-                        item_label, index, len(live_urls[:8]),
-                    )
-            # FIX-3.2: If any images failed, don't mark the post as fully downloaded
-            # so failed images get retried on the next check cycle.
+            # Incomplete stills or motion clips must be retried, including
+            # items upgraded from a previously completed still-only download.
             if _image_failures > 0:
                 logging.warning(
-                    "Image set %s: %d/%d payloads failed; will retry next cycle.",
-                    item_label, _image_failures, _payload_total,
+                    "Image set %s: %d/%d assets failed; will retry next cycle.",
+                    item_label, _image_failures, len(image_urls) + len(image_motion_urls),
                 )
                 saved = False  # prevent marking as downloaded
         if not saved:
@@ -3818,10 +3868,8 @@ def download_aweme_items(
                 item=item_label,
             )
             continue
-        # OPT-META: opt-in sidecar with the raw aweme payload. Off by default so
-        # the download folder holds media only.
+        meta_path = saved_files[0].with_suffix(saved_files[0].suffix + ".json")
         if save_metadata_json:
-            meta_path = saved_files[0].with_suffix(saved_files[0].suffix + ".json")
             save_json(meta_path, aweme)
         result.downloaded += 1
         result.files.extend(str(path) for path in saved_files)

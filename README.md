@@ -28,6 +28,7 @@ Cookie），因此不会把你已经打开的抖音网页挤下线。
 - 每个资料可单独关闭直播录制，只自动下载作品和日常
 - 多账号并行，每个资料有独立的轮询间隔、清晰度和保存目录
 - 作品和日常走移动端接口（X-Gorgon 签名）
+- Live Photo 实况图同时保存照片和动态视频，补齐之前漏下的动态部分
 - 纯 Python 签名（X-Bogus / Gorgon），盯直播不用开浏览器
 - 可选抖音 App 登录（扫码后保存为 App 会话，本机 DPAPI 加密，不要提交到 git）
 - 支持托盘的图形界面
@@ -93,7 +94,7 @@ python -m pytest src/tests
 
 ```text
 pip install -r requirements-release.txt
-pwsh ./scripts/build_release.ps1 -Version 1.2.6 -FfmpegDir <含 ffmpeg.exe 和 ffprobe.exe 的目录>
+pwsh ./scripts/build_release.ps1 -Version 1.2.7 -FfmpegDir <含 ffmpeg.exe 和 ffprobe.exe 的目录>
 ```
 
 推送 `v*` 标签会在 GitHub Actions 上走同样的打包流程。
@@ -139,6 +140,7 @@ The interface defaults to Simplified Chinese; switch to English in Settings.
 - Optional per-profile live recording so works/stories can download without monitoring live streams
 - Multiple profiles, each with its own interval, quality, and output folder
 - Posted works and stories via the mobile API (X-Gorgon signed)
+- Live Photos save both stills and motion clips, including clips missed by earlier downloads
 - Pure-Python request signing (X-Bogus / Gorgon) — no browser required for
   live monitoring
 - Optional Douyin app login (QR scan saved as an app-capable session; DPAPI-encrypted, local only)
@@ -207,7 +209,7 @@ python -m pytest src/tests
 
 ```text
 pip install -r requirements.txt pyinstaller
-pwsh ./scripts/build_release.ps1 -Version 1.2.0 -FfmpegDir <folder-with-ffmpeg.exe>
+pwsh ./scripts/build_release.ps1 -Version 1.2.7 -FfmpegDir <folder-with-ffmpeg.exe>
 ```
 
 Pushing a `v*` tag runs the same packaging on GitHub Actions.
