@@ -3,6 +3,7 @@ import asyncio
 import base64
 import ctypes
 import copy
+from collections import OrderedDict
 from contextlib import nullcontext
 import json
 import logging
@@ -1023,6 +1024,50 @@ class RecorderStore:
             remaining = [p for p in self.profiles if p["id"] != profile_id]
             save_json(PROFILES_FILE, remaining, allow_empty=True)
             self.profiles = remaining
+
+
+class RecorderEventQueue:
+    """Bound pending GUI updates without blocking recording workers.
+
+    Repeated updates for a profile replace its pending message and merge state
+    deltas, so live and media workers cannot overwrite each other's fields.
+    Excess distinct producers evict the oldest pending update.
+    """
+
+    def __init__(self, maxsize=256):
+        self.maxsize = max(1, int(maxsize))
+        self._events = OrderedDict()
+        self._lock = threading.Lock()
+
+    def put(self, item, block=True, timeout=None):
+        event = dict(item)
+        event["state"] = dict(event.get("state") or {})
+        profile_id = event["profile_id"]
+        with self._lock:
+            previous = self._events.get(profile_id)
+            if previous is not None:
+                state = dict(previous["state"])
+                state.update(event["state"])
+                event["state"] = state
+            elif len(self._events) >= self.maxsize:
+                self._events.popitem(last=False)
+            self._events[profile_id] = event
+
+    def put_nowait(self, item):
+        self.put(item)
+
+    def get_nowait(self):
+        with self._lock:
+            if not self._events:
+                raise queue.Empty
+            return self._events.popitem(last=False)[1]
+
+    def qsize(self):
+        with self._lock:
+            return len(self._events)
+
+    def empty(self):
+        return self.qsize() == 0
 
 
 class MonitorEngine:
@@ -3409,7 +3454,7 @@ class RecorderApp:
         setup_logging()
         self.store = RecorderStore()
         self.store.save()
-        self.queue = queue.Queue()
+        self.queue = RecorderEventQueue()
         self.engine = MonitorEngine(self.store, self.queue)
         self.media_engine = MediaDownloadEngine(self.store, self.queue, notify_callback=self._tray_notify)
         self.rows = {}
@@ -3635,20 +3680,29 @@ class RecorderApp:
             self.tree.delete(item)
 
     def process_events(self):
-        while True:
+        try:
+            # Bound callback work as well as storage so busy workers cannot
+            # keep the Tk event loop inside this drain indefinitely.
+            for _ in range(256):
+                try:
+                    event = self.queue.get_nowait()
+                except queue.Empty:
+                    break
+                profile_id = event["profile_id"]
+                if profile_id != "engine":
+                    row = self.rows.setdefault(profile_id, {})
+                    row.update(event.get("state", {}))
+                self.activity.config(text=f"{event['time']}  {event['message']}")
+                self.status_label.config(text=event["message"])
+                logging.info("%s: %s", profile_id, event["message"])
+            self.refresh_profiles()
+        except Exception:
+            logging.exception("Could not update recorder GUI; retrying next cycle")
+        finally:
             try:
-                event = self.queue.get_nowait()
-            except queue.Empty:
-                break
-            profile_id = event["profile_id"]
-            if profile_id != "engine":
-                row = self.rows.setdefault(profile_id, {})
-                row.update(event.get("state", {}))
-            self.activity.config(text=f"{event['time']}  {event['message']}")
-            self.status_label.config(text=event["message"])
-            logging.info("%s: %s", profile_id, event["message"])
-        self.refresh_profiles()
-        self.root.after(500, self.process_events)
+                self.root.after(500, self.process_events)
+            except Exception:
+                logging.exception("Could not reschedule recorder GUI updates")
 
     def check_show_signal(self):
         if SHOW_SIGNAL_FILE.exists():

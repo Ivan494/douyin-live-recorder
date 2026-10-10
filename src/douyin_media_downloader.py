@@ -320,9 +320,21 @@ def _is_mobile_post_story(aweme):
     """True when a post-feed item is itself a time-limited 日常, not just 图文."""
     if not isinstance(aweme, dict):
         return False
-    if aweme.get("aweme_type") == MOBILE_STORY_AWEME_TYPE and is_time_limited_story(aweme):
+    # Old ordinary posts can retain story_ttl=1 with every story flag zero.
+    # That metadata alone must not short-circuit the actual active story pack.
+    # Keep explicit story markers usable for retained items; only the ambiguous
+    # TTL-only post fallback requires a recent, known creation time.
+    markers = {key: value for key, value in aweme.items() if key != "story_ttl"}
+    if is_time_limited_story(markers):
         return True
-    return is_time_limited_story(aweme)
+    if not is_time_limited_story(aweme):
+        return False
+    try:
+        created = float(aweme.get("create_time") or 0)
+        age = time.time() - created
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return created > 0 and 0 <= age < 24 * 60 * 60
 
 
 def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header=""):
@@ -2563,6 +2575,40 @@ def collect_image_urls(aweme):
     return result
 
 
+def collect_image_motion_urls(aweme):
+    """Return Live Photo clip candidates keyed by their album position."""
+    if not isinstance(aweme, dict):
+        return []
+    images = aweme.get("images") or (aweme.get("image_post_info") or {}).get("images") or []
+    result = []
+    for index, image in enumerate(images, start=1):
+        video = image.get("video") if isinstance(image, dict) else None
+        if isinstance(video, dict) and video:
+            result.append((index, collect_video_urls({"video": video})))
+    return result
+
+
+def collect_indexed_image_urls(aweme):
+    """Keep each Live Photo cover's original position, including duplicates."""
+    if not isinstance(aweme, dict):
+        return []
+    images = aweme.get("images") or (aweme.get("image_post_info") or {}).get("images") or []
+    result = []
+    for index, image in enumerate(images, start=1):
+        urls = collect_image_urls({"images": [image]})
+        if urls:
+            result.append((index, urls[0]))
+    return result
+
+
+def _has_valid_media_file(path):
+    try:
+        _verify_downloaded_file(path, suffix=path.suffix.lower())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def aweme_filename(aweme, suffix=".mp4"):
     # FIX-D2: Use millisecond timestamp to reduce collision risk for items
     # without aweme_id. Same-second collisions caused silent data loss.
@@ -3191,7 +3237,28 @@ def download_aweme_items(
         aweme_id = str(aweme.get("aweme_id") or "")
         if not aweme_id:  # FIX-3.3: only fall back to group_id when aweme_id is truly absent
             aweme_id = str(aweme.get("group_id") or "")
-        if aweme_id and aweme_id in downloaded_ids:
+        image_motion_urls = collect_image_motion_urls(aweme)
+        image_url_entries = (
+            collect_indexed_image_urls(aweme)
+            if image_motion_urls
+            else list(enumerate(collect_image_urls(aweme), start=1))
+        )
+        image_urls = [url for _index, url in image_url_entries]
+        target_dir = (
+            Path(output_dir) / "images"
+            if media_kind != "story" and (image_urls or image_motion_urls)
+            else default_target_dir
+        )
+        stem = target_dir / aweme_filename(aweme, suffix="")
+        # Older versions marked Live Photos complete after saving only stills.
+        # Check their required files so missing clips can be added on upgrade.
+        image_asset_paths = [Path(f"{stem}_{index:02d}.jpg")
+                             for index, _url in image_url_entries]
+        motion_asset_paths = [Path(f"{stem}_{index:02d}_live.mp4")
+                              for index, _urls in image_motion_urls]
+        if (aweme_id and aweme_id in downloaded_ids
+                and (not image_motion_urls or all(_has_valid_media_file(path)
+                     for path in image_asset_paths + motion_asset_paths))):
             result.skipped += 1
             if result.skipped % 25 == 0 or item_index == total_items:
                 report_progress(
@@ -3205,13 +3272,13 @@ def download_aweme_items(
                     failed=result.failed,
                 )
             continue
-        image_urls = collect_image_urls(aweme)
+        if image_motion_urls:
+            downloaded_ids.discard(aweme_id)
         # Image works (notably aweme_type 68) expose their BGM through
-        # video.play_addr. Prefer the actual images instead of saving that audio
-        # response with an .mp4 extension.
-        video_urls = [] if image_urls else collect_video_urls(aweme)
+        # video.play_addr. Live Photo motion is in each image's own video.
+        video_urls = [] if image_urls or image_motion_urls else collect_video_urls(aweme)
         local_media = Path(str(aweme.get("_local_media_path") or ""))
-        if not video_urls and not image_urls and not (local_media.is_file() and local_media.stat().st_size > 0):
+        if not video_urls and not image_urls and not image_motion_urls and not (local_media.is_file() and local_media.stat().st_size > 0):
             result.failed += 1
             report_progress(
                 progress_callback,
@@ -3224,11 +3291,6 @@ def download_aweme_items(
                 failed=result.failed,
             )
             continue
-        target_dir = (
-            Path(output_dir) / "images"
-            if media_kind != "story" and image_urls
-            else default_target_dir
-        )
         output_path = target_dir / aweme_filename(aweme)
         item_label = safe_name(
             aweme.get("desc")
@@ -3236,7 +3298,7 @@ def download_aweme_items(
             or aweme_id
             or output_path.stem
         )[:56]
-        if output_path.exists() and output_path.stat().st_size > 0:
+        if not image_motion_urls and output_path.exists() and output_path.stat().st_size > 0:
             result.skipped += 1
             if aweme_id:
                 downloaded_ids.add(aweme_id)
@@ -3252,12 +3314,12 @@ def download_aweme_items(
                     failed=result.failed,
                 )
             continue
-        if output_path.exists():
+        if not image_motion_urls and output_path.exists():
             output_path.unlink(missing_ok=True)
         saved = False
         saved_files = []
         local_media = Path(str(aweme.get("_local_media_path") or ""))
-        if local_media.is_file() and local_media.stat().st_size > 0:
+        if not image_motion_urls and local_media.is_file() and local_media.stat().st_size > 0:
             try:
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(local_media, output_path)
@@ -3355,10 +3417,13 @@ def download_aweme_items(
                             item_label, type(_fb_exc).__name__, _fb_exc,
                         )
         else:
-            stem = target_dir / aweme_filename(aweme, suffix="")
             _image_failures = 0  # FIX-3.2: track partial image set failures
-            for index, url in enumerate(image_urls, start=1):
+            for progress_index, (index, url) in enumerate(image_url_entries, start=1):
                 image_path = Path(f"{stem}_{index:02d}.jpg")
+                if image_motion_urls and _has_valid_media_file(image_path):
+                    saved = True
+                    saved_files.append(image_path)
+                    continue
                 details = {
                     "media_kind": media_kind,
                     "current": item_index,
@@ -3367,7 +3432,7 @@ def download_aweme_items(
                     "skipped": result.skipped,
                     "failed": result.failed,
                     "item": item_label,
-                    "attempt": index,
+                    "attempt": progress_index,
                     "attempts": len(image_urls),
                 }
                 try:
@@ -3391,12 +3456,52 @@ def download_aweme_items(
                         error=type(exc).__name__,
                         **details,
                     )
-            # FIX-3.2: If any images failed, don't mark the post as fully downloaded
-            # so failed images get retried on the next check cycle.
+            for index, urls in image_motion_urls:
+                motion_path = Path(f"{stem}_{index:02d}_live.mp4")
+                if _has_valid_media_file(motion_path):
+                    saved = True
+                    saved_files.append(motion_path)
+                    continue
+                motion_saved = False
+                candidates = urls[:8]
+                for attempt, url in enumerate(candidates, start=1):
+                    details = {
+                        "media_kind": media_kind,
+                        "current": item_index,
+                        "total": total_items,
+                        "downloaded": result.downloaded,
+                        "skipped": result.skipped,
+                        "failed": result.failed,
+                        "item": item_label,
+                        "attempt": attempt,
+                        "attempts": len(candidates),
+                    }
+                    try:
+                        download_bytes(
+                            client, url, motion_path,
+                            progress_callback=progress_callback,
+                            progress_details=details,
+                            **download_kwargs,
+                        )
+                        motion_saved = True
+                        saved = True
+                        saved_files.append(motion_path)
+                        break
+                    except InterruptedError:
+                        raise
+                    except Exception as exc:
+                        report_progress(
+                            progress_callback, phase="retrying",
+                            error=type(exc).__name__, **details,
+                        )
+                if not motion_saved:
+                    _image_failures += 1
+            # Incomplete stills or motion clips must be retried, including
+            # items upgraded from a previously completed still-only download.
             if _image_failures > 0:
                 logging.warning(
-                    "Image set %s: %d/%d images failed; will retry next cycle.",
-                    item_label, _image_failures, len(image_urls),
+                    "Image set %s: %d/%d assets failed; will retry next cycle.",
+                    item_label, _image_failures, len(image_urls) + len(image_motion_urls),
                 )
                 saved = False  # prevent marking as downloaded
         if not saved:
