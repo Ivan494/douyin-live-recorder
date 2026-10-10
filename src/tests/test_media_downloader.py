@@ -1,4 +1,6 @@
 import asyncio
+import json
+import os
 import tempfile
 
 import httpx
@@ -314,7 +316,7 @@ class MediaDownloaderTest(unittest.TestCase):
 
         with patch.object(media, "fetch_stories_via_mobile_post_api", return_value=(None, "no post stories")), patch.object(
             media, "fetch_stories_via_mobile_story_feed",
-            return_value=(None, "https://aweme.snssdk.com/aweme/v1/story/profile/list/: empty pack"),
+            return_value=([], "https://aweme.snssdk.com/aweme/v1/story/profile/list/: empty pack"),
         ), patch.object(
             media, "fetch_stories_via_mobile_life_feed", return_value=(None, "no life")
         ), patch.object(
@@ -354,7 +356,7 @@ class MediaDownloaderTest(unittest.TestCase):
             return_value=([old_note], "https://aweme.snssdk.com/aweme/v1/aweme/post/ (mobile, 1 stories)"),
         ), patch.object(
             media, "fetch_stories_via_mobile_story_feed",
-            return_value=(None, "https://aweme.snssdk.com/aweme/v1/story/profile/list/: empty pack"),
+            return_value=([], "https://aweme.snssdk.com/aweme/v1/story/profile/list/: empty pack"),
         ), patch.object(
             media, "fetch_stories_via_mobile_life_feed", return_value=(None, "no life")
         ), patch.object(
@@ -373,7 +375,9 @@ class MediaDownloaderTest(unittest.TestCase):
         self.assertIn("story/profile/list", source)
         self.assertIn("empty pack", source.lower())
 
-    def test_empty_profile_list_is_authoritative_no_stories(self):
+    def test_empty_profile_list_and_story_feed_means_no_stories(self):
+        # profile/list 只覆盖 TTL 内的日常，历史日常在 story/feed 里，
+        # 所以"没有日常"必须两边都问过才能下结论。
         target = "target-sec-uid"
         payload = {
             "status_code": 0,
@@ -397,10 +401,68 @@ class MediaDownloaderTest(unittest.TestCase):
                 object(), "sec", user_id="1234567890", cookie_header="sid=1"
             )
 
-        self.assertIsNone(items)
+        self.assertEqual([], items)
         self.assertIn(media.STORY_PROFILE_LIST_PATH, source)
         self.assertIn("empty pack", source)
-        self.assertEqual([media.STORY_PROFILE_LIST_PATH], seen)
+        self.assertEqual([media.STORY_PROFILE_LIST_PATH, media.STORY_FEED_PATH], seen)
+
+    def test_profile_list_and_story_feed_results_are_merged(self):
+        # 主页挂 3 条日常时：profile/list 回 TTL 内的那条，story/feed 回更早的
+        # 历史日常。以前命中 profile/list 就 return，导致只拿到 1 条。
+        active = {"aweme_id": "active-story", "is_story": 1, "author": {"sec_uid": "sec"}}
+        history = {"aweme_id": "history-story", "is_story": 1, "author": {"sec_uid": "sec"}}
+        payloads = {
+            media.STORY_PROFILE_LIST_PATH: {
+                "status_code": 0,
+                "active_data": {"data": [active], "has_more": False},
+                "month_list": [],
+            },
+            media.STORY_FEED_PATH: {"status_code": 0, "data": [history], "has_more": False},
+        }
+        seen = []
+
+        def fake_request(_client, method, path, extra, *_args, **_kwargs):
+            seen.append(path)
+            response = MagicMock()
+            response.json.return_value = payloads[path]
+            return response
+
+        with patch.object(media, "_check_mobile_signer", return_value=True), patch.object(
+            media, "_mobile_signed_request", side_effect=fake_request
+        ), patch.object(media, "_persistent_mobile_device", return_value=("1" * 16, "2" * 16)), patch.object(
+            media, "_mobile_device_profile", return_value={"own_uid": "551"}
+        ):
+            items, source = media.fetch_stories_via_mobile_story_feed(
+                object(), "sec", user_id="1234567890", cookie_header="sid=1"
+            )
+
+        self.assertEqual(["active-story", "history-story"], [i["aweme_id"] for i in items])
+        self.assertEqual([media.STORY_PROFILE_LIST_PATH, media.STORY_FEED_PATH], seen)
+
+    def test_story_feed_uses_to_uid_not_tray_params(self):
+        # 历史日常只认作者维度（to_uid）；关注页托盘参数一条都拿不到，
+        # 这里锁死请求形态，避免以后被改回 cursor 形态。
+        captured = {}
+
+        def fake_request(_client, method, path, extra, *_args, **_kwargs):
+            captured.setdefault(path, extra)
+            response = MagicMock()
+            response.json.return_value = {"status_code": 0}
+            return response
+
+        with patch.object(media, "_check_mobile_signer", return_value=True), patch.object(
+            media, "_mobile_signed_request", side_effect=fake_request
+        ), patch.object(media, "_persistent_mobile_device", return_value=("1" * 16, "2" * 16)), patch.object(
+            media, "_mobile_device_profile", return_value={"own_uid": "551"}
+        ):
+            media.fetch_stories_via_mobile_story_feed(
+                object(), "sec", user_id="1234567890", cookie_header="sid=1"
+            )
+
+        feed_extra = captured[media.STORY_FEED_PATH]
+        self.assertEqual("1234567890", feed_extra.get("to_uid"))
+        self.assertNotIn("cursor", feed_extra)
+        self.assertEqual("0", feed_extra.get("story_ttl"))
 
     def test_mobile_story_feed_is_used_before_web_fallbacks(self):
         target = "target-sec-uid"
@@ -422,6 +484,64 @@ class MediaDownloaderTest(unittest.TestCase):
         self.assertTrue(supported)
         self.assertIn("story/feed", source)
         self.assertEqual(["ring-story"], [item["aweme_id"] for item in items])
+
+    def test_post_feed_candidates_do_not_mask_real_story_apis(self):
+        """作品流里的"疑似日常"必须让位给真正的 story 接口。
+
+        回归：以前第 1 级命中就 return，真正的 24h/日常 接口整条被跳过，
+        表现为主页挂着日常却一条都抓不到。
+        """
+        target = "target-sec-uid"
+        post_items = [
+            {"aweme_id": "false-story", "is_story": 1, "author": {"sec_uid": target}},
+        ]
+        real_items = [
+            {"aweme_id": "real-story", "is_25_story": 1, "author": {"sec_uid": target}},
+        ]
+        with patch.object(
+            media, "fetch_stories_via_mobile_post_api",
+            return_value=(post_items, "mobile post feed"),
+        ) as post_mock, patch.object(
+            media, "fetch_stories_via_mobile_story_feed",
+            return_value=(real_items, f"https://aweme.snssdk.com{media.STORY_PROFILE_LIST_PATH}"),
+        ) as feed_mock, patch.object(
+            media, "fetch_stories_via_browser", return_value=(None, "no browser")
+        ), patch.object(
+            media, "request_life_feed", return_value=(None, "life skipped")
+        ), patch.object(media, "request_json", return_value={"status_code": 0, "data": []}):
+            items, source, supported = media.fetch_stories(object(), {"cookies": "x"}, target)
+
+        # 真接口被调用了，并且返回的是它，而不是第 1 级的伪日常。
+        self.assertTrue(feed_mock.called)
+        post_mock.assert_not_called()
+        self.assertEqual(["real-story"], [item["aweme_id"] for item in items])
+        self.assertIn("story/profile/list", source)
+        self.assertNotIn("fallback", source)
+
+    def test_post_feed_candidates_are_used_only_as_last_resort(self):
+        """所有真实 story 接口都空时，才回退到作品流的疑似日常。"""
+        target = "target-sec-uid"
+        post_items = [
+            {"aweme_id": "fallback-story", "is_story": 1, "author": {"sec_uid": target}},
+        ]
+        with patch.object(
+            media, "fetch_stories_via_mobile_post_api",
+            return_value=(post_items, "mobile post feed"),
+        ), patch.object(
+            media, "fetch_stories_via_mobile_story_feed", return_value=(None, "no items")
+        ), patch.object(
+            media, "fetch_stories_via_mobile_life_feed", return_value=(None, "no items")
+        ), patch.object(
+            media, "fetch_stories_via_browser", return_value=(None, "no browser")
+        ), patch.object(
+            media, "request_life_feed", return_value=(None, "life skipped")
+        ), patch.object(
+            media, "request_json", return_value={"status_code": 0, "data": []}
+        ), patch.object(media, "profile_has_active_story", return_value=False):
+            items, source, supported = media.fetch_stories(object(), {"cookies": "x"}, target)
+
+        self.assertEqual(["fallback-story"], [item["aweme_id"] for item in items])
+        self.assertIn("fallback", source)
 
     def test_mobile_story_feed_tries_story25_profile_list(self):
         payload = {
@@ -469,6 +589,49 @@ class MediaDownloaderTest(unittest.TestCase):
         }
         items = media._story_items_from_feed_payload(payload)
         self.assertEqual(["from-active"], [item["aweme_id"] for item in items])
+
+    def test_story_feed_payload_merges_data_and_active_data_buckets(self):
+        """The two response shapes (data / active_data) are both read."""
+        payload = {
+            "status_code": 0,
+            "data": [{"aweme_id": "feed-story", "is_25_story": 1}],
+            "active_data": {"data": [{"aweme_id": "profile-story", "is_25_story": 1}]},
+        }
+
+        items = media._story_items_from_feed_payload(payload)
+
+        self.assertEqual(
+            {"feed-story", "profile-story"},
+            {item["aweme_id"] for item in items},
+        )
+
+    def test_empty_profile_list_still_returns_story_feed_history(self):
+        # profile/list 只覆盖 TTL 内的日常，它返回空并不代表这个主页没有日常；
+        # story/feed 里的历史日常仍然必须被返回，而不是直接报"没有日常"。
+        payloads = {
+            media.STORY_PROFILE_LIST_PATH: {"status_code": 0, "active_data": {"data": []}},
+            media.STORY_FEED_PATH: {
+                "status_code": 0,
+                "data": [{"aweme_id": "old-story", "is_story": 1, "author": {"sec_uid": "sec"}}],
+            },
+        }
+
+        def fake_request(_client, method, path, extra, *_args, **_kwargs):
+            response = MagicMock()
+            response.json.return_value = payloads[path]
+            return response
+
+        with patch.object(media, "_check_mobile_signer", return_value=True), patch.object(
+            media, "_mobile_signed_request", side_effect=fake_request
+        ), patch.object(media, "_persistent_mobile_device", return_value=("1" * 16, "2" * 16)), patch.object(
+            media, "_mobile_device_profile", return_value={"own_uid": "551"}
+        ):
+            items, source = media.fetch_stories_via_mobile_story_feed(
+                object(), "sec", user_id="1234567890", cookie_header="sid=1"
+            )
+
+        self.assertEqual(["old-story"], [item["aweme_id"] for item in items])
+        self.assertIn(media.STORY_FEED_PATH, source)
 
     def test_time_limited_type68_post_is_still_a_story(self):
         target = "target-sec-uid"
@@ -553,7 +716,7 @@ class MediaDownloaderTest(unittest.TestCase):
     def test_download_uses_local_emulator_cache(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             source = Path(temporary_directory) / "cached.mp4"
-            source.write_bytes(b"\x00\x00\x00 ftypisomlocal")
+            source.write_bytes(b"\x00\x00\x00 ftypisomlocal" + b"\0" * 4096)
             aweme = {
                 "aweme_id": "local-story",
                 "desc": "日常",
@@ -569,6 +732,84 @@ class MediaDownloaderTest(unittest.TestCase):
             saved = Path(result.files[0])
             self.assertTrue(saved.is_file())
             self.assertEqual(source.read_bytes(), saved.read_bytes())
+
+    def test_recorded_story_without_local_file_is_downloaded_again(self):
+        """A recorded id must not block the download once its file is gone.
+
+        The state file is merged forward on every save, so cleaning up the
+        download folder by hand leaves ids behind that point at nothing.
+        """
+        aweme = {
+            "aweme_id": "residue-story",
+            "desc": "日常",
+            "create_time": 1786893660,
+            "video": {"play_addr": {"url_list": ["https://example.test/story.mp4"]}},
+        }
+        state = {"downloaded_story_ids": ["residue-story"]}
+
+        def fake_download(_client, url, output_path, progress_callback=None,
+                          progress_details=None, **_kwargs):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00\x00\x00 ftypisomdownloaded")
+
+        with tempfile.TemporaryDirectory() as temporary_directory, patch.object(
+            media, "download_bytes", side_effect=fake_download
+        ):
+            result = media.download_aweme_items(
+                object(), {}, [aweme], temporary_directory, state, "story"
+            )
+
+        self.assertEqual(0, result.skipped)
+        self.assertEqual(1, result.downloaded)
+        self.assertEqual(0, result.failed)
+        self.assertEqual(["residue-story"], state["downloaded_story_ids"])
+
+    def test_recorded_story_with_present_file_is_still_skipped(self):
+        aweme = {
+            "aweme_id": "present-story",
+            "desc": "日常",
+            "create_time": 1786893660,
+            "video": {"play_addr": {"url_list": ["https://example.test/story.mp4"]}},
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "stories"
+            target.mkdir(parents=True, exist_ok=True)
+            (target / media.aweme_filename(aweme)).write_bytes(b"\x00\x00\x00 ftypisom" + b"\0" * 4096)
+            state = {"downloaded_story_ids": ["present-story"]}
+            result = media.download_aweme_items(
+                object(), {}, [aweme], temporary_directory, state, "story"
+            )
+
+        self.assertEqual(1, result.skipped)
+        self.assertEqual(0, result.downloaded)
+
+    def test_recorded_image_story_without_local_images_is_downloaded_again(self):
+        """Image items store <stem>_01.jpg, never the .mp4 output_path."""
+        aweme = {
+            "aweme_id": "residue-image-story",
+            "desc": "图文日常",
+            "create_time": 1786893660,
+            "images": [{"url_list": ["https://example.test/one.jpg"]}],
+        }
+        state = {"downloaded_story_ids": ["residue-image-story"]}
+        saved_paths = []
+
+        def fake_download(_client, url, output_path, progress_callback=None,
+                          progress_details=None, **_kwargs):
+            saved_paths.append(str(output_path))
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"jpegdata")
+
+        with tempfile.TemporaryDirectory() as temporary_directory, patch.object(
+            media, "download_bytes", side_effect=fake_download
+        ):
+            result = media.download_aweme_items(
+                object(), {}, [aweme], temporary_directory, state, "story"
+            )
+
+        self.assertEqual(0, result.skipped)
+        self.assertEqual(1, result.downloaded)
+        self.assertTrue(saved_paths and saved_paths[0].endswith("_01.jpg"))
 
     def test_parse_share_command_blk(self):
         blob = b"keva-blk\x00https://v.douyin.com/EXY01FyD8dU/\x00junk"
@@ -649,6 +890,36 @@ class MediaDownloaderTest(unittest.TestCase):
         self.assertEqual(2, len(saved))
         self.assertEqual(["image-note"], state["downloaded_video_ids"])
 
+    def test_metadata_json_is_opt_in(self):
+        """OPT-META: the <file>.json sidecar is written only when asked for."""
+        aweme = {
+            "aweme_id": "meta-note",
+            "desc": "Metadata sidecar",
+            "images": [{"url_list": ["https://example.test/photo.jpg"]}],
+        }
+
+        def fake_download(_client, url, output_path, progress_callback=None, progress_details=None):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"image")
+
+        def run(**kwargs):
+            """Return the parsed sidecar payloads (temp dir is gone afterwards)."""
+            with tempfile.TemporaryDirectory() as temporary_directory, patch.object(
+                media, "download_bytes", side_effect=fake_download
+            ):
+                media.download_aweme_items(
+                    object(), {}, [aweme], temporary_directory, {}, "video", **kwargs
+                )
+                return [
+                    json.loads(path.read_text(encoding="utf-8"))
+                    for path in Path(temporary_directory).rglob("*.json")
+                ]
+
+        # Default: media only, no metadata sidecar.
+        self.assertEqual([], run())
+        # Opt-in: exactly one sidecar, holding the raw payload.
+        self.assertEqual([aweme], run(save_metadata_json=True))
+
     def test_image_work_ignores_bgm_in_video_play_address(self):
         aweme = {
             "aweme_id": "image-with-bgm",
@@ -684,6 +955,152 @@ class MediaDownloaderTest(unittest.TestCase):
         self.assertEqual(1, result.downloaded)
         self.assertEqual(1, len(images))
         self.assertEqual([], videos)
+
+    def test_live_photo_image_entry_exposes_animated_payload(self):
+        """动图 (Live Photo) works carry their mp4 in images[i].video."""
+        aweme = {
+            "aweme_id": "live-photo-note",
+            "aweme_type": 68,
+            "is_live_photo": 1,
+            "images": [
+                {
+                    "clip_type": 5,
+                    "live_photo_type": 1,
+                    "url_list": ["https://example.test/cover.heic"],
+                    "video": {
+                        "bit_rate": [
+                            {"play_addr": {"url_list": ["https://example.test/live.mp4"]}}
+                        ]
+                    },
+                }
+            ],
+        }
+
+        entries = media.collect_image_entries(aweme)
+
+        self.assertEqual(1, len(entries))
+        self.assertEqual("https://example.test/cover.heic", entries[0]["url"])
+        self.assertEqual(["https://example.test/live.mp4"], entries[0]["video_urls"])
+        self.assertTrue(entries[0]["live_photo"])
+        # collect_image_urls stays still-image-only for existing callers.
+        self.assertEqual(["https://example.test/cover.heic"], media.collect_image_urls(aweme))
+
+    def test_plain_image_entry_has_no_animated_payload(self):
+        aweme = {"images": [{"url_list": ["https://example.test/one.jpg"]}]}
+
+        entries = media.collect_image_entries(aweme)
+
+        self.assertEqual(1, len(entries))
+        self.assertEqual("https://example.test/one.jpg", entries[0]["url"])
+        self.assertEqual([], entries[0]["video_urls"])
+        self.assertFalse(entries[0]["live_photo"])
+
+    def test_live_photo_work_downloads_still_and_animated_mp4(self):
+        aweme = {
+            "aweme_id": "live-photo-download",
+            "aweme_type": 68,
+            "is_live_photo": 1,
+            "images": [
+                {
+                    "url_list": ["https://example.test/cover.jpg"],
+                    "video": {
+                        "play_addr": {"url_list": ["https://example.test/live.mp4"]}
+                    },
+                }
+            ],
+        }
+        saved_urls = []
+
+        def fake_download(_client, url, output_path, progress_callback=None,
+                          progress_details=None, **_kwargs):
+            saved_urls.append(url)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(url.encode("utf-8"))
+
+        with tempfile.TemporaryDirectory() as temporary_directory, patch.object(
+            media, "download_bytes", side_effect=fake_download
+        ):
+            result = media.download_aweme_items(
+                object(), {}, [aweme], temporary_directory, {}, "video"
+            )
+            images_dir = Path(temporary_directory) / "images"
+            stills = sorted(images_dir.glob("*.jpg"))
+            animations = sorted(images_dir.glob("*.mp4"))
+
+        self.assertEqual(1, result.downloaded)
+        self.assertEqual(1, len(stills))
+        self.assertEqual(1, len(animations))
+        self.assertTrue(stills[0].name.endswith("_01.jpg"))
+        self.assertTrue(animations[0].name.endswith("_01_live.mp4"))
+        self.assertIn("https://example.test/live.mp4", saved_urls)
+
+    def test_recorded_live_photo_missing_mp4_is_downloaded_again(self):
+        """A still-only run from an older version must fetch the 动图 later."""
+        aweme = {
+            "aweme_id": "legacy-live-photo",
+            "desc": "图文日常",
+            "create_time": 1786893660,
+            "images": [
+                {
+                    "url_list": ["https://example.test/cover.jpg"],
+                    "video": {
+                        "play_addr": {"url_list": ["https://example.test/live.mp4"]}
+                    },
+                }
+            ],
+        }
+        state = {"downloaded_story_ids": ["legacy-live-photo"]}
+
+        def fake_download(_client, url, output_path, progress_callback=None,
+                          progress_details=None, **_kwargs):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(url.encode("utf-8"))
+
+        with tempfile.TemporaryDirectory() as temporary_directory, patch.object(
+            media, "download_bytes", side_effect=fake_download
+        ):
+            target = Path(temporary_directory) / "stories"
+            target.mkdir(parents=True, exist_ok=True)
+            stem = media.aweme_filename(aweme, suffix="")
+            (target / f"{stem}_01.jpg").write_bytes(b"jpegfromolderbuild")
+            result = media.download_aweme_items(
+                object(), {}, [aweme], temporary_directory, state, "story"
+            )
+            animations = sorted(target.glob("*.mp4"))
+
+        self.assertEqual(0, result.skipped)
+        self.assertEqual(1, result.downloaded)
+        self.assertEqual(1, len(animations))
+        self.assertTrue(animations[0].name.endswith("_01_live.mp4"))
+
+    def test_recorded_live_photo_with_all_payloads_is_still_skipped(self):
+        aweme = {
+            "aweme_id": "complete-live-photo",
+            "desc": "图文日常",
+            "create_time": 1786893660,
+            "images": [
+                {
+                    "url_list": ["https://example.test/cover.jpg"],
+                    "video": {
+                        "play_addr": {"url_list": ["https://example.test/live.mp4"]}
+                    },
+                }
+            ],
+        }
+        state = {"downloaded_story_ids": ["complete-live-photo"]}
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "stories"
+            target.mkdir(parents=True, exist_ok=True)
+            stem = media.aweme_filename(aweme, suffix="")
+            (target / f"{stem}_01.jpg").write_bytes(b"\xff\xd8\xff" + b"\0" * 4096)
+            (target / f"{stem}_01_live.mp4").write_bytes(b"\x00\x00\x00 ftypisom" + b"\0" * 4096)
+            result = media.download_aweme_items(
+                object(), {}, [aweme], temporary_directory, state, "story"
+            )
+
+        self.assertEqual(1, result.skipped)
+        self.assertEqual(0, result.downloaded)
 
     def test_legacy_video_state_is_migrated_without_marking_stories(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1017,6 +1434,137 @@ class MediaDownloaderTest(unittest.TestCase):
         self.assertNotIn("/", name)
         self.assertNotIn("\\", name)
         self.assertTrue(name.endswith("_clip.mp4") or "_clip.mp4" in name)
+
+    def test_aweme_filename_budgets_caption_against_deep_base_dir(self):
+        # Regression: a long CJK caption under a ~135-char portable install root
+        # used to push the real path past Windows' 260-char MAX_PATH, so open()
+        # raised FileNotFoundError and the work was reported as a failed
+        # download even though the CDN served it fine.
+        sec_uid = "MS4wLjABAAAA" + "0" * 43   # 55 chars, same shape as a real one
+        deep = Path(
+            "C:/Users/someone/Downloads/DouyinLiveRecorder-v1.2.6-win64"
+            f"/douyindownload/抖音 {sec_uid}/videos"
+        )
+        aweme = {
+            "aweme_id": "7000000000000000000",
+            "desc": "示例标题示例标题示例标题！✴️#examplehashtag  #示例话题标签",
+            "create_time": 1_709_900_648,
+        }
+        for suffix in ("", ".mp4"):
+            name = media.aweme_filename(aweme, suffix=suffix, base_dir=deep)
+            # Worst case the caller appends "_01.jpg" and download_bytes then
+            # appends ".part.<pid>.<8-hex-uuid>".
+            worst = (
+                len(str(deep)) + 1 + len(name)
+                + len("_01.jpg") + len(".part.99999.") + 8
+            )
+            self.assertLess(worst, 260, f"path too long for suffix={suffix!r}: {worst}")
+            # The id must survive so state tracking keeps working.
+            self.assertIn("7000000000000000000", name)
+
+    def test_aweme_filename_keeps_short_captions_intact(self):
+        aweme = {"aweme_id": "123", "desc": "短的标题", "create_time": 1_700_000_000}
+        name = media.aweme_filename(aweme, base_dir=Path("C:/tmp/videos"))
+        self.assertIn("短的标题", name)
+
+    def test_media_item_path_groups_payloads_under_aweme_id(self):
+        target = Path("C:/tmp/videos")
+        aweme = {
+            "aweme_id": "7000000000000000000",
+            "desc": "示例标题",
+            "create_time": 1_709_900_648,
+        }
+        flat = media.media_item_path(target, aweme, subdir_by_aweme_id=False)
+        grouped = media.media_item_path(target, aweme, subdir_by_aweme_id=True, keep_full_title=True)
+        self.assertEqual(flat.parent, target)
+        self.assertIn("7000000000000000000", flat.name)
+        self.assertEqual(grouped.parent, target / "7000000000000000000")
+        # the id names the directory, so it must not be repeated in the file name
+        self.assertNotIn("7000000000000000000", grouped.name)
+        self.assertIn("示例标题", grouped.name)
+
+    def test_media_item_path_keeps_long_caption_when_requested(self):
+        target = Path("C:/tmp/videos")
+        caption = "示例标题示例标题示例标题！✴️#examplehashtag #示例话题标签"
+        aweme = {
+            "aweme_id": "7000000000000000000",
+            "desc": caption,
+            "create_time": 1_709_900_648,
+        }
+        full = media.media_item_path(target, aweme, keep_full_title=True)
+        self.assertIn(caption, full.name)
+        # The truncating layout still shortens it against a deep directory.
+        # (At extreme depths even the floor of 16 chars can exceed 260; that case
+        # is what _extended_path() exists to cover.)
+        deep = Path("C:/" + "d" * 150)
+        short = media.media_item_path(deep, aweme, keep_full_title=False)
+        self.assertNotEqual(short.name, full.name)
+        self.assertLess(len(short.name), len(full.name))
+        self.assertLess(len(str(short)) + media._PATH_TAIL_RESERVE, media._MAX_PATH_LEGACY)
+
+    def test_extended_path_only_rewrites_over_long_windows_paths(self):
+        short = "C:/tmp/videos/a.mp4"
+        self.assertEqual(media._extended_path(short), short)
+        long_path = "C:/tmp/" + "d" * 300 + "/a.mp4"
+        extended = media._extended_path(long_path)
+        if os.name == "nt":
+            self.assertTrue(extended.startswith("\\\\?\\"))
+            self.assertTrue(extended.endswith("a.mp4"))
+            # already-prefixed paths must be left alone
+            self.assertEqual(media._extended_path(extended), extended)
+        else:
+            self.assertEqual(extended, long_path)
+
+    def test_normalize_pasted_link_extracts_url_from_share_blob(self):
+        blob = (
+            "1- 长按复制此条消息，打开抖音搜索，查看TA的更多作品。 "
+            "https://v.douyin.com/AbCdEfGhIjK/ 2@2.com :4pm"
+        )
+        self.assertEqual(
+            media.normalize_pasted_link(blob), "https://v.douyin.com/AbCdEfGhIjK/"
+        )
+        # The whole sentence must never survive into the request layer.
+        self.assertNotIn("长按复制", media.normalize_pasted_link(blob))
+
+    def test_normalize_pasted_link_tolerates_missing_scheme(self):
+        self.assertEqual(
+            media.normalize_pasted_link("v.douyin.com/abc/ 复制打开抖音"),
+            "https://v.douyin.com/abc/",
+        )
+        self.assertEqual(media.normalize_pasted_link(""), "")
+        self.assertEqual(media.normalize_pasted_link("没有链接的文字"), "")
+
+    def test_canonical_douyin_profile_url_handles_share_landing_page(self):
+        sec_uid = "MS4wLjABAAAA" + "0" * 43
+        canonical = f"https://www.douyin.com/user/{sec_uid}"
+        # The v.douyin.com redirect lands on the share surface, which the app
+        # previously failed to recognize as a profile at all.
+        self.assertEqual(
+            media.extract_sec_uid_from_url(
+                f"https://www.iesdouyin.com/share/user/{sec_uid}?u_code=abc&did=xyz"
+            ),
+            sec_uid,
+        )
+        self.assertEqual(
+            media.canonical_douyin_profile_url(
+                f"https://www.iesdouyin.com/share/user/{sec_uid}?u_code=abc"
+            ),
+            canonical,
+        )
+        self.assertEqual(
+            media.canonical_douyin_profile_url(f"{canonical}?from_tab_name=main"),
+            canonical,
+        )
+        self.assertEqual(media.canonical_douyin_profile_url("https://v.douyin.com/abc/"), "")
+
+    def test_expand_douyin_short_link_short_circuits_concrete_urls(self):
+        # Concrete URLs must return without touching the network.
+        canonical = "https://www.douyin.com/user/MS4wLjABAAAAexample"
+        self.assertEqual(media.expand_douyin_short_link(canonical), canonical)
+        work = "https://www.douyin.com/video/7000000000000000001"
+        self.assertEqual(media.expand_douyin_short_link(work), work)
+        self.assertEqual(media.expand_douyin_short_link(""), "")
+
     def test_mobile_base_params_reuse_stable_cdid(self):
         with patch.object(
             media,
