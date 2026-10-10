@@ -316,7 +316,7 @@ class MediaDownloaderTest(unittest.TestCase):
 
         with patch.object(media, "fetch_stories_via_mobile_post_api", return_value=(None, "no post stories")), patch.object(
             media, "fetch_stories_via_mobile_story_feed",
-            return_value=(None, "https://aweme.snssdk.com/aweme/v1/story/profile/list/: empty pack"),
+            return_value=([], "https://aweme.snssdk.com/aweme/v1/story/profile/list/: empty pack"),
         ), patch.object(
             media, "fetch_stories_via_mobile_life_feed", return_value=(None, "no life")
         ), patch.object(
@@ -356,7 +356,7 @@ class MediaDownloaderTest(unittest.TestCase):
             return_value=([old_note], "https://aweme.snssdk.com/aweme/v1/aweme/post/ (mobile, 1 stories)"),
         ), patch.object(
             media, "fetch_stories_via_mobile_story_feed",
-            return_value=(None, "https://aweme.snssdk.com/aweme/v1/story/profile/list/: empty pack"),
+            return_value=([], "https://aweme.snssdk.com/aweme/v1/story/profile/list/: empty pack"),
         ), patch.object(
             media, "fetch_stories_via_mobile_life_feed", return_value=(None, "no life")
         ), patch.object(
@@ -401,7 +401,7 @@ class MediaDownloaderTest(unittest.TestCase):
                 object(), "sec", user_id="1234567890", cookie_header="sid=1"
             )
 
-        self.assertIsNone(items)
+        self.assertEqual([], items)
         self.assertIn(media.STORY_PROFILE_LIST_PATH, source)
         self.assertIn("empty pack", source)
         self.assertEqual([media.STORY_PROFILE_LIST_PATH, media.STORY_FEED_PATH], seen)
@@ -513,7 +513,7 @@ class MediaDownloaderTest(unittest.TestCase):
 
         # 真接口被调用了，并且返回的是它，而不是第 1 级的伪日常。
         self.assertTrue(feed_mock.called)
-        self.assertTrue(post_mock.called)
+        post_mock.assert_not_called()
         self.assertEqual(["real-story"], [item["aweme_id"] for item in items])
         self.assertIn("story/profile/list", source)
         self.assertNotIn("fallback", source)
@@ -716,7 +716,7 @@ class MediaDownloaderTest(unittest.TestCase):
     def test_download_uses_local_emulator_cache(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             source = Path(temporary_directory) / "cached.mp4"
-            source.write_bytes(b"\x00\x00\x00 ftypisomlocal")
+            source.write_bytes(b"\x00\x00\x00 ftypisomlocal" + b"\0" * 4096)
             aweme = {
                 "aweme_id": "local-story",
                 "desc": "日常",
@@ -774,7 +774,7 @@ class MediaDownloaderTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             target = Path(temporary_directory) / "stories"
             target.mkdir(parents=True, exist_ok=True)
-            (target / media.aweme_filename(aweme)).write_bytes(b"\x00\x00\x00 ftypisom")
+            (target / media.aweme_filename(aweme)).write_bytes(b"\x00\x00\x00 ftypisom" + b"\0" * 4096)
             state = {"downloaded_story_ids": ["present-story"]}
             result = media.download_aweme_items(
                 object(), {}, [aweme], temporary_directory, state, "story"
@@ -1031,7 +1031,7 @@ class MediaDownloaderTest(unittest.TestCase):
         self.assertEqual(1, len(stills))
         self.assertEqual(1, len(animations))
         self.assertTrue(stills[0].name.endswith("_01.jpg"))
-        self.assertTrue(animations[0].name.endswith("_01.mp4"))
+        self.assertTrue(animations[0].name.endswith("_01_live.mp4"))
         self.assertIn("https://example.test/live.mp4", saved_urls)
 
     def test_recorded_live_photo_missing_mp4_is_downloaded_again(self):
@@ -1071,7 +1071,7 @@ class MediaDownloaderTest(unittest.TestCase):
         self.assertEqual(0, result.skipped)
         self.assertEqual(1, result.downloaded)
         self.assertEqual(1, len(animations))
-        self.assertTrue(animations[0].name.endswith("_01.mp4"))
+        self.assertTrue(animations[0].name.endswith("_01_live.mp4"))
 
     def test_recorded_live_photo_with_all_payloads_is_still_skipped(self):
         aweme = {
@@ -1093,8 +1093,8 @@ class MediaDownloaderTest(unittest.TestCase):
             target = Path(temporary_directory) / "stories"
             target.mkdir(parents=True, exist_ok=True)
             stem = media.aweme_filename(aweme, suffix="")
-            (target / f"{stem}_01.jpg").write_bytes(b"jpeg")
-            (target / f"{stem}_01.mp4").write_bytes(b"mp4payload")
+            (target / f"{stem}_01.jpg").write_bytes(b"\xff\xd8\xff" + b"\0" * 4096)
+            (target / f"{stem}_01_live.mp4").write_bytes(b"\x00\x00\x00 ftypisom" + b"\0" * 4096)
             result = media.download_aweme_items(
                 object(), {}, [aweme], temporary_directory, state, "story"
             )

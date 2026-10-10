@@ -649,6 +649,8 @@ class ProfileResolverTest(unittest.TestCase):
 
         dialog = SimpleNamespace(
             resolving=False,
+            resolve_request_id=0,
+            profile={},
             url_var=Value("https://live.douyin.com/123456"),
             profile_url_var=Value(),
             quality_var=Value("OD"),
@@ -658,15 +660,15 @@ class ProfileResolverTest(unittest.TestCase):
             resolve_result_queue=app.queue.Queue(),
         )
 
-        async def delayed_resolve(_url, _quality=None):
+        async def delayed_resolve(_context, _url, _quality=None):
             await app.asyncio.sleep(0.25)
             return {"anchor_name": "Resolved", "live_url": "https://live.douyin.com/123456"}, SimpleNamespace()
 
-        dialog.resolve_room = delayed_resolve
         started = time.monotonic()
-        app.ProfileDialog.resolve_link(dialog)
-        returned_in = time.monotonic() - started
-        result = dialog.resolve_result_queue.get(timeout=2)
+        with patch.object(app.ProfileDialog, "resolve_room", side_effect=delayed_resolve):
+            app.ProfileDialog.resolve_link(dialog)
+            returned_in = time.monotonic() - started
+            result = dialog.resolve_result_queue.get(timeout=2)
 
         self.assertLess(returned_in, 0.1)
         self.assertTrue(result["ok"])

@@ -207,13 +207,14 @@ def test_initial_media_request_removes_merged_client_cookie_outside_auth_domains
     assert output.read_bytes() == VIDEO_BODY
 
 
-@pytest.mark.parametrize("route", ["posts", "posts_retry", "stories"])
+@pytest.mark.parametrize("route", ["posts", "posts_retry", "stories", "stories_author"])
 def test_download_profile_uses_same_selected_account_for_metadata_and_binary(
         tmp_path, monkeypatch, route):
     sec_uid = "synthetic-author-sec-uid"
     item = item_fixture("video")
     item["author"] = {"sec_uid": sec_uid}
-    if route == "stories":
+    story_route = route.startswith("stories")
+    if story_route:
         item["is_story"] = 1
     profile = {"id": "synthetic-profile", "name": "synthetic profile",
                "cookies": f"  {PROFILE_COOKIE}  ", "output_dir": str(tmp_path)}
@@ -229,9 +230,17 @@ def test_download_profile_uses_same_selected_account_for_metadata_and_binary(
             raise media.EmptyApiResponseError("synthetic initial metadata failure")
         return [item]
 
-    def stories(_client, _sec_uid, cookie_header=""):
+    def stories(_client, _sec_uid, cookie_header="", *, scan_state=None):
+        assert isinstance(scan_state, dict)
         metadata_cookies.append(cookie_header)
         return [item], "synthetic story metadata"
+
+    def author_stories(_client, _sec_uid, *, user_id="", cookie_header="", scan_state=None):
+        assert isinstance(scan_state, dict)
+        if route == "stories_author":
+            metadata_cookies.append(cookie_header)
+            return media.MobileStoryFeedResult([item], "synthetic author story metadata", complete=True)
+        return media.MobileStoryFeedResult([], "synthetic complete empty author feed", complete=True)
 
     def unavailable(*args, **kwargs):
         raise media.EmptyApiResponseError("synthetic metadata route unavailable")
@@ -248,15 +257,16 @@ def test_download_profile_uses_same_selected_account_for_metadata_and_binary(
     monkeypatch.setattr(media, "resolve_profile_identity", identity)
     monkeypatch.setattr(media, "fetch_posts_via_mobile_api", posts)
     monkeypatch.setattr(media, "fetch_stories_via_mobile_post_api", stories)
+    monkeypatch.setattr(media, "fetch_stories_via_mobile_story_feed", author_stories)
     monkeypatch.setattr(media, "fetch_posts", unavailable)
     monkeypatch.setattr(media, "fetch_posts_via_browser", unavailable)
     monkeypatch.setattr(media, "_http_fastpath_failures", {})
     monkeypatch.setattr(media.httpx, "Client", offline_client)
 
-    summary = media.download_profile(profile, videos=route != "stories", stories=route == "stories")
+    summary = media.download_profile(profile, videos=not story_route, stories=story_route)
 
     assert metadata_cookies == [PROFILE_COOKIE] * (2 if route == "posts_retry" else 1)
-    result = summary["stories" if route == "stories" else "videos"]
+    result = summary["stories" if story_route else "videos"]
     assert result["status"] == "ok" and result["downloaded"] == 1 and result["failed"] == 0
     assert requests and all(request.headers.get("Cookie") == PROFILE_COOKIE for request in requests)
     assert Path(result["files"][0]).read_bytes() == VIDEO_BODY

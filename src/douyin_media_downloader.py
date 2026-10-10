@@ -337,7 +337,52 @@ def _is_mobile_post_story(aweme):
     return created > 0 and 0 <= age < 24 * 60 * 60
 
 
-def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header=""):
+class MobileStoryFeedResult(tuple):
+    """Two-value compatibility plus mobile scan/capability metadata."""
+
+    def __new__(cls, items, source, *, complete, attempted=True, unavailable_reason=""):
+        result = super().__new__(cls, (items, source))
+        result.complete = complete
+        result.attempted = attempted
+        result.unavailable_reason = unavailable_reason
+        return result
+
+
+class StoryFetchResult(tuple):
+    """Three-value compatibility plus explicit overall scan completeness."""
+
+    def __new__(cls, items, source, supported, *, complete, unavailable_reason=""):
+        result = super().__new__(cls, (items, source, supported))
+        result.complete = complete
+        result.unavailable_reason = unavailable_reason
+        return result
+
+
+def _story_scan_state(scan_state, sec_user_id, cookie_header):
+    """Keep bounded scan continuation private to this target/login scope."""
+    if not isinstance(scan_state, dict):
+        return None
+    from hashlib import sha256
+    scope = sha256(f"{sec_user_id}\0{cookie_header}".encode("utf-8")).hexdigest()
+    stored = scan_state.get("story_scan")
+    if not isinstance(stored, dict) or stored.get("scope") != scope:
+        stored = {"scope": scope, "author_offsets": {}}
+        scan_state["story_scan"] = stored
+    if not isinstance(stored.get("author_offsets"), dict):
+        stored["author_offsets"] = {}
+    return stored
+
+
+def _story_cursor(value):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return ""
+    text = str(value)
+    if not re.fullmatch(r"[0-9]{1,32}", text):
+        return ""
+    return str(int(text))
+
+
+def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header="", *, scan_state=None):
     """
     Fetch time-limited story items from the mobile /aweme/v1/aweme/post/ feed.
 
@@ -348,18 +393,27 @@ def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header=""):
     Returns (items_list, source_label) or (None, error_message).
     """
     if not _check_mobile_signer():
-        return None, "mobile_post_api: signer module not available"
+        return MobileStoryFeedResult(None, "mobile_post_api: signer module not available",
+                                     complete=False, attempted=False, unavailable_reason="signer_unavailable")
     if not cookie_header:
         cookie_header = _mobile_cookie_header()
     if not cookie_header:
-        return None, "mobile_post_api: no session cookies"
+        return MobileStoryFeedResult(None, "mobile_post_api: no session cookies",
+                                     complete=False, attempted=False, unavailable_reason="login_required")
 
     device_id, install_id = _persistent_mobile_device()
+    continuation = _story_scan_state(scan_state, sec_user_id, cookie_header)
+    resume_cursor = _story_cursor(continuation.get("post_cursor")) if continuation is not None else ""
+    if resume_cursor == "0":
+        resume_cursor = ""
 
     stories = []
+    seen_ids = set()
     max_cursor = "0"
+    seen_cursors = {max_cursor}
     pages_fetched = 0
     max_pages = 15  # safety limit
+    partial_message = ""
 
     try:
         while pages_fetched < max_pages:
@@ -377,25 +431,59 @@ def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header=""):
             )
             data = response.json()
             if not isinstance(data, dict):
+                partial_message = "invalid response"
                 break
             _raise_mobile_login_required(data)
             status_code = data.get("status_code")
             if status_code != 0:
                 msg = data.get("status_msg") or data.get("message") or ""
                 if pages_fetched == 0:
-                    return None, f"mobile_post_api: status_code={status_code} {msg}"
+                    return MobileStoryFeedResult(None, f"mobile_post_api: status_code={status_code} {msg}", complete=False)
+                partial_message = f"status_code={status_code} {msg}"
                 break  # partial results are still useful
 
             aweme_list = data.get("aweme_list") or []
             for aweme in aweme_list:
                 if _is_mobile_post_story(aweme):
+                    item_id = str(aweme.get("aweme_id") or aweme.get("group_id") or "")
+                    if item_id and item_id in seen_ids:
+                        continue
+                    if item_id:
+                        seen_ids.add(item_id)
                     stories.append(aweme)
 
             has_more = data.get("has_more", 0)
-            max_cursor = str(data.get("max_cursor", 0))
             pages_fetched += 1
 
             if not has_more:
+                if continuation is not None:
+                    continuation.pop("post_cursor", None)
+                break
+            next_cursor = data.get("max_cursor")
+            if next_cursor is None:
+                partial_message = "missing pagination cursor"
+                break
+            next_cursor = _story_cursor(next_cursor)
+            if not next_cursor:
+                partial_message = "invalid pagination cursor"
+                if continuation is not None:
+                    continuation.pop("post_cursor", None)
+                break
+            # Every check reads page zero for newly posted stories, then spends
+            # the remaining request budget continuing the older archive.
+            if pages_fetched == 1 and resume_cursor:
+                next_cursor = resume_cursor
+            if next_cursor in seen_cursors:
+                partial_message = "repeated pagination cursor"
+                if continuation is not None:
+                    continuation.pop("post_cursor", None)
+                break
+            seen_cursors.add(next_cursor)
+            max_cursor = next_cursor
+            if continuation is not None:
+                continuation["post_cursor"] = next_cursor
+            if pages_fetched >= max_pages:
+                partial_message = f"page limit ({max_pages}) reached"
                 break
             _cancel_wait(0.3)  # rate-limit courtesy
 
@@ -405,12 +493,18 @@ def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header=""):
         raise
     except Exception as exc:
         if not stories:
-            return None, f"mobile_post_api: {exc}"
+            return MobileStoryFeedResult(None, f"mobile_post_api: {exc}", complete=False)
+        partial_message = str(exc)
         # Return partial results
 
     if stories:
-        return stories, f"{MOBILE_API_HOST}/aweme/v1/aweme/post/ (mobile, {len(stories)} stories)"
-    return None, "mobile_post_api: no time-limited stories in post feed"
+        source = f"{MOBILE_API_HOST}/aweme/v1/aweme/post/ (mobile, {len(stories)} stories)"
+        if partial_message:
+            source += f" (partial: {partial_message})"
+        return MobileStoryFeedResult(stories, source, complete=not bool(partial_message))
+    if partial_message:
+        return MobileStoryFeedResult(None, f"mobile_post_api: partial: {partial_message}", complete=False)
+    return MobileStoryFeedResult(None, "mobile_post_api: no time-limited stories in post feed", complete=True)
 
 
 STORY_PAYLOAD_BUCKET_KEYS = (
@@ -447,16 +541,20 @@ def _story_payload_entries(bucket):
     else:
         return []
     entries = []
+    seen_nodes = set()
     for node in queue:
         if not isinstance(node, dict):
             continue
+        if id(node) in seen_nodes:
+            continue
+        seen_nodes.add(id(node))
         entries.append(node)
         for key in STORY_PAYLOAD_NESTED_KEYS:
             nested = node.get(key)
             if isinstance(nested, list):
-                entries.extend(item for item in nested if isinstance(item, dict))
+                queue.extend(item for item in nested if isinstance(item, dict))
             elif isinstance(nested, dict) and nested:
-                entries.append(nested)
+                queue.append(nested)
     return entries
 
 
@@ -500,33 +598,35 @@ def _story_items_from_feed_payload(data):
     return unique
 
 
-def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_header=""):
+def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_header="", *, scan_state=None):
     """
     Fetch the active 24h/日常 pack via mobile story endpoints.
 
     The follow-tab tray is /aweme/v1/story/feed/. Story25 (日常) also lives on
     /aweme/v1/new/story/feed/, /aweme/v2/new/story/feed/, and the profile
-    tab /aweme/v1/story/profile/list/. Returns (items, source) or (None, msg).
+    tab /aweme/v1/story/profile/list/. Returns a two-value result with explicit
+    ``complete`` metadata. [] means both author sources completed empty;
+    None means no items could be obtained from an incomplete author scan.
     """
     if not _check_mobile_signer():
-        return None, "mobile_story_feed: signer module not available"
+        return MobileStoryFeedResult(None, "mobile_story_feed: signer module not available",
+                                     complete=False, attempted=False, unavailable_reason="signer_unavailable")
     if not cookie_header:
         cookie_header = _mobile_cookie_header()
     if not cookie_header:
-        return None, "mobile_story_feed: no session cookies"
+        return MobileStoryFeedResult(None, "mobile_story_feed: no session cookies",
+                                     complete=False, attempted=False, unavailable_reason="login_required")
 
     numeric_uid = str(user_id or "").strip()
     if not numeric_uid.isdigit():
         numeric_uid = resolve_numeric_user_id(client, {"cookies": cookie_header}, sec_user_id)
     device_id, install_id = _persistent_mobile_device()
     own_uid = _mobile_device_profile().get("own_uid") or ""
+    continuation = _story_scan_state(scan_state, sec_user_id, cookie_header)
 
-    # 两组请求形态，语义完全不同，不能混在一起轮流试：
-    #  * profile_variants —— 按"作者"维度查（to_uid）。profile/list 给还在 TTL 内的
-    #    日常，story/feed 给更早的「历史日常」。两者是互补的，必须合并，不能谁先
-    #    命中就 return（以前正是这样，所以主页挂 3 条日常只拿得到 1 条）。
-    #  * tray_variants —— 按"观看者的关注页托盘"维度查（cursor/insert_ids）。返回的
-    #    是观看者好友的日常，只在作者维度整条链都失败时才兜底。
+    # Author requests and the viewer's following tray have different scopes.
+    # Merge the author endpoints; a failed/unfinished endpoint must leave the
+    # tray fallback available, with strict author verification on tray items.
     profile_variants = []
     tray_variants = []
     if numeric_uid.isdigit():
@@ -541,11 +641,8 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
             "delete_ids": "",
         }
         profile_variants.append((STORY_PROFILE_LIST_PATH, profile_extra))
-        # 历史日常（App 里「日常 → 历史日常作品」那个跳转页）。
-        # profile/list 只回 TTL 内那一条；用户翻到更早的日常时，App 走的是同一个
-        # story/feed，但按作者维度传 to_uid，而不是关注页托盘的 cursor 形态。
-        # 实测：带 to_uid 能拿到 profile/list 看不到的往期日常（is_24_story=1 /
-        # story_ttl=0 的归档条目）；带托盘参数则一条都拿不到。
+        # Contributor-provided author history request. Live endpoint checks
+        # confirm the response schema; older-item access is account-dependent.
         history_extra = {
             "to_uid": numeric_uid,
             "offset": "0",
@@ -571,69 +668,124 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
     last_message = "mobile_story_feed: no items"
     hosts = (MOBILE_API_HOST, "https://api3-social-m-lf.amemv.com")
 
-    # —— 第 1 组：作者维度，profile/list 与 story/feed 的结果合并 ——
     collected = []
     seen_ids = set()
-    answered_clean = False
+    completed_author_variants = 0
+    author_errors = []
+
+    def append_items(items, *, tray=False):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            author_sec = item_author_sec_uid(item)
+            author = item.get("author") or item.get("user") or {}
+            author_uid = str(author.get("uid") or "") if isinstance(author, dict) else ""
+            # A to_uid request supplies the author scope for unlabelled items.
+            # A viewer tray does not: unknown authors must never be attributed
+            # to the requested profile, even when insert_ids was supplied.
+            if author_sec and author_sec != sec_user_id:
+                continue
+            if author_uid and numeric_uid and author_uid != numeric_uid:
+                continue
+            if tray and not (author_sec == sec_user_id or
+                             (numeric_uid and author_uid == numeric_uid)):
+                continue
+            item_id = str(item.get("aweme_id") or item.get("group_id") or "")
+            if item_id and item_id in seen_ids:
+                continue
+            if item_id:
+                seen_ids.add(item_id)
+            collected.append(item)
+
+    # Both author sources must finish successfully before their empty result
+    # can suppress other sources. Each request follows only an explicitly
+    # returned next_offset; timestamp-to-offset mappings are not assumed.
     for path, extra in profile_variants:
         try_hosts = hosts if path == STORY_PROFILE_LIST_PATH else (MOBILE_API_HOST,)
-        for host in try_hosts:
-            try:
-                response = _mobile_signed_request(
-                    client,
-                    "GET",
-                    path,
-                    extra,
-                    cookie_header,
-                    device_id,
-                    install_id,
-                    host=host,
-                    full_sign=True,
-                )
-                data = response.json()
-            except InterruptedError:
-                raise
-            except Exception as exc:
-                last_message = f"mobile_story_feed: {host}{path}: {exc}"
-                continue
-            if not isinstance(data, dict):
-                continue
-            _raise_mobile_login_required(data)
-            status_code = data.get("status_code")
-            if status_code not in (0, None):
-                last_message = (
-                    f"mobile_story_feed: {path}: status_code={status_code} "
-                    f"{(data.get('status_msg') or data.get('message') or '')}"
-                )
-                continue
-            # status 0 是一次可信答复：这个变体不用再换 host 了。
-            answered_clean = True
-            items = _story_items_from_feed_payload(data)
-            if not items:
-                items = normalize_items(data)
-            if items:
-                for item in items:
-                    aweme_id = str(item.get("aweme_id") or item.get("group_id") or "")
-                    if aweme_id and aweme_id in seen_ids:
-                        continue
-                    if aweme_id:
-                        seen_ids.add(aweme_id)
-                    collected.append(item)
-            else:
-                last_message = f"{host}{path}: empty pack"
-            break
+        page_extra = dict(extra)
+        seen_offsets = {page_extra["offset"]}
+        resume_offset = _story_cursor(continuation["author_offsets"].get(path)) if continuation is not None else ""
+        if resume_offset == "0":
+            resume_offset = ""
+        complete = False
+        for page in range(15):
+            data = None
+            page_error = "invalid response"
+            for host in try_hosts:
+                try:
+                    response = _mobile_signed_request(
+                        client, "GET", path, page_extra, cookie_header,
+                        device_id, install_id, host=host, full_sign=True,
+                    )
+                    payload = response.json()
+                except (LoginRequiredError, InterruptedError):
+                    raise
+                except Exception as exc:
+                    page_error = str(exc)
+                    continue
+                if not isinstance(payload, dict):
+                    page_error = "invalid response"
+                    continue
+                _raise_mobile_login_required(payload)
+                if payload.get("status_code") != 0:
+                    page_error = (
+                        f"status_code={payload.get('status_code')} "
+                        f"{payload.get('status_msg') or payload.get('message') or ''}"
+                    ).strip()
+                    continue
+                data = payload
+                break
+            if data is None:
+                author_errors.append(f"{path}: {page_error}")
+                break
+            append_items(_story_items_from_feed_payload(data))
+            if not data.get("has_more", False):
+                active_data = data.get("active_data")
+                if isinstance(active_data, dict) and active_data.get("has_more", False):
+                    author_errors.append(f"{path}: no verified active pagination cursor")
+                    break
+                complete = True
+                if continuation is not None:
+                    continuation["author_offsets"].pop(path, None)
+                break
+            next_offset = data.get("next_offset")
+            if isinstance(next_offset, bool) or not isinstance(next_offset, (int, str)):
+                author_errors.append(f"{path}: no verified pagination cursor")
+                break
+            next_offset = _story_cursor(next_offset)
+            if not next_offset:
+                author_errors.append(f"{path}: invalid pagination cursor")
+                if continuation is not None:
+                    continuation["author_offsets"].pop(path, None)
+                break
+            if page == 0 and resume_offset:
+                next_offset = resume_offset
+            if next_offset in seen_offsets:
+                author_errors.append(f"{path}: repeated pagination cursor")
+                if continuation is not None:
+                    continuation["author_offsets"].pop(path, None)
+                break
+            if continuation is not None:
+                continuation["author_offsets"][path] = next_offset
+            if page == 14:
+                author_errors.append(f"{path}: page limit (15) reached")
+                break
+            seen_offsets.add(next_offset)
+            page_extra = {**page_extra, "offset": next_offset}
+            _cancel_wait(0.3)
+        if complete:
+            completed_author_variants += 1
 
-    if collected:
-        return collected, (
-            f"{MOBILE_API_HOST}{STORY_PROFILE_LIST_PATH} + {STORY_FEED_PATH} (profile 日常)"
-        )
+    author_source = f"{MOBILE_API_HOST}{STORY_PROFILE_LIST_PATH} + {STORY_FEED_PATH}"
+    author_complete = len(profile_variants) == 2 and completed_author_variants == 2
+    if author_complete:
+        if collected:
+            return MobileStoryFeedResult(collected, f"{author_source} (author endpoints complete)", complete=True)
+        return MobileStoryFeedResult([], f"{author_source} (author endpoints complete): empty pack", complete=True)
 
-    if answered_clean:
-        # profile/list 已经从作者维度给出干净答复：这个主页当前没有可见日常。
-        # 不要退回到关注页托盘，那会抓到观看者好友的日常，张冠李戴。
-        return None, f"{MOBILE_API_HOST}{STORY_PROFILE_LIST_PATH}: empty pack"
-
-    # —— 第 2 组：关注页托盘兜底（仅当作者维度整条链都没能给出答复）——
+    partial_source = f"{author_source} (partial author results: {'; '.join(author_errors) or 'numeric user_id unavailable'})"
+    # A partial author result must keep available, verified tray items and
+    # explicitly tell fetch_stories to continue its other fallbacks.
     for path, extra in tray_variants:
         try:
             response = _mobile_signed_request(
@@ -648,7 +800,7 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                 full_sign=True,
             )
             data = response.json()
-        except InterruptedError:
+        except (LoginRequiredError, InterruptedError):
             raise
         except Exception as exc:
             last_message = f"mobile_story_feed: {MOBILE_API_HOST}{path}: {exc}"
@@ -657,19 +809,18 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
             continue
         _raise_mobile_login_required(data)
         status_code = data.get("status_code")
-        if status_code not in (0, None):
+        if status_code != 0:
             last_message = (
                 f"mobile_story_feed: {path}: status_code={status_code} "
                 f"{(data.get('status_msg') or data.get('message') or '')}"
             )
             continue
-        items = _story_items_from_feed_payload(data)
-        if not items:
-            items = normalize_items(data)
-        if items:
-            return items, f"{MOBILE_API_HOST}{path}"
+        count_before = len(collected)
+        append_items(_story_items_from_feed_payload(data), tray=True)
+        if len(collected) > count_before:
+            return MobileStoryFeedResult(collected, f"{MOBILE_API_HOST}{path}; {partial_source}", complete=False)
         last_message = f"{MOBILE_API_HOST}{path}: empty pack"
-    return None, last_message
+    return MobileStoryFeedResult(collected or None, f"{partial_source}; {last_message}", complete=False)
 
 
 def fetch_stories_via_mobile_life_feed(client, sec_user_id, user_id="", cookie_header=""):
@@ -2432,10 +2583,11 @@ def map_config_strings(data, mapper):
 
 
 def load_json(path, fallback):
-    if not path.exists():
+    fs_path = _extended_path(path)
+    if not os.path.exists(fs_path):
         return fallback
     try:
-        with open(path, "r", encoding="utf-8-sig") as fh:
+        with open(fs_path, "r", encoding="utf-8-sig") as fh:
             return map_config_strings(json.load(fh), expand_portable_path)
     except InterruptedError:
         raise
@@ -2446,7 +2598,7 @@ def load_json(path, fallback):
         corrupt_name = path.with_suffix(path.suffix + f".corrupt-{int(time.time())}")
         logging.error("JSON file %s is corrupt (%s); quarantining to %s", path, exc, corrupt_name.name)
         try:
-            path.rename(corrupt_name)
+            os.rename(fs_path, _extended_path(corrupt_name))
         except InterruptedError:
             raise
         except OSError:
@@ -2455,18 +2607,33 @@ def load_json(path, fallback):
 
 
 def save_json(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=2)
-    tmp.replace(path)
+    os.makedirs(_extended_path(path.parent), exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+    temp_fs = _extended_path(tmp)
+    created = False
+    try:
+        # Exclusive creation avoids clobbering another writer's temporary
+        # file; replacement happens only after serialization has succeeded.
+        with open(temp_fs, "x", encoding="utf-8") as fh:
+            created = True
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(temp_fs, _extended_path(path))
+    finally:
+        if created:
+            try:
+                os.unlink(temp_fs)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logging.warning("Could not remove temporary JSON file %s", tmp.name)
 
 
-def safe_name(value, fallback="untitled"):
+def safe_name(value, fallback="untitled", max_chars=120):
     text = str(value or "").strip() or fallback
     text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text)
     text = re.sub(r"\s+", " ", text).strip(" .")
-    return (text or fallback)[:120]
+    text = text or fallback
+    return text if max_chars is None else text[:max_chars]
 
 
 def cookie_value(cookie_header, name):
@@ -2596,13 +2763,34 @@ def profile_has_active_story(client, profile, sec_user_id):
     return isinstance(user, dict) and user.get("story_tab_empty") is False
 
 
+_DOUYIN_SHARE_HOSTS = frozenset({
+    "douyin.com", "www.douyin.com", "live.douyin.com", "v.douyin.com",
+    "iesdouyin.com", "www.iesdouyin.com",
+})
+_PASTED_LINK_HOSTS = _DOUYIN_SHARE_HOSTS | {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
+
+
+def _trusted_link_parts(url, hosts):
+    try:
+        parsed = urllib.parse.urlparse(str(url or "").strip())
+        if (parsed.scheme.lower() not in ("http", "https")
+                or parsed.hostname not in hosts
+                or parsed.username is not None or parsed.password is not None
+                or parsed.port not in (None, 80, 443)):
+            return None
+        return parsed
+    except ValueError:
+        return None
+
+
 def extract_sec_uid_from_url(url):
-    # Both shapes occur in the wild: the web profile surface
-    # (``www.douyin.com/user/<sec_uid>``) and the share landing page that
-    # v.douyin.com short links redirect to
-    # (``www.iesdouyin.com/share/user/<sec_uid>``).
-    match = re.search(r"douyin\.com/(?:share/)?user/([^/?#]+)", url or "")
-    return urllib.parse.unquote(match.group(1)) if match else ""
+    """Read profile IDs only from trusted web and share landing-page URLs."""
+    parsed = _trusted_link_parts(url, _DOUYIN_SHARE_HOSTS - {"live.douyin.com", "v.douyin.com"})
+    if parsed is None:
+        return ""
+    path = urllib.parse.unquote(parsed.path)
+    match = re.fullmatch(r"/(?:share/)?user/([A-Za-z0-9_.-]+)/?", path)
+    return match.group(1) if match else ""
 
 
 async def resolve_profile_identity(profile):
@@ -2683,9 +2871,9 @@ def collect_video_urls(aweme):
 def collect_image_entries(aweme):
     """Return one entry per image-work item, still/动图 payloads side by side.
 
-    Each entry is ``{"url": <still image url>, "video_urls": [...],
-    "live_photo": bool}``. ``video_urls`` is non-empty for 动图 (Live Photo)
-    items, whose animated payload is served from ``images[i].video``. The
+    Entries preserve ``index``, ``url``, ``video_urls``, and ``live_photo``.
+    Declared motion without any URL remains visible as an incomplete asset.
+    Animated payloads are served from ``images[i].video``. The
     top-level ``aweme["video"]`` of such works is only the BGM (an .mp3), so it
     must never be used as a substitute for a missing animated payload.
     """
@@ -2693,14 +2881,13 @@ def collect_image_entries(aweme):
         return []
     images = aweme.get("images") or (aweme.get("image_post_info") or {}).get("images") or []
     entries = []
-    seen = set()
-    for image in images:
+    for index, image in enumerate(images, start=1):
         if not isinstance(image, dict):
             continue
         candidates = list(iter_url_list(image))
         for key in ("display_image", "download_url", "owner_watermark_image", "thumbnail"):
             candidates.extend(iter_url_list(image.get(key)))
-        candidates = [url for url in candidates if url and url not in seen]
+        candidates = [url for url in candidates if url]
         selected = ""
         if candidates:
             candidates.sort(
@@ -2711,14 +2898,16 @@ def collect_image_entries(aweme):
                 )
             )
             selected = candidates[0]
-            seen.add(selected)
-        video_urls = _video_urls_from_video(image.get("video"))
-        if not selected and not video_urls:
+        video = image.get("video")
+        live_photo = isinstance(video, dict) and bool(video)
+        video_urls = _video_urls_from_video(video)
+        if not selected and not live_photo:
             continue
         entries.append({
+            "index": index,
             "url": selected,
             "video_urls": video_urls,
-            "live_photo": bool(video_urls),
+            "live_photo": live_photo,
         })
     return entries
 
@@ -2794,14 +2983,15 @@ def _has_valid_media_file(path):
 #
 # Two independent defences now exist:
 #   1. _extended_path() wraps long paths in the Win32 extended-length prefix,
-#      which lifts the 260-char ceiling entirely, so captions no longer have to
-#      be truncated.
+#      which lifts the 260-unit path ceiling. Filename components still need
+#      a separate UTF-16 budget for the payload and temporary-write suffixes.
 #   2. aweme_filename() budgets the caption against the real base directory for
 #      callers that do not opt into extended paths (and as a safety net).
 _MAX_PATH_LEGACY = 260
 _PATH_LENGTH_BUDGET = 255   # stay clear of the 260 limit
 _PATH_TAIL_RESERVE = 32     # "_01.jpg"/".mp4" + ".part.<pid>.<8-hex>"
 _MAX_NAME_COMPONENT = 255   # NTFS per-component limit
+_PART_SUFFIX_RESERVE = len(".part.4294967295.12345678")
 
 
 def _extended_path(path):
@@ -2820,12 +3010,46 @@ def _extended_path(path):
     raw = str(path)
     if os.name != "nt" or raw.startswith("\\\\?\\"):
         return raw
-    if len(raw) < _MAX_PATH_LEGACY:
+    absolute = os.path.abspath(raw)
+    if _utf16_length(absolute) < _MAX_PATH_LEGACY:
         return raw
-    raw = os.path.abspath(raw)
+    raw = absolute
     if raw.startswith("\\\\"):                 # UNC share
         return "\\\\?\\UNC\\" + raw[2:]
     return "\\\\?\\" + raw
+
+
+def _utf16_length(value):
+    """Win32 and NTFS name limits count UTF-16 units, not Python characters."""
+    return sum(2 if ord(char) > 0xffff else 1 for char in str(value))
+
+
+def _truncate_utf16(value, budget):
+    used = 0
+    end = 0
+    for char in value:
+        size = 2 if ord(char) > 0xffff else 1
+        if used + size > budget:
+            break
+        used += size
+        end += 1
+    return value[:end]
+
+
+def _media_name_tail(aweme, suffix):
+    """Reserve the real payload suffix and both download/metadata temp names."""
+    if suffix:
+        payload_suffix = suffix
+    else:
+        images = aweme.get("images") or (aweme.get("image_post_info") or {}).get("images") or []
+        digits = max(2, len(str(len(images))))
+        if images:
+            payload_suffix = "_" + "9" * digits + ("_live.mp4" if collect_image_motion_urls(aweme) else ".jpg")
+        else:
+            payload_suffix = ".mp4"
+    # Reserve a full unsigned Win32 PID, so the saved name never changes when
+    # a later process happens to have more digits in its PID.
+    return _utf16_length(payload_suffix + ".json") + _PART_SUFFIX_RESERVE
 
 
 def _aweme_id_for_name(aweme):
@@ -2848,15 +3072,19 @@ def aweme_filename(aweme, suffix=".mp4", base_dir=None, include_id=True, keep_fu
     """Build the file name for a single item.
 
     ``include_id=False`` drops the aweme id, for layouts where the id already
-    names the parent directory.  ``keep_full_title=True`` keeps the caption
-    intact and leaves the 260-char ceiling to :func:`_extended_path` (the name
-    is still capped at NTFS' 255-char component limit).  Otherwise the caption is
+    names the parent directory. ``keep_full_title=True`` preserves as much of
+    the caption as NTFS' 255-unit component limit permits, including temporary
+    and sidecar suffixes. The path ceiling is handled by :func:`_extended_path`.
+    Otherwise the caption is
     budgeted against ``base_dir``; that 80-char fallback and the truncating
     default are kept so existing callers are unaffected.
     """
     aweme_id = _aweme_id_for_name(aweme)
     # FIX-D1: Use (x or {}) to handle share_info being JSON null.
-    desc = safe_name(aweme.get("desc") or (aweme.get("share_info") or {}).get("share_title") or aweme_id)
+    desc = safe_name(
+        aweme.get("desc") or (aweme.get("share_info") or {}).get("share_title") or aweme_id,
+        max_chars=None if keep_full_title else 120,
+    )
     try:
         stamp = datetime.fromtimestamp(int(aweme.get("create_time") or time.time())).strftime("%Y-%m-%d_%H-%M-%S")
     except InterruptedError:
@@ -2864,12 +3092,11 @@ def aweme_filename(aweme, suffix=".mp4", base_dir=None, include_id=True, keep_fu
     except (TypeError, ValueError, OSError):
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     prefix = f"{stamp}_{aweme_id}_" if include_id else f"{stamp}_"
+    component_budget = _MAX_NAME_COMPONENT - _utf16_length(prefix) - _media_name_tail(aweme, suffix)
     if keep_full_title:
         # The caller opted into extended-length paths; only the NTFS
         # per-component limit still applies.
-        budget = max(_MAX_NAME_COMPONENT - len(prefix) - len(suffix) - 1, 16)
-        if len(desc) > budget:
-            desc = desc[:budget].rstrip("_ ")
+        budget = component_budget
     elif base_dir is not None:
         # FIX-PATHLEN: budget the caption against the *real* base directory.
         # The old fixed 80-char cap assumed a ~95-char download root; a portable
@@ -2877,16 +3104,16 @@ def aweme_filename(aweme, suffix=".mp4", base_dir=None, include_id=True, keep_fu
         # "videos" level is ~135 chars, which made long-caption works fail.
         budget = max(
             _PATH_LENGTH_BUDGET
-            - len(str(base_dir))
+            - _utf16_length(str(base_dir))
             - 1                     # path separator
-            - len(prefix)
+            - _utf16_length(prefix)
             - _PATH_TAIL_RESERVE,
             16,
         )
-        if len(desc) > budget:
-            desc = desc[:budget].rstrip("_ ")
-    elif len(desc) > 80:
-        desc = desc[:80].rstrip("_ ")
+        budget = min(budget, component_budget)
+    else:
+        budget = min(80, component_budget)
+    desc = _truncate_utf16(desc, max(budget, 1)).rstrip("_ .") or "_"
     return f"{prefix}{desc}{suffix}"
 
 
@@ -2895,8 +3122,8 @@ def media_item_path(target_dir, aweme, suffix=".mp4", subdir_by_aweme_id=False, 
 
     ``subdir_by_aweme_id`` groups every payload of a work under
     ``<target_dir>/<aweme_id>/`` instead of prefixing each file name with the
-    id.  ``keep_full_title`` keeps the caption intact; the writable ceiling is
-    then handled by :func:`_extended_path` at I/O time.
+    id. ``keep_full_title`` keeps the caption up to the UTF-16 filename budget;
+    :func:`_extended_path` handles the full path at I/O time.
     """
     target_dir = Path(target_dir)
     if subdir_by_aweme_id:
@@ -2928,10 +3155,18 @@ def load_state(output_dir):
 def save_state(state_path, state):
     with MEDIA_STATE_LOCK:
         previous = load_json(state_path, {})
+        if not isinstance(previous, dict):
+            previous = {}
+        invalidated = state.get("_invalidated_download_ids") or {}
         for key in ("downloaded_video_ids", "downloaded_story_ids"):
-            state[key] = sorted(set(map(str, state.get(key, []))) | set(map(str, previous.get(key, []))))
+            merged = set(map(str, state.get(key, []))) | set(map(str, previous.get(key, [])))
+            state[key] = sorted(merged - set(map(str, invalidated.get(key, []))))
+        if "downloaded_aweme_ids" in state or "downloaded_aweme_ids" in previous:
+            state["downloaded_aweme_ids"] = list(state["downloaded_video_ids"])
         state["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        save_json(state_path, state)
+        persisted = {key: value for key, value in state.items() if key != "_invalidated_download_ids"}
+        save_json(state_path, persisted)
+        state.pop("_invalidated_download_ids", None)
 
 
 
@@ -3496,15 +3731,14 @@ def _extract_video_id(aweme):
 
 
 def _expected_live_photo_paths(target_dir, aweme, subdir_by_aweme_id=False, keep_full_title=True):
-    """Paths of the 动图 payloads (``<stem>_NN.mp4``) this work should own."""
+    """Paths of the motion clips, preserving each image's original index."""
     stem = media_item_path(
         target_dir, aweme, suffix="",
         subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title,
     )
     return [
-        Path(f"{stem}_{index:02d}.mp4")
-        for index, entry in enumerate(collect_image_entries(aweme), start=1)
-        if entry.get("video_urls")
+        Path(f"{stem}_{index:02d}_live.mp4")
+        for index, _urls in collect_image_motion_urls(aweme)
     ]
 
 
@@ -3526,28 +3760,26 @@ def _already_saved_media_file(output_path, image_urls, target_dir, aweme,
     """
     Return the on-disk file that proves this item was saved by an earlier run.
 
-    Video items live at output_path. Image works are written as
-    ``<stem>_01.jpg``, ``<stem>_02.jpg`` ... so the .mp4-shaped output_path
-    never exists for them; probe the first image instead. Live Photo (动图)
-    works additionally require every ``<stem>_NN.mp4`` payload, so a run that
-    predates animated-photo support still has its 动图 fetched. Returns None
-    when anything is missing (or only a zero-byte leftover).
+    Video items live at output_path. Every expected still and motion clip must
+    be valid before an album can be treated as complete.
     """
-    if image_urls:
-        first_image = Path(
-            f"{media_item_path(target_dir, aweme, suffix='', subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title)}_01.jpg"
-        )
-        if not _saved_file_exists(first_image):
-            return None
-        for live_path in _expected_live_photo_paths(
-            target_dir, aweme, subdir_by_aweme_id, keep_full_title
-        ):
-            if not _saved_file_exists(live_path):
-                return None
-        return first_image
-    if _saved_file_exists(output_path):
+    motion_paths = _expected_live_photo_paths(
+        target_dir, aweme, subdir_by_aweme_id, keep_full_title
+    )
+    if image_urls or motion_paths:
+        stem = media_item_path(target_dir, aweme, suffix="", subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title)
+        required = [Path(f"{stem}_{index:02d}.jpg") for index, _url in collect_indexed_image_urls(aweme)] + motion_paths
+        if required and all(_has_valid_media_file(path) for path in required):
+            return required[0]
+        return None
+    if _has_valid_media_file(output_path):
         return output_path
     return None
+
+
+def _save_media_metadata(path, data):
+    """Atomically save a sidecar using the same long-path and name budget."""
+    save_json(path, data)
 
 
 def download_aweme_items(
@@ -3569,6 +3801,7 @@ def download_aweme_items(
     download_kwargs = {"extra_headers": {"Cookie": cookies}} if cookies else {}
     state_key = "downloaded_story_ids" if media_kind == "story" else "downloaded_video_ids"
     downloaded_ids = set(str(item) for item in state.get(state_key, []))
+    invalidated_ids = state.setdefault("_invalidated_download_ids", {}).setdefault(state_key, set())
     default_target_dir = Path(output_dir) / ("stories" if media_kind == "story" else "videos")
     total_items = len(items)
     report_progress(
@@ -3588,11 +3821,7 @@ def download_aweme_items(
         if not aweme_id:  # FIX-3.3: only fall back to group_id when aweme_id is truly absent
             aweme_id = str(aweme.get("group_id") or "")
         image_motion_urls = collect_image_motion_urls(aweme)
-        image_url_entries = (
-            collect_indexed_image_urls(aweme)
-            if image_motion_urls
-            else list(enumerate(collect_image_urls(aweme), start=1))
-        )
+        image_url_entries = collect_indexed_image_urls(aweme)
         image_urls = [url for _index, url in image_url_entries]
         target_dir = (
             Path(output_dir) / "images"
@@ -3600,16 +3829,17 @@ def download_aweme_items(
             else default_target_dir
         )
         stem = media_item_path(target_dir, aweme, suffix="", subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title)
-        # Older versions marked Live Photos complete after saving only stills.
-        # Check their required files so missing clips can be added on upgrade.
-        image_asset_paths = [Path(f"{stem}_{index:02d}.jpg")
-                             for index, _url in image_url_entries]
-        motion_asset_paths = [Path(f"{stem}_{index:02d}_live.mp4")
-                              for index, _urls in image_motion_urls]
-        if (aweme_id and aweme_id in downloaded_ids
-                and (not image_motion_urls or all(_has_valid_media_file(path)
-                     for path in image_asset_paths + motion_asset_paths))):
+        output_path = media_item_path(target_dir, aweme, subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title)
+        # IDs describe successful earlier runs; files can be moved or damaged.
+        # Recheck every album asset, and reuse the valid ones during repairs.
+        existing_media = _already_saved_media_file(
+            output_path, image_urls, target_dir, aweme, subdir_by_aweme_id, keep_full_title
+        )
+        if existing_media is not None:
             result.skipped += 1
+            if aweme_id:
+                downloaded_ids.add(aweme_id)
+                invalidated_ids.discard(aweme_id)
             if result.skipped % 25 == 0 or item_index == total_items:
                 report_progress(
                     progress_callback,
@@ -3622,13 +3852,14 @@ def download_aweme_items(
                     failed=result.failed,
                 )
             continue
-        if image_motion_urls:
-            downloaded_ids.discard(aweme_id)
+        downloaded_ids.discard(aweme_id)
+        if aweme_id:
+            invalidated_ids.add(aweme_id)
         # Image works (notably aweme_type 68) expose their BGM through
         # video.play_addr. Live Photo motion is in each image's own video.
         video_urls = [] if image_urls or image_motion_urls else collect_video_urls(aweme)
         local_media = Path(str(aweme.get("_local_media_path") or ""))
-        if not video_urls and not image_urls and not image_motion_urls and not (local_media.is_file() and local_media.stat().st_size > 0):
+        if not video_urls and not image_urls and not image_motion_urls and not _saved_file_exists(local_media):
             result.failed += 1
             report_progress(
                 progress_callback,
@@ -3641,39 +3872,25 @@ def download_aweme_items(
                 failed=result.failed,
             )
             continue
-        output_path = media_item_path(target_dir, aweme, subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title)
         item_label = safe_name(
             aweme.get("desc")
             or (aweme.get("share_info") or {}).get("share_title")
             or aweme_id
             or output_path.stem
         )[:56]
-        if not image_motion_urls and output_path.exists() and output_path.stat().st_size > 0:
-            result.skipped += 1
-            if aweme_id:
-                downloaded_ids.add(aweme_id)
-            if result.skipped % 25 == 0 or item_index == total_items:
-                report_progress(
-                    progress_callback,
-                    phase="downloading",
-                    media_kind=media_kind,
-                    current=item_index,
-                    total=total_items,
-                    downloaded=result.downloaded,
-                    skipped=result.skipped,
-                    failed=result.failed,
-                )
-            continue
-        if not image_motion_urls and output_path.exists():
-            output_path.unlink(missing_ok=True)
+        if not image_urls and not image_motion_urls:
+            try:
+                os.unlink(_extended_path(output_path))
+            except FileNotFoundError:
+                pass
         saved = False
         saved_files = []
         local_media = Path(str(aweme.get("_local_media_path") or ""))
-        if not image_motion_urls and local_media.is_file() and local_media.stat().st_size > 0:
+        if not image_urls and not image_motion_urls and _saved_file_exists(local_media):
             try:
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(local_media, output_path)
-                saved = output_path.stat().st_size > 0
+                os.makedirs(_extended_path(output_path.parent), exist_ok=True)
+                shutil.copy2(_extended_path(local_media), _extended_path(output_path))
+                saved = _has_valid_media_file(output_path)
                 if saved:
                     saved_files.append(output_path)
             except InterruptedError:
@@ -3770,7 +3987,7 @@ def download_aweme_items(
             _image_failures = 0  # FIX-3.2: track partial image set failures
             for progress_index, (index, url) in enumerate(image_url_entries, start=1):
                 image_path = Path(f"{stem}_{index:02d}.jpg")
-                if image_motion_urls and _has_valid_media_file(image_path):
+                if _has_valid_media_file(image_path):
                     saved = True
                     saved_files.append(image_path)
                     continue
@@ -3870,17 +4087,19 @@ def download_aweme_items(
             continue
         meta_path = saved_files[0].with_suffix(saved_files[0].suffix + ".json")
         if save_metadata_json:
-            save_json(meta_path, aweme)
+            _save_media_metadata(meta_path, aweme)
         result.downloaded += 1
         result.files.extend(str(path) for path in saved_files)
         if aweme_id:
             downloaded_ids.add(aweme_id)
+            invalidated_ids.discard(aweme_id)
         # FIX-3.1: Periodic state save every 10 downloads to prevent full
         # re-download if the process crashes mid-loop.
         if result.downloaded % 10 == 0:
             state[state_key] = sorted(downloaded_ids)
             _periodic_state_path = Path(output_dir) / "douyin_media_state.json"
             save_state(_periodic_state_path, state)
+            invalidated_ids = state.setdefault("_invalidated_download_ids", {}).setdefault(state_key, set())
         report_progress(
             progress_callback,
             phase="downloading",
@@ -4168,58 +4387,57 @@ def fetch_stories_via_emulator(sec_user_id, user_id=""):
     return [aweme], "emulator://story25"
 
 
-def fetch_stories(client, profile, sec_user_id, user_id=""):
+def fetch_stories(client, profile, sec_user_id, user_id="", *, scan_state=None):
     last_message = ""
     supported = False
     supported_message = ""
     mobile_cookie = _profile_cookie_header(profile)
 
-    # 1) Mobile post API — 作品流里的"疑似日常"，只作最后的兜底。
-    #    NOTE: 这一级的判定是启发式的（is_time_limited_story）：普通图文作品只要
-    #    身上带一个含 story/moment 的字段就会被算成日常——实测某主页 2 条 2024 年
-    #    的图文作品就是这样被收进 stories/ 的。所以它**不能**再像以前那样"命中即
-    #    return"：那会把真正的 24h/日常 接口（第 2~7 级）整条挡在门外，表现就是
-    #    "主页明明挂着日常，程序却一条都抓不到"。这里只把它暂存，等所有真实
-    #    story 接口都试过仍无结果时，再作为兜底返回。
-    post_fallback = []
-    post_fallback_source = ""
-    try:
-        mobile_items, mobile_source = fetch_stories_via_mobile_post_api(
-            client, sec_user_id, cookie_header=mobile_cookie,
-        )
-        if mobile_items:
-            items = _filter_story_items(
-                mobile_items,
-                sec_user_id,
-                require_story_marker=True,
-                require_author_match=True,
-            )
-            if items:
-                post_fallback = items
-                post_fallback_source = mobile_source
-                logging.info(
-                    "story step1 (post feed) held %d candidate(s) as fallback: %s",
-                    len(items),
-                    [str(i.get("aweme_id") or "") for i in items],
-                )
-        if mobile_source and "not available" not in mobile_source:
-            last_message = mobile_source
-    except LoginRequiredError:
-        raise
-    except InterruptedError:
-        raise
-    except Exception as exc:
-        last_message = f"mobile_post_api: {exc}"
+    partial_items = []
+    partial_source = ""
+    author_scan_complete = True
+    author_empty_source = ""
+    unavailable_reason = ""
+    capability_source = ""
 
-    # 2) Mobile story/feed — the actual 24h/日常 tray. Web cookies plus a
-    #    signed request can still return a pack when insert_ids is set.
+    def merge_partial(items):
+        merged = []
+        seen_ids = set()
+        for item in [*partial_items, *items]:
+            item_id = str(item.get("aweme_id") or item.get("group_id") or "")
+            if item_id and item_id in seen_ids:
+                continue
+            if item_id:
+                seen_ids.add(item_id)
+            merged.append(item)
+        return merged
+
+    def source_with_partial(source):
+        return f"{source}; {partial_source}" if partial_source else source
+
+    def result(items, source, is_supported, *, complete=True):
+        return StoryFetchResult(items, source, is_supported,
+                                complete=complete and author_scan_complete,
+                                unavailable_reason=unavailable_reason if not items else "")
+
+    # Query actual story sources before scanning the ordinary post feed.
     try:
-        feed_items, feed_source = fetch_stories_via_mobile_story_feed(
+        feed_result = fetch_stories_via_mobile_story_feed(
             client,
             sec_user_id,
             user_id=user_id,
             cookie_header=mobile_cookie,
+            **({"scan_state": scan_state} if scan_state is not None else {}),
         )
+        feed_items, feed_source = feed_result
+        feed_complete = getattr(feed_result, "complete", True)
+        feed_attempted = getattr(feed_result, "attempted", True)
+        author_scan_complete = feed_complete or not feed_attempted
+        if not feed_attempted:
+            unavailable_reason = getattr(feed_result, "unavailable_reason", "")
+            capability_source = feed_source
+        elif not feed_complete:
+            partial_source = feed_source
         if feed_items:
             items = _filter_story_items(
                 feed_items,
@@ -4235,12 +4453,18 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
                     and item_author_sec_uid(item) in ("", sec_user_id)
                 ]
             if items:
-                return items, feed_source, True
+                if not feed_complete:
+                    partial_items = items
+                else:
+                    return result(items, feed_source, True)
         if feed_source:
             last_message = feed_source
             logging.info("story step2 (mobile story feed): %s", feed_source)
-            if STORY_PROFILE_LIST_PATH in feed_source and "empty pack" in feed_source:
-                return [], feed_source, True
+            if feed_complete and feed_items == []:
+                # These author endpoints are empty, but retained stories may
+                # still exist only in the explicitly classified post feed.
+                author_empty_source = feed_source
+                supported = True
             if "empty pack" in feed_source or feed_source.startswith("http"):
                 supported = True
                 supported_message = feed_source
@@ -4250,6 +4474,8 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
         raise
     except Exception as exc:
         last_message = f"mobile_story_feed: {exc}"
+        author_scan_complete = False
+        partial_source = last_message
 
     # 3) Signed mobile life/feed POST — this is the real 24h pack API.
     try:
@@ -4274,7 +4500,7 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
                     and item_author_sec_uid(item) in ("", sec_user_id)
                 ]
             if items:
-                return items, life_source, True
+                return result(merge_partial(items), source_with_partial(life_source), True)
         if life_source:
             last_message = life_source
             logging.info("story step3 (mobile life feed): %s", life_source)
@@ -4317,7 +4543,8 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
                 and item_author_sec_uid(item) in ("", sec_user_id)
             ]
         if items:
-            return items, life_source if life_source.startswith("http") else LIFE_FEED_PATH, True
+            source = life_source if life_source.startswith("http") else LIFE_FEED_PATH
+            return result(merge_partial(items), source_with_partial(source), True)
         message = life_source if "no active" in life_source else f"{LIFE_FEED_PATH}: no active visible stories"
         last_message = message
         supported_message = message
@@ -4356,7 +4583,7 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
                 require_author_match=True,
             )
         if items:
-            return items, path, True
+            return result(merge_partial(items), source_with_partial(path), True)
         if data:
             message = f"{path}: no active visible stories"
             last_message = message
@@ -4395,7 +4622,7 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
                         and item_author_sec_uid(item) in ("", sec_user_id)
                     ]
                 if items:
-                    return items, browser_source, True
+                    return result(merge_partial(items), source_with_partial(browser_source), True)
             if browser_source:
                 last_message = browser_source
         except LoginRequiredError:
@@ -4405,20 +4632,60 @@ def fetch_stories(client, profile, sec_user_id, user_id=""):
         except Exception as exc:
             last_message = f"browser_story: {exc}"
 
-    # 7) Last resort — the post-feed heuristic candidates collected in step 1.
-    #    Only served when every real story endpoint came back empty, so the
-    #    heuristic can no longer mask the real 24h/日常 APIs (that is exactly
-    #    what made "主页有日常却抓不到" happen before).
+    if partial_items:
+        return result(partial_items, partial_source, True, complete=False)
+
+    # Only scan post-feed candidates after all actual story sources have been
+    # tried. The v1.2.7 classifier retains explicit historical story markers
+    # while rejecting old ordinary videos whose only marker is story_ttl.
+    post_fallback = []
+    post_fallback_source = ""
+    post_complete = False
+    post_incomplete_source = ""
+    try:
+        post_result = fetch_stories_via_mobile_post_api(
+            client, sec_user_id, cookie_header=mobile_cookie,
+            **({"scan_state": scan_state} if scan_state is not None else {}),
+        )
+        mobile_items, mobile_source = post_result
+        post_attempted = getattr(post_result, "attempted", True)
+        post_complete = getattr(post_result, "complete", True) or not post_attempted
+        if not post_attempted:
+            unavailable_reason = unavailable_reason or getattr(post_result, "unavailable_reason", "")
+            capability_source = capability_source or mobile_source
+        elif not post_complete:
+            post_incomplete_source = mobile_source
+        if mobile_items:
+            post_fallback = _filter_story_items(
+                mobile_items, sec_user_id, require_story_marker=True,
+                require_author_match=True,
+            )
+            post_fallback_source = mobile_source
+        if mobile_source and "not available" not in mobile_source:
+            last_message = mobile_source
+    except (LoginRequiredError, InterruptedError):
+        raise
+    except Exception as exc:
+        last_message = f"mobile_post_api: {exc}"
+        post_incomplete_source = last_message
+
     if post_fallback:
         logging.info(
             "story fallback: serving %d post-feed candidate(s) after all real endpoints failed",
             len(post_fallback),
         )
-        return post_fallback, f"{post_fallback_source} (post-feed fallback)", True
+        return result(post_fallback, source_with_partial(f"{post_fallback_source} (post-feed fallback)"),
+                      True, complete=post_complete)
 
     if ring_active:
-        return [], MOBILE_ONLY_STORY_MESSAGE, False
-    return [], supported_message or last_message or "No supported story endpoint returned items", supported
+        if author_empty_source and author_scan_complete and post_complete:
+            return result([], author_empty_source, True)
+        return result([], source_with_partial(post_incomplete_source or MOBILE_ONLY_STORY_MESSAGE),
+                      False, complete=post_complete)
+    message = (post_incomplete_source or partial_source or capability_source or author_empty_source or
+               supported_message or last_message or "No supported story endpoint returned items")
+    return result([], source_with_partial(message) if post_incomplete_source else message,
+                  supported, complete=post_complete)
 
 
 def result_to_dict(result):
@@ -4656,12 +4923,14 @@ def _download_profile(
         if stories:
             try:
                 report_progress(progress_callback, phase="checking_stories", media_kind="story")
-                story_items, story_source, story_supported = fetch_stories(
+                story_fetch = fetch_stories(
                     client,
                     profile,
                     identity["sec_user_id"],
                     user_id=identity.get("user_id") or "",
+                    scan_state=state,
                 )
+                story_items, story_source, story_supported = story_fetch
                 result = download_aweme_items(
                     client,
                     profile,
@@ -4674,8 +4943,14 @@ def _download_profile(
                     keep_full_title=keep_full_title,
                     save_metadata_json=save_metadata_json,
                 )
-                if story_items:
+                if not getattr(story_fetch, "complete", True):
+                    result.status = "partial"
+                elif story_items:
                     result.status = "ok"
+                elif getattr(story_fetch, "unavailable_reason", "") == "login_required":
+                    result.status = "login_required"
+                elif getattr(story_fetch, "unavailable_reason", "") == "signer_unavailable":
+                    result.status = "unavailable"
                 elif story_source == MOBILE_ONLY_STORY_MESSAGE:
                     result.status = "mobile_only"
                 elif story_supported:
@@ -4728,8 +5003,10 @@ def extract_url_from_text(text):
 
 # Bare host without a scheme, as pasted by some clients (``v.douyin.com/xxx``).
 _SHARE_HOST_RE = re.compile(
-    r"(?:v\.douyin\.com|live\.douyin\.com|(?:www\.)?douyin\.com|(?:www\.)?iesdouyin\.com)"
-    r"/[^\s\u4e00-\u9fff\"'<>]+"
+    r"(?<![A-Za-z0-9_.@:/-])"
+    r"(?:v\.douyin\.com|live\.douyin\.com|(?:www\.)?douyin\.com|(?:www\.)?iesdouyin\.com|"
+    r"(?:www\.|m\.)?youtube\.com|youtu\.be)/[^\s\u4e00-\u9fff\"'<>]+",
+    re.IGNORECASE,
 )
 
 
@@ -4745,11 +5022,19 @@ def normalize_pasted_link(text):
     exactly what happened when it was typed into the "live/profile URL" field.
     Returns "" when no link is present at all.
     """
-    url = extract_url_from_text(text)
-    if url:
-        return url
-    match = _SHARE_HOST_RE.search(text or "")
-    return f"https://{match.group(0)}" if match else ""
+    matches = list(re.finditer(r"https?://[^\s\u4e00-\u9fff\"'<>]+", text or "", re.IGNORECASE))
+    for match in matches:
+        url = match.group(0).rstrip(".,;!?)]}\u3002\uff0c\uff09\uff01")
+        if _trusted_link_parts(url, _PASTED_LINK_HOSTS):
+            return url
+    # Do not reinterpret a substring of an untrusted full URL as a bare host.
+    if matches:
+        return ""
+    for match in _SHARE_HOST_RE.finditer(text or ""):
+        url = f"https://{match.group(0)}".rstrip(".,;!?)]}\u3002\uff0c\uff09\uff01")
+        if _trusted_link_parts(url, _PASTED_LINK_HOSTS):
+            return url
+    return ""
 
 
 def canonical_douyin_profile_url(url):
@@ -4768,29 +5053,39 @@ def expand_douyin_short_link(url, timeout=10):
 
     Short links carry no hint of what they point at, so the caller cannot tell a
     profile from a live room until the redirect chain is walked. Returns the
-    input unchanged when it is already concrete, is not a trusted share link, or
-    the chain cannot be followed.
+    input unchanged when it is already concrete or is not a trusted short link.
+    A failed short-link request raises a redacted error instead of passing an
+    unresolved link to the live-room API.
     """
     target = (url or "").strip()
     if not target:
         return ""
-    if extract_aweme_id(target) or extract_sec_uid_from_url(target):
-        return target
-    if not is_safe_share_link_url(target):
+    parsed = _trusted_link_parts(target, {"v.douyin.com"})
+    if parsed is None:
         return target
     try:
         try:
-            timeout = max(2, int(timeout))
+            timeout = min(30, max(2, int(timeout)))
         except (TypeError, ValueError):
             timeout = 10
         limits = httpx.Timeout(timeout, connect=min(8, timeout), read=timeout, write=timeout, pool=timeout)
-        with httpx.Client(timeout=limits, follow_redirects=False, http2=False) as client:
-            response = follow_safe_redirects(client, target, url_validator=is_safe_share_link_url)
-        return str(response.url) or target
+        def public_request(request):
+            request.headers.pop("Cookie", None)
+
+        def trusted_redirect(candidate):
+            return bool(_trusted_link_parts(candidate, _DOUYIN_SHARE_HOSTS)) and is_safe_share_link_url(candidate)
+
+        with httpx.Client(timeout=limits, follow_redirects=False, http2=False,
+                          event_hooks={"request": [public_request]}) as client:
+            response = follow_safe_redirects(client, target, url_validator=trusted_redirect, max_hops=5)
+        resolved = str(response.url)
+        if response.is_redirect or not trusted_redirect(resolved) or resolved == target:
+            raise RuntimeError("Unresolved share link")
+        return resolved
     except InterruptedError:
         raise
     except Exception:
-        return target
+        raise RuntimeError("Could not resolve the Douyin share link; please try again or paste the full profile/live URL") from None
 
 
 def extract_aweme_id(url):

@@ -298,10 +298,18 @@ def map_config_strings(data, mapper):
 
 
 def detect_platform(url):
-    lowered = (url or "").lower()
-    if "youtube.com" in lowered or "youtu.be" in lowered:
+    try:
+        parsed = urlparse(str(url or "").strip())
+        if (parsed.scheme.lower() not in {"http", "https"}
+                or parsed.username is not None or parsed.password is not None
+                or parsed.port not in (None, 80, 443)):
+            return "unknown"
+        host = parsed.hostname
+    except ValueError:
+        return "unknown"
+    if host in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}:
         return "youtube"
-    if "douyin.com" in lowered:
+    if host in {"douyin.com", "www.douyin.com", "live.douyin.com", "v.douyin.com", "iesdouyin.com", "www.iesdouyin.com"}:
         return "douyin"
     return "unknown"
 
@@ -2627,9 +2635,9 @@ class MediaDownloadEngine:
         label = t("works") if key == "videos" else (t("stories") if key == "stories" else key.capitalize())
         if status == "disabled":
             return ""
-        if status == "ok":
+        if status in {"ok", "partial"}:
             return t(
-                "summary_ok",
+                "summary_partial" if status == "partial" else "summary_ok",
                 label=label,
                 downloaded=result.get("downloaded", 0),
                 skipped=result.get("skipped", 0),
@@ -2825,16 +2833,19 @@ class ProfileDialog(Toplevel):
 
         self.url_var = StringVar(value=self.profile.get("url", ""))
         existing_profile_url = self.profile.get("original_profile_url", "")
-        if not existing_profile_url and "douyin.com/user/" in self.profile.get("url", ""):
-            existing_profile_url = self.profile.get("url", "").split("?", 1)[0]
+        if not existing_profile_url:
+            existing_profile_url = canonical_douyin_profile_url(self.profile.get("url", ""))
         self.profile_url_var = StringVar(value=existing_profile_url)
         self.name_var = StringVar(value=self.profile.get("name", ""))
         self.output_var = StringVar(value=self.profile.get("output_dir", ""))
         initial_quality = str(self.profile.get("quality", self.store.settings["quality"])).upper()
         self.quality_var = StringVar(value=initial_quality if initial_quality in QUALITY_OPTIONS else "OD")
-        self.resolve_result_queue = queue.Queue()
+        self.resolve_result_queue = queue.Queue(maxsize=1)
         self.resolving = False
         self.resolve_after_id = None
+        self.resolve_request_id = 0
+        self.save_requested_url = ""
+        self.closed = False
         self.interval_var = StringVar(
             value=str(self.profile.get(
                 "poll_interval_seconds",
@@ -2932,10 +2943,20 @@ class ProfileDialog(Toplevel):
             return None
         quality = self.quality_var.get() or self.store.settings["quality"]
         existing_name = self.name_var.get().strip()
+        self.resolve_request_id += 1
+        request_id = self.resolve_request_id
+        result_queue = self.resolve_result_queue
+        # The worker owns plain snapshots and a queue, never a Tk widget or
+        # Variable. It can finish safely after the dialog has been destroyed.
+        context = SimpleNamespace(
+            store=SimpleNamespace(settings=dict(self.store.settings)),
+            profile=dict(self.profile),
+        )
         self.resolving = True
         self.resolve_button.configure(text=t("resolving"), state="disabled")
 
         def worker():
+            result = {"request_id": request_id, "source_url": url, "show_errors": show_errors}
             try:
                 # A v.douyin.com short link hides its target, so walk the
                 # redirect before deciding what we are looking at.
@@ -2945,32 +2966,39 @@ class ProfileDialog(Toplevel):
                     # A profile link is a perfectly usable monitor target on its
                     # own; there is no live room to look up. Probing the live API
                     # with one only produced a misleading "service busy" error.
-                    self.resolve_result_queue.put({
+                    result.update({
                         "ok": True,
                         "mode": "profile",
                         "profile_url": resolved_profile,
                         "url": resolved_profile,
                         "source_url": url,
                     })
-                    return
-                if platform == "youtube":
-                    room, stream = self.resolve_youtube(resolved_url, existing_name)
                 else:
-                    room, stream = asyncio.run(self.resolve_room(resolved_url, quality))
-                self.resolve_result_queue.put({
-                    "ok": True,
-                    "room": room,
-                    "stream": stream,
-                    "url": resolved_url,
-                    "platform": platform,
-                })
+                    if detect_platform(resolved_url) != platform:
+                        raise RuntimeError(t("invalid_url"))
+                    if platform == "douyin" and re.match(r"/(?:share/)?(?:video|note)/", urlparse(resolved_url).path):
+                        raise RuntimeError(t("enter_url_short"))
+                    if platform == "youtube":
+                        room, stream = ProfileDialog.resolve_youtube(context, resolved_url, existing_name)
+                    else:
+                        room, stream = asyncio.run(ProfileDialog.resolve_room(context, resolved_url, quality))
+                    result.update({
+                        "ok": True,
+                        "room": room,
+                        "stream": stream,
+                        "url": resolved_url,
+                        "platform": platform,
+                    })
             except Exception as exc:
-                self.resolve_result_queue.put({"ok": False, "error": str(exc), "show_errors": show_errors})
+                result.update({"ok": False, "error": str(exc)})
+            result_queue.put_nowait(result)
 
         threading.Thread(target=worker, name="profile-link-resolver", daemon=True).start()
         return None
 
     def process_resolve_results(self):
+        if self.closed:
+            return
         try:
             result = self.resolve_result_queue.get_nowait()
         except queue.Empty:
@@ -2978,7 +3006,16 @@ class ProfileDialog(Toplevel):
         if result is not None:
             self.resolving = False
             self.resolve_button.configure(text=t("resolve"), state="normal")
-            if not result.get("ok"):
+            source_url = result.get("source_url", "")
+            current_url = normalize_pasted_link(self.url_var.get().strip())
+            if result.get("request_id") != self.resolve_request_id or source_url != current_url:
+                # Editing the target while a request runs invalidates its result.
+                # A pending Save can resolve the new target once the one worker
+                # has finished; repeated clicks never create additional workers.
+                if self.save_requested_url and current_url == self.save_requested_url:
+                    self.resolve_link()
+            elif not result.get("ok"):
+                self.save_requested_url = ""
                 if result.get("show_errors"):
                     messagebox.showerror(t("resolve_failed"), result.get("error") or t("unknown_error"), parent=self)
             else:
@@ -2999,10 +3036,16 @@ class ProfileDialog(Toplevel):
                 self.name_var.set(name)
                 if not self.output_var.get().strip():
                     self.output_var.set(str(ROOT_DOWNLOAD_DIR / safe_name(name).rstrip(" .")))
-        if self.winfo_exists():
+                if self.save_requested_url == source_url:
+                    self.save_requested_url = ""
+                    self.save()
+        if not self.closed and self.winfo_exists():
             self.resolve_after_id = self.after(100, self.process_resolve_results)
 
     def destroy(self):
+        self.closed = True
+        self.save_requested_url = ""
+        self.resolve_request_id = getattr(self, "resolve_request_id", 0) + 1
         after_id = getattr(self, "resolve_after_id", None)
         if after_id:
             try:
@@ -3036,15 +3079,13 @@ class ProfileDialog(Toplevel):
         raw = self.url_var.get().strip()
         # Never persist a raw share blob. Extract the link, then canonicalize it
         # so live/media polling can actually use it.
-        url = normalize_pasted_link(raw) or raw
-        if url != raw:
+        url = normalize_pasted_link(raw)
+        if url and url != raw:
             self.url_var.set(url)
-        if url and detect_platform(url) == "douyin":
-            # Only short links hit the network here; concrete URLs return as-is.
-            profile_url = canonical_douyin_profile_url(expand_douyin_short_link(url, timeout=6))
-            if profile_url:
-                url = profile_url
-                self.url_var.set(url)
+        profile_url = canonical_douyin_profile_url(url)
+        if profile_url:
+            url = profile_url
+            self.url_var.set(url)
         name = self.name_var.get().strip()
         platform = detect_platform(url)
         if not url:
@@ -3053,26 +3094,32 @@ class ProfileDialog(Toplevel):
         if platform not in ("douyin", "youtube"):
             messagebox.showerror(t("invalid_url"), t("enter_url_short"))
             return
-        if not name:
-            # Saving must never block the Tk event loop on a network request.
-            # The explicit Resolve button performs that work in a background thread.
-            name = fallback_name_from_url(url)
-            self.name_var.set(name)
-            if not self.output_var.get().strip():
-                self.output_var.set(str(ROOT_DOWNLOAD_DIR / safe_name(name).rstrip(" .")))
-        output_dir = self.output_var.get().strip() or str(ROOT_DOWNLOAD_DIR / safe_name(name).rstrip(" ."))
-        original_profile_url = self.profile_url_var.get().strip()
-        if platform == "douyin" and not original_profile_url:
-            # Covers the canonical /user/<sec_uid> shape as well as a
-            # share/user landing page that the canonicalizer can normalize.
-            original_profile_url = canonical_douyin_profile_url(url) or (
-                url.split("?", 1)[0] if "douyin.com/user/" in url else ""
-            )
+        if (platform == "douyin" and urlparse(url).hostname != "v.douyin.com"
+                and re.match(r"/(?:share/)?(?:video|note)/", urlparse(url).path)):
+            messagebox.showerror(t("invalid_url"), t("enter_url_short"))
+            return
         try:
             poll_interval = max(15, int(self.interval_var.get()))
             media_interval = max(60, int(self.media_interval_var.get()))
         except ValueError:
             messagebox.showerror(t("invalid_interval"), t("intervals_numbers"))
+            return
+        if platform == "douyin" and urlparse(url).hostname == "v.douyin.com":
+            self.save_requested_url = url
+            self.resolve_link()
+            return
+        if not name:
+            # Saving must never block the Tk event loop on a network request.
+            # Concrete URLs can use a local fallback without resolving a room.
+            name = fallback_name_from_url(url)
+            self.name_var.set(name)
+            if not self.output_var.get().strip():
+                self.output_var.set(str(ROOT_DOWNLOAD_DIR / safe_name(name).rstrip(" .")))
+        output_dir = self.output_var.get().strip() or str(ROOT_DOWNLOAD_DIR / safe_name(name).rstrip(" ."))
+        raw_profile_url = self.profile_url_var.get().strip()
+        original_profile_url = canonical_douyin_profile_url(raw_profile_url) or profile_url
+        if platform == "douyin" and raw_profile_url and not canonical_douyin_profile_url(raw_profile_url):
+            messagebox.showerror(t("invalid_url"), t("enter_url_short"))
             return
         self.result = {
             "id": self.profile.get("id", str(uuid.uuid4())),
