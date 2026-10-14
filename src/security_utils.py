@@ -226,8 +226,8 @@ def stream_safe_redirects(client, url, *, url_validator, headers=None, max_hops=
             response.close()
 
 
-def resolve_trusted_executable(path_text, *, allowed_basenames=None, trusted_roots=()):
-    """Resolve ffmpeg / yt-dlp paths to an existing file under trusted roots."""
+def resolve_trusted_executable(path_text, *, allowed_basenames=None, trusted_roots=(), allow_missing=False):
+    """Resolve a trusted tool path; optionally accept a not-yet-installed tool."""
     allowed = {name.lower() for name in (allowed_basenames or _TRUSTED_TOOL_BASENAMES)}
     raw = str(path_text or "").strip()
     if not raw:
@@ -246,10 +246,10 @@ def resolve_trusted_executable(path_text, *, allowed_basenames=None, trusted_roo
 
     if candidate.name.lower() not in allowed:
         raise ValueError(f"Executable must be one of: {', '.join(sorted(allowed))}")
-    if not candidate.is_file():
+    if not candidate.is_file() and (not allow_missing or candidate.exists()):
         raise ValueError(f"Executable not found: {candidate}")
 
-    resolved = candidate.resolve()
+    resolved = candidate.resolve(strict=False)
     roots = [Path(root).resolve() for root in trusted_roots if str(root or "").strip()]
     if roots:
         allowed_by_root = any(
