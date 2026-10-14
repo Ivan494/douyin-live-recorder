@@ -1064,6 +1064,11 @@ def dpapi_unprotect(data):
 
 
 def save_session_cookie_header(cookie_header, source=DEFAULT_CHROME_CDP):
+    if os.name != "nt":
+        from linux_session_storage import save_cookie_header
+
+        save_cookie_header(SESSION_FILE, cookie_header, source=source)
+        return
     encrypted = dpapi_protect(cookie_header.encode("utf-8"))
     save_json(
         SESSION_FILE,
@@ -1077,6 +1082,10 @@ def save_session_cookie_header(cookie_header, source=DEFAULT_CHROME_CDP):
 
 
 def load_session_cookie_header():
+    if os.name != "nt":
+        from linux_session_storage import load_cookie_header
+
+        return load_cookie_header(SESSION_FILE)
     session = load_json(SESSION_FILE, {})
     encoded = session.get("encrypted_cookie_header") if isinstance(session, dict) else ""
     if not encoded:
@@ -1093,6 +1102,11 @@ def load_session_cookie_header():
 
 def save_mobile_session_cookie_header(cookie_header, source="edge-qr-app"):
     """Persist the EXE QR login as the app-capable mobile session."""
+    if os.name != "nt":
+        from linux_session_storage import save_cookie_header
+
+        save_cookie_header(MOBILE_SESSION_FILE, cookie_header, source=source)
+        return
     encrypted = dpapi_protect(cookie_header.encode("utf-8"))
     save_json(
         MOBILE_SESSION_FILE,
@@ -1106,6 +1120,10 @@ def save_mobile_session_cookie_header(cookie_header, source="edge-qr-app"):
 
 
 def load_mobile_session_cookie_header():
+    if os.name != "nt":
+        from linux_session_storage import load_cookie_header
+
+        return load_cookie_header(MOBILE_SESSION_FILE)
     session = load_json(MOBILE_SESSION_FILE, {})
     encoded = session.get("encrypted_cookie_header") if isinstance(session, dict) else ""
     if not encoded:

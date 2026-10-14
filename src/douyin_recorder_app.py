@@ -14,6 +14,7 @@ import random
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -21,13 +22,20 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from tkinter import BooleanVar, StringVar, Tk, Toplevel, messagebox, filedialog
-from tkinter import ttk
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-import pystray
-from PIL import Image, ImageDraw
+HEADLESS = os.environ.get("DOUYIN_HEADLESS", "").lower() in {"1", "true", "yes"} or "--headless" in sys.argv
+if HEADLESS:
+    # GUI classes are defined below, but cannot be constructed by the service.
+    class Toplevel:
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("GUI dialogs are unavailable in headless mode")
+else:
+    from tkinter import BooleanVar, StringVar, Tk, Toplevel, messagebox, filedialog
+    from tkinter import ttk
+    import pystray
+    from PIL import Image, ImageDraw
 from streamget.platforms.douyin.live_stream import DouyinLiveStream
 
 from douyin_media_downloader import (
@@ -58,8 +66,8 @@ APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
 PACK_ROOT = APP_DIR.parent.parent
 ROOT_DOWNLOAD_DIR = APP_DIR.parent
 TOOLS_DIR = PACK_ROOT / "youtube-dl"
-DEFAULT_FFMPEG_PATH = TOOLS_DIR / "ffmpeg.exe"
-DEFAULT_FFPROBE_PATH = TOOLS_DIR / "ffprobe.exe"
+DEFAULT_FFMPEG_PATH = TOOLS_DIR / "ffmpeg.exe" if os.name == "nt" else Path("/usr/bin/ffmpeg")
+DEFAULT_FFPROBE_PATH = TOOLS_DIR / "ffprobe.exe" if os.name == "nt" else Path("/usr/bin/ffprobe")
 DEFAULT_YTDLP_PATH = TOOLS_DIR / "yt-dlp.exe"
 PROFILES_FILE = APP_DIR / "profiles.json"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -256,8 +264,11 @@ def expand_portable_path(value):
         "E:/youtube-dl": TOOLS_DIR,
     }
     expanded = value
+    portable_path = any(marker in value for marker in replacements)
     for marker, path in replacements.items():
         expanded = expanded.replace(marker, str(path))
+    if os.name != "nt" and portable_path:
+        expanded = expanded.replace("\\", "/")
     return expanded
 
 
@@ -477,13 +488,14 @@ def _looks_like_cookie_header(value):
 
 
 def _trusted_tool_roots():
-    return default_trusted_tool_roots(APP_DIR, TOOLS_DIR)
+    roots = default_trusted_tool_roots(APP_DIR, TOOLS_DIR)
+    return roots if os.name == "nt" else (*roots, Path("/usr/bin"), Path("/usr/local/bin"))
 
 
 def resolve_ffmpeg_executable(path_text):
     return resolve_trusted_executable(
         path_text,
-        allowed_basenames={"ffmpeg.exe"},
+        allowed_basenames={"ffmpeg.exe"} if os.name == "nt" else {"ffmpeg"},
         trusted_roots=_trusted_tool_roots(),
     )
 
@@ -507,6 +519,18 @@ def hidden_subprocess_kwargs():
         "creationflags": subprocess.CREATE_NO_WINDOW,
         "startupinfo": startupinfo,
     }
+
+
+def force_kill_process(process):
+    """Use the platform's process API; taskkill is Windows-only."""
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/PID", str(process.pid), "/T"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=10, **hidden_subprocess_kwargs(),
+        )
+    else:
+        process.kill()
 
 
 def setup_logging(*, console=False):
@@ -915,13 +939,13 @@ class RecorderStore:
         if not isinstance(self.settings, dict):
             raise ValueError("settings.json must contain an object")
         set_language(self.settings.get("language"))
-        if "start_with_windows" not in self.settings:
+        if os.name == "nt" and "start_with_windows" not in self.settings:
             self.settings["start_with_windows"] = is_autostart_enabled()
         # Repair the startup shortcut when the setting is enabled but the
         # shortcut is missing or broken (e.g. after a directory move or a
         # failed PowerShell read).  Failures here are non-fatal — the app can
         # still run; the user will see the toggle state in Settings.
-        if not read_only and self.settings.get("start_with_windows") and not is_autostart_enabled():
+        if os.name == "nt" and not read_only and self.settings.get("start_with_windows") and not is_autostart_enabled():
             try:
                 set_autostart_enabled(True)
             except Exception:
@@ -1173,11 +1197,7 @@ class MonitorEngine:
                 if process.poll() is None:
                     logging.warning("Force-killing unresponsive FFmpeg for %s (PID %s)", profile_id, getattr(process, "pid", "?"))
                     try:
-                        subprocess.run(
-                            ["taskkill", "/F", "/PID", str(process.pid), "/T"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            timeout=10, **hidden_subprocess_kwargs(),
-                        )
+                        force_kill_process(process)
                     except Exception:
                         pass
             self._poll_processes()
@@ -1211,13 +1231,7 @@ class MonitorEngine:
                     getattr(process, "pid", "?"),
                 )
                 try:
-                    subprocess.run(
-                        ["taskkill", "/F", "/PID", str(process.pid), "/T"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=10,
-                        **hidden_subprocess_kwargs(),
-                    )
+                    force_kill_process(process)
                 except Exception:
                     logging.exception("Failed to force-kill FFmpeg for %s", profile_id)
         self._poll_processes()
@@ -1556,7 +1570,7 @@ class MonitorEngine:
                 manifest = self._read_recording_manifest(manifest_path)
                 if not manifest or manifest.get("profile_id") != profile_id:
                     continue
-                if manifest.get("status") in {"complete", "failed"}:
+                if manifest.get("status") in {"complete", "failed"} or (HEADLESS and manifest.get("status") in {"waiting_for_disk", "finalizing"}):
                     continue
                 parts = [str(Path(value)) for value in manifest.get("parts") or [] if Path(value).exists()]
                 if not parts:
@@ -1885,7 +1899,7 @@ class MonitorEngine:
         try:
             probe_path = resolve_trusted_executable(
                 probe_setting,
-                allowed_basenames={"ffprobe.exe"},
+                allowed_basenames={"ffprobe.exe"} if os.name == "nt" else {"ffprobe"},
                 trusted_roots=_trusted_tool_roots(),
             )
         except ValueError:
@@ -1971,7 +1985,7 @@ class MonitorEngine:
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=log_handle,
-                    timeout=None,
+                    timeout=max(30, int(self.store.settings.get("headless_finalize_timeout_seconds", 240))) if HEADLESS else None,
                     **hidden_subprocess_kwargs(),
                 )
             if result.returncode != 0:
@@ -2557,7 +2571,7 @@ class MediaDownloadEngine:
 
     @staticmethod
     def enabled_for_profile(profile):
-        return bool(profile.get("auto_download_videos")) or bool(profile.get("auto_download_stories"))
+        return (not HEADLESS and bool(profile.get("auto_download_videos"))) or bool(profile.get("auto_download_stories"))
 
     def _run(self):
         while not self.stop_event.is_set():
@@ -2686,7 +2700,7 @@ class MediaDownloadEngine:
         cancellation = ProfileCancellation(self.stop_event, self.store, profile)
         if cancellation.is_set():
             return
-        videos = bool(profile.get("auto_download_videos"))
+        videos = not HEADLESS and bool(profile.get("auto_download_videos"))
         stories = bool(profile.get("auto_download_stories"))
         last_progress = ""
 
@@ -2787,6 +2801,12 @@ class AdoptedProcess:
     def terminate(self):
         if self.poll() is not None:
             return
+        if os.name != "nt":
+            try:
+                os.kill(self.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            return
         # FIX-APP-11: Try graceful shutdown first (lets ffmpeg flush MKV trailer),
         # then escalate to force-kill after 3 seconds.
         try:
@@ -2818,6 +2838,16 @@ class AdoptedProcess:
                 )
             except Exception:
                 pass
+
+    def kill(self):
+        if self.poll() is None:
+            if os.name == "nt":
+                force_kill_process(self)
+            else:
+                try:
+                    os.kill(self.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 class ProfileDialog(Toplevel):
@@ -4073,6 +4103,9 @@ def run_check():
 
 
 def main():
+    if HEADLESS:
+        from douyin_headless import main as headless_main
+        return headless_main()
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="Run one profile check without opening the UI.")
     parser.add_argument("--self-test-report", help="Run an offline packaging self-test and write its JSON result.")

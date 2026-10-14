@@ -42,3 +42,10 @@ src/logs/
 
 # Personal deployment provenance
 **/deployed-source.json
+
+# Linux capture service runtime
+downloads/
+src/status.json
+*-probe.json
+*-update.tar
+linux-tests.tar

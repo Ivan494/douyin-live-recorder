@@ -1,0 +1,32 @@
+Ubuntu server: ubuntu@100.90.83.101 (Tailscale SSH)
+Installation: /home/ubuntu/douyin-live-recorder
+Recordings and stories: /home/ubuntu/douyin-live-recorder/downloads/<profile folder>
+All 17 profile IDs imported; the original 14 enabled and 3 disabled flags are retained.
+Livestream recording and stories are configured; posted works are disabled.
+
+Commands:
+  sudo systemctl status douyin-recorder --no-pager
+  sudo journalctl -u douyin-recorder -n 60 --no-pager
+  sudo systemctl restart douyin-recorder
+  sudo systemctl stop douyin-recorder
+  cat /home/ubuntu/douyin-live-recorder/src/status.json
+
+Profiles: src/profiles.json
+Settings: src/settings.json
+Restart the service after editing either JSON file.
+Session files and mobile_device.json are private to ubuntu (0600; src 0700).
+Sessions migrated privately over SSH from the Windows recorder. If expired or
+rejected, reimport a renewed local session or use src/import_linux_session.py
+with JSON stdin; never paste credentials into a command line or Git.
+
+Disk guard pauses new captures below 5 GiB free and stops active captures below
+1 GiB free. Files are never automatically deleted. Check disk usage until Drive
+upload and retention have been configured.
+
+Google Drive upload is not configured. A later uploader should consume completed
+recordings only, verify uploaded copies, and apply an agreed retention policy.
+Do not copy, move or delete live segment files while a recording is active.
+
+Modified code is based on upstream b18de53894c0e302ff08048323dc61aea2b25bf1.
+The Linux changes are maintained on the server branch linux-live-stories;
+the upstream GitHub repository is not changed.

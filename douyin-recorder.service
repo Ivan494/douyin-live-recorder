@@ -1,0 +1,26 @@
+[Unit]
+Description=Douyin livestream and story capture
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/douyin-live-recorder
+ExecStart=/home/ubuntu/douyin-live-recorder/.venv/bin/python /home/ubuntu/douyin-live-recorder/src/douyin_headless.py
+Environment=DOUYIN_HEADLESS=1
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Hong_Kong
+UMask=0077
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=360
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/douyin-live-recorder/src /home/ubuntu/douyin-live-recorder/downloads
+
+[Install]
+WantedBy=multi-user.target
