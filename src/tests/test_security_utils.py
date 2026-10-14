@@ -68,6 +68,64 @@ class SecurityUtilsTest(unittest.TestCase):
             )
             self.assertEqual(str(tool.resolve()), resolved)
 
+    def test_resolve_trusted_executable_missing_requires_opt_in(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            missing = root / "yt-dlp.exe"
+            with self.assertRaises(ValueError):
+                resolve_trusted_executable(
+                    str(missing),
+                    allowed_basenames={"yt-dlp.exe"},
+                    trusted_roots=(root,),
+                )
+            resolved = resolve_trusted_executable(
+                str(missing),
+                allowed_basenames={"yt-dlp.exe"},
+                trusted_roots=(root,),
+                allow_missing=True,
+            )
+            self.assertEqual(str(missing.resolve()), resolved)
+
+    def test_resolve_trusted_executable_optional_missing_still_requires_trusted_root(self):
+        with TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            root = base / "trusted"
+            root.mkdir()
+            outside = base / "outside"
+            outside.mkdir()
+            missing = outside / "yt-dlp.exe"
+            with self.assertRaises(ValueError):
+                resolve_trusted_executable(
+                    str(missing),
+                    allowed_basenames={"yt-dlp.exe"},
+                    trusted_roots=(root,),
+                    allow_missing=True,
+                )
+
+    def test_resolve_trusted_executable_optional_missing_still_requires_basename(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with self.assertRaises(ValueError):
+                resolve_trusted_executable(
+                    str(root / "youtube-dl.exe"),
+                    allowed_basenames={"yt-dlp.exe"},
+                    trusted_roots=(root,),
+                    allow_missing=True,
+                )
+
+    def test_resolve_trusted_executable_optional_path_rejects_directory(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            directory = root / "yt-dlp.exe"
+            directory.mkdir()
+            with self.assertRaises(ValueError):
+                resolve_trusted_executable(
+                    str(directory),
+                    allowed_basenames={"yt-dlp.exe"},
+                    trusted_roots=(root,),
+                    allow_missing=True,
+                )
+
     def test_is_safe_http_url_alias(self):
         self.assertEqual(
             is_safe_http_url("https://cdn.example/live.flv"),

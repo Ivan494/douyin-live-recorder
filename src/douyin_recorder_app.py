@@ -488,11 +488,12 @@ def resolve_ffmpeg_executable(path_text):
     )
 
 
-def resolve_ytdlp_executable(path_text):
+def resolve_ytdlp_executable(path_text, *, allow_missing=False):
     return resolve_trusted_executable(
         path_text,
         allowed_basenames={"yt-dlp.exe"},
         trusted_roots=_trusted_tool_roots(),
+        allow_missing=allow_missing,
     )
 
 
@@ -3378,7 +3379,13 @@ class SettingsDialog(Toplevel):
             previous_language = updated_settings.get("language") or "zh-CN"
             language_code = self.language_codes.get(self.language_var.get(), "zh-CN")
             updated_settings["ffmpeg_path"] = resolve_ffmpeg_executable(self.ffmpeg_var.get().strip())
-            updated_settings["ytdlp_path"] = resolve_ytdlp_executable(self.ytdlp_var.get().strip())
+            # yt-dlp is only needed for YouTube. Keep its configured trusted
+            # location even before installation; validate the file at use time.
+            ytdlp_path = self.ytdlp_var.get().strip()
+            updated_settings["ytdlp_path"] = (
+                resolve_ytdlp_executable(ytdlp_path, allow_missing=True)
+                if ytdlp_path else ""
+            )
             updated_settings["new_profile_poll_interval_seconds"] = poll
             updated_settings["container"] = "mkv"
             updated_settings["start_hidden_to_tray"] = self.hidden_var.get()
