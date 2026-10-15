@@ -50,8 +50,10 @@ from douyin_media_downloader import (
     import_chrome_session,
     launch_douyin_login_browser,
     normalize_pasted_link,
+    profile_lookup_cooldown,
     saved_session_info,
 )
+from lookup_resilience import LOOKUP_DEFAULTS, LookupDeferred
 from recording_urls import (
     ffmpeg_live_input_options,
     has_recording_url,
@@ -838,6 +840,7 @@ def default_settings():
         "priority_poll_jitter_seconds": 2,
         "poll_jitter_seconds": 8,
         "media_poll_interval_seconds": DEFAULT_MEDIA_INTERVAL,
+        **LOOKUP_DEFAULTS,
         # FIX-PATHLEN: long captions used to be truncated so the full path could
         # fit Windows' 260-char MAX_PATH.  Keep the caption intact and let
         # extended-length paths carry the overflow; optionally group every
@@ -2618,7 +2621,8 @@ class MediaDownloadEngine:
                 # remaining profiles will almost certainly hit the same IP-level
                 # captcha.  Skip them and let the backoff cool down.
                 last_status = (self._last_video_status or {}).get(profile_id, "")
-                if last_status == "captcha":
+                resilient = self.store.settings.get("media_lookup_resilience_enabled") is True
+                if last_status == "captcha" and not resilient:
                     # FIX-CB-2: Only trip circuit breaker after 2+ consecutive captcha hits.
                     # A single captcha may be a false positive (preloaded SDK element).
                     captcha_streak = self.consecutive_failures.get(profile_id, 0)
@@ -2638,14 +2642,19 @@ class MediaDownloadEngine:
                             "Captcha on %s (streak=%d), continuing with remaining profiles.",
                             profile.get("name"), captcha_streak,
                         )
-                if failures > 0:
+                if failures > 0 and not resilient:
                     backoff_multiplier = min(2 ** failures, 8)
                     wait_seconds = int(wait_seconds * backoff_multiplier)
                     logging.info(
                         "Media backoff for %s: %d consecutive failures, waiting %ds",
                         profile.get("name"), failures, wait_seconds,
                     )
-                self.next_check[profile_id] = time.monotonic() + wait_seconds
+                if resilient:
+                    wait_seconds = max(wait_seconds, profile_lookup_cooldown(profile, self.store.settings))
+                self.next_check[profile_id] = max(
+                    self.next_check.get(profile_id, 0) if resilient else 0,
+                    time.monotonic() + wait_seconds,
+                )
                 self.emit(
                     profile_id,
                     f"Next media check in {wait_seconds}s.",
@@ -2764,6 +2773,12 @@ class MediaDownloadEngine:
                 media_last_checked=now_text(),
                 media_next_check="",
             )
+        except LookupDeferred as exc:
+            # A refresh must respect admission too. Deferral is not a failed
+            # lookup and must not generate another exception/attention alert.
+            self.next_check[profile["id"]] = time.monotonic() + exc.retry_after
+            self.emit(profile["id"], str(exc), media_status="Lookup cooling down",
+                      media_progress="", media_next_check=future_text(exc.retry_after))
         except InterruptedError:
             self.emit(profile["id"], "Media download cancelled.", media_status="Stopped", media_progress="Stopped")
         except CaptchaDetectedError as exc:
@@ -2781,7 +2796,12 @@ class MediaDownloadEngine:
                 media_next_check="",
             )
         except Exception as exc:
-            logging.exception("Media download check failed for %s", profile.get("name"))
+            if self.store.settings.get("media_lookup_resilience_enabled") is True:
+                # Retry details are DEBUG; admitted failures get one concise
+                # warning without exception text, URLs or a repeated traceback.
+                logging.warning("Media download check failed (%s)", type(exc).__name__)
+            else:
+                logging.exception("Media download check failed for %s", profile.get("name"))
             self.consecutive_failures[profile["id"]] = self.consecutive_failures.get(profile["id"], 0) + 1
             self.emit(
                 profile["id"],

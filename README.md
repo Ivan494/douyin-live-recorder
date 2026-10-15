@@ -201,10 +201,44 @@ profile, or:
 python src/douyin_media_downloader.py --profile-url <user-url> --stories --output-dir <dir>
 ```
 
+### Optional lookup protection
+
+`media_lookup_resilience_enabled` in `settings.json` defaults to `false`.
+When explicitly enabled, profile identity and media metadata lookups retry
+transient timeouts, connection errors, selected HTTP 5xx/408 responses and
+empty API responses. Each source call gets at most
+`media_lookup_max_attempts` attempts (default 3, including the first), with
+equal-jitter exponential waits starting at `media_lookup_backoff_base_seconds`
+(default 1) and capped by `media_lookup_backoff_max_seconds` (default 8).
+The existing source fallbacks and endpoint-level retries still apply; this
+does not retry downloaded media or entire download jobs. Login, captcha,
+risk-control, HTTP 429 and configuration errors receive no immediate retry.
+
+After `media_lookup_failure_threshold` consecutive unsuccessful account
+checks (default 3), that account's circuit opens for
+`media_lookup_cooldown_seconds` (default 900). Refreshes also respect the
+circuit. After cooldown, one check may probe with one attempt per lookup
+source; success closes the circuit and failure starts another cooldown.
+Other accounts continue checking. Successful empty feeds count as success;
+error, authentication, unavailable and incomplete results count as failure.
+Cancellation does not add a failure. Retry waits can be cancelled on shutdown
+or profile changes. Polling resumes no sooner than the normal interval and
+the cooldown, so a probe may run later than the cooldown boundary.
+
+The new circuit state is per profile ID (URL host/path when no ID exists),
+in memory, and shared by profile download calls in one process. Restarting
+the process resets it. Enabled protection replaces the media scheduler's
+legacy global captcha skip and failure multiplier with per-account cooldowns.
+Live recording polling and single-video downloads are unchanged. Disabling
+the flag restores the existing behavior and bypasses this circuit. Numeric
+values are validated and bounded; attempts are limited to 1–5, failure
+threshold to 1–20, cooldown to 1–86400 seconds, and wait cap to 0.1–60 seconds.
+
 ## Tests
 
 ```text
 python -m pytest src/tests
+DOUYIN_HEADLESS=1 PYTHONPATH=src python -m pytest src/tests/test_lookup_resilience.py -q
 ```
 
 ## Build a Windows zip

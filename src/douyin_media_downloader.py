@@ -16,7 +16,7 @@ import time
 import urllib.parse
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from contextlib import contextmanager
 from datetime import datetime
 from http.cookies import SimpleCookie
@@ -27,6 +27,9 @@ import httpx
 from streamget.platforms.douyin.live_stream import DouyinLiveStream
 
 from douyin_abogus import ABogus, BrowserFingerprintGenerator
+from lookup_resilience import (
+    AccountCircuitBreaker, LookupPolicy, account_key, retry_lookup,
+)
 from security_utils import (
     follow_safe_redirects,
     stream_safe_redirects,
@@ -55,6 +58,7 @@ KNOWN_GOOD_EDGE_VERSION = "150.0.4078.83"
 MEDIA_BROWSER_LAUNCH_LOCK = threading.RLock()
 MEDIA_STATE_LOCK = threading.RLock()
 _cancellation = threading.local()
+_lookup_circuits = AccountCircuitBreaker()
 
 
 def check_cancelled():
@@ -993,6 +997,37 @@ class CaptchaDetectedError(RuntimeError):
     """Douyin is showing a captcha / slide-verify challenge."""
 
     pass
+
+
+def _retryable_lookup_error(exc):
+    # Authentication, captcha/risk-control and programming/configuration errors
+    # should cool down, not receive a burst of immediate retries.
+    if isinstance(exc, (LoginRequiredError, CaptchaDetectedError, InterruptedError)):
+        return False
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {408, 500, 502, 503, 504}
+    if isinstance(exc, EmptyApiResponseError) and str(exc) in {
+        "mobile_post_api: signer module not available", "mobile_post_api: no session cookies",
+        "mobile_post_api: no posts returned",
+    }:
+        return False
+    return (
+        isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError,
+                         TimeoutError, ConnectionError, EmptyApiResponseError))
+        or (isinstance(exc, RuntimeError)
+            and str(exc) == "Could not resolve sec_user_id for this Douyin profile")
+    )
+
+
+def _lookup_call(operation, *args, **kwargs):
+    return retry_lookup(
+        lambda: operation(*args, **kwargs),
+        getattr(_cancellation, "lookup_policy", None),
+        retryable=_retryable_lookup_error,
+        wait=_cancel_wait,
+        check_cancelled=check_cancelled,
+        label="identity" if operation is resolve_profile_identity_sync else "metadata",
+    )
 
 
 # OPT-D: Track consecutive HTTP fast-path failures per sec_user_id.
@@ -2836,6 +2871,15 @@ async def resolve_profile_identity(profile):
     if not sec_uid:
         raise RuntimeError("Could not resolve sec_user_id for this Douyin profile")
     return {"sec_user_id": sec_uid, "user_id": numeric_user_id, "nickname": nickname}
+
+
+def resolve_profile_identity_sync(profile):
+    identity = httpx.run(resolve_profile_identity(profile)) if hasattr(httpx, "run") else None
+    if identity is None:
+        import asyncio
+
+        identity = asyncio.run(resolve_profile_identity(profile))
+    return identity
 
 
 def iter_url_list(source):
@@ -4873,11 +4917,43 @@ def result_to_dict(result):
     }
 
 
+def profile_lookup_cooldown(profile, settings):
+    policy = LookupPolicy.from_settings(settings)
+    return _lookup_circuits.remaining(account_key(profile), policy) if policy else 0.0
+
+
 def download_profile(profile, settings=None, *, videos=True, stories=False, limit=0,
                      progress_callback=None, cancel_event=None):
     with cancellation_scope(cancel_event):
-        return _download_profile(profile, settings, videos=videos, stories=stories,
-                                 limit=limit, progress_callback=progress_callback)
+        policy = LookupPolicy.from_settings(settings or {})
+        if policy is None:
+            return _download_profile(profile, settings, videos=videos, stories=stories,
+                                     limit=limit, progress_callback=progress_callback)
+        # Admission precedes directories, state reads and all lookup traffic.
+        key = account_key(profile)
+        circuit, probe = _lookup_circuits.acquire(key, policy)
+        previous = getattr(_cancellation, "lookup_policy", None)
+        _cancellation.lookup_policy = replace(policy, max_attempts=1) if probe else policy
+        failed = None
+        try:
+            summary = _download_profile(profile, settings, videos=videos, stories=stories,
+                                        limit=limit, progress_callback=progress_callback)
+            check_cancelled()
+            statuses = {(summary.get(kind) or {}).get("status", "")
+                        for kind in ("videos", "stories")}
+            failed = bool(statuses.intersection({
+                "error", "api_empty", "blocked", "captcha", "login_required",
+                "partial", "unavailable",
+            })) or summary.get("auth_warning") == "login_required"
+            return summary
+        except InterruptedError:
+            raise
+        except Exception:
+            failed = True
+            raise
+        finally:
+            _cancellation.lookup_policy = previous
+            _lookup_circuits.finish(key, circuit, policy, failed=failed)
 
 
 def _download_profile(
@@ -4924,11 +5000,7 @@ def _download_profile(
     if _quick_sec:
         identity = {"sec_user_id": _quick_sec, "user_id": "", "nickname": profile.get("name") or ""}
     else:
-        identity = httpx.run(resolve_profile_identity(profile)) if hasattr(httpx, "run") else None
-        if identity is None:
-            import asyncio
-
-            identity = asyncio.run(resolve_profile_identity(profile))
+        identity = _lookup_call(resolve_profile_identity_sync, profile)
     summary["sec_user_id"] = identity["sec_user_id"]
     summary["user_id"] = identity.get("user_id", "")
     summary["resolved_name"] = identity.get("nickname", "")
@@ -4953,7 +5025,7 @@ def _download_profile(
                 _app_cookie = _profile_cookie_header(profile)
                 if _app_cookie:
                     try:
-                        posts = fetch_posts_via_mobile_api(
+                        posts = _lookup_call(fetch_posts_via_mobile_api,
                             client,
                             _fp_uid,
                             limit=limit,
@@ -4995,7 +5067,7 @@ def _download_profile(
                     else:
                         _fp_skip_counter = False
                         try:
-                            posts = fetch_posts(
+                            posts = _lookup_call(fetch_posts,
                                 client, profile, _fp_uid,
                                 limit=limit, progress_callback=progress_callback,
                             )
@@ -5030,7 +5102,7 @@ def _download_profile(
 
                 if not posts:
                     try:
-                        posts = fetch_posts_via_browser(
+                        posts = _lookup_call(fetch_posts_via_browser,
                             profile,
                             identity["sec_user_id"],
                             limit=limit,
@@ -5050,7 +5122,7 @@ def _download_profile(
                     # Last-resort mobile retry after anonymous web/browser failed.
                     try:
                         _mob_cookie = _profile_cookie_header(profile)
-                        posts = fetch_posts_via_mobile_api(
+                        posts = _lookup_call(fetch_posts_via_mobile_api,
                             client,
                             identity["sec_user_id"],
                             limit=limit,
@@ -5096,7 +5168,7 @@ def _download_profile(
         if stories:
             try:
                 report_progress(progress_callback, phase="checking_stories", media_kind="story")
-                story_fetch = fetch_stories(
+                story_fetch = _lookup_call(fetch_stories,
                     client,
                     profile,
                     identity["sec_user_id"],

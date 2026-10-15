@@ -28,6 +28,12 @@ PUBLIC_SETTINGS = {
     "recording_stall_timeout_seconds": 300, "recording_offline_grace_seconds": 90,
     "recording_segment_max_seconds": 2700, "recording_reconnect_delay_max_seconds": 5,
     "recording_engine_version": 2, "media_poll_interval_seconds": 300,
+    "media_lookup_resilience_enabled": False,
+    "media_lookup_max_attempts": 3,
+    "media_lookup_backoff_base_seconds": 1.0,
+    "media_lookup_backoff_max_seconds": 8.0,
+    "media_lookup_failure_threshold": 3,
+    "media_lookup_cooldown_seconds": 900.0,
     "captcha_backoff_seconds": 120,
 }
 
