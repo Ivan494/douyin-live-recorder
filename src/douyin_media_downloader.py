@@ -3070,6 +3070,11 @@ def _media_name_tail(aweme, suffix):
     return _utf16_length(payload_suffix + ".json") + _PART_SUFFIX_RESERVE
 
 
+# Filename timestamps always use Douyin's zone, independent of the process TZ.
+from datetime import timedelta as _td, timezone as _tz
+_NAME_TZ = _tz(_td(hours=8), "UTC+08")
+
+
 def _aweme_id_for_name(aweme):
     """Sanitized id, shared by filenames and per-item subdirectories."""
     # FIX-D2: Use millisecond timestamp to reduce collision risk for items
@@ -3104,11 +3109,13 @@ def aweme_filename(aweme, suffix=".mp4", base_dir=None, include_id=True, keep_fu
         max_chars=None if keep_full_title else 120,
     )
     try:
-        stamp = datetime.fromtimestamp(int(aweme.get("create_time") or time.time())).strftime("%Y-%m-%d_%H-%M-%S")
+        # Fixed Douyin zone (UTC+8): a naive fromtimestamp() followed the
+        # process TZ, so UTC and HKT runs named one story 8h apart.
+        stamp = datetime.fromtimestamp(int(aweme.get("create_time") or time.time()), _NAME_TZ).strftime("%Y-%m-%d_%H-%M-%S")
     except InterruptedError:
         raise
     except (TypeError, ValueError, OSError):
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        stamp = datetime.now(_NAME_TZ).strftime("%Y-%m-%d_%H-%M-%S")
     prefix = f"{stamp}_{aweme_id}_" if include_id else f"{stamp}_"
     component_budget = _MAX_NAME_COMPONENT - _utf16_length(prefix) - _media_name_tail(aweme, suffix)
     if keep_full_title:
@@ -3781,8 +3788,14 @@ def _previously_saved_paths_by_aweme_id(target_dir, aweme, subdir_by_aweme_id=Fa
         candidates = search_root.iterdir()
         if subdir_by_aweme_id:
             return [path for path in candidates if path.is_file()]
-        marker = f"_{aweme_id}_"
-        return [path for path in candidates if path.is_file() and marker in path.name]
+        # Dedupe by item id regardless of timestamp prefix or caption.
+        markers = (f"_{aweme_id}_", f"_{aweme_id}.")
+        return [
+            path for path in candidates
+            if path.is_file()
+            and any(marker in path.name for marker in markers)
+            and ".part" not in path.name
+        ]
     except OSError:
         return []
 

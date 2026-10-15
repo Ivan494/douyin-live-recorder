@@ -1678,3 +1678,36 @@ class UploadedLogSkipTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             with patch.dict(os.environ, {media.UPLOADED_LOG_ENV: str(Path(root) / "none.jsonl")}):
                 self.assertEqual(media._uploaded_aweme_ids(Path(root), {}), set())
+
+
+class StoryNamingDedupeTests(unittest.TestCase):
+    def test_filename_stamp_ignores_process_timezone(self):
+        import time as _time
+        aweme = {"aweme_id": "7696544512231551040", "create_time": 1760426614, "desc": ""}
+        names = []
+        old = os.environ.get("TZ")
+        try:
+            for zone in ("UTC", "Asia/Hong_Kong", "America/New_York"):
+                os.environ["TZ"] = zone
+                _time.tzset()
+                names.append(media.aweme_filename(aweme))
+        finally:
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            _time.tzset()
+        self.assertEqual(len(set(names)), 1)
+        self.assertTrue(names[0].startswith("2025-10-14_15-23-34_"), names[0])
+
+    def test_story_dedupes_by_id_despite_different_filename(self):
+        aweme = {"aweme_id": "7696544512231551040", "create_time": 1760426614, "desc": ""}
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root)
+            old_name = target / "2025-10-14_07-23-34_7696544512231551040_old caption.mp4"
+            old_name.write_bytes(b"x")
+            output = media.media_item_path(target, aweme)
+            self.assertNotEqual(output, old_name)
+            with patch.object(media, "_has_valid_media_file", side_effect=lambda p: Path(p).exists()):
+                found = media._already_saved_media_file(output, [], target, aweme)
+            self.assertEqual(found, old_name)
