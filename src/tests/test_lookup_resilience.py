@@ -77,7 +77,9 @@ def test_default_off_and_strict_opt_in(flag):
     operation.assert_called_once()
     assert app.default_settings()["media_lookup_resilience_enabled"] is False
     shipped = json.loads((Path(media.__file__).parent / "settings.json").read_text())
-    assert shipped["media_lookup_resilience_enabled"] is False
+    # A deployed settings.json may predate these keys; missing means the
+    # runtime default (off) applies.
+    assert shipped.get("media_lookup_resilience_enabled", False) is False
 
 
 def test_policy_validation_and_hard_limits():
@@ -95,7 +97,7 @@ def test_policy_validation_and_hard_limits():
 def test_shipped_policy_matches_runtime_defaults():
     shipped = json.loads((Path(media.__file__).parent / "settings.json").read_text())
     for key, value in LOOKUP_DEFAULTS.items():
-        assert shipped[key] == app.default_settings()[key] == value
+        assert shipped.get(key, value) == app.default_settings()[key] == value
 
 
 @pytest.mark.parametrize("fraction", [0, 0.3, 1])

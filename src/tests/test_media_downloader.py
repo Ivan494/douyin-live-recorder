@@ -948,7 +948,7 @@ class MediaDownloaderTest(unittest.TestCase):
         }
         state = {}
 
-        def fake_download(_client, url, output_path, progress_callback=None, progress_details=None):
+        def fake_download(_client, url, output_path, progress_callback=None, progress_details=None, **_kwargs):
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(url.encode("utf-8"))
 
@@ -972,7 +972,7 @@ class MediaDownloaderTest(unittest.TestCase):
             "images": [{"url_list": ["https://example.test/photo.jpg"]}],
         }
 
-        def fake_download(_client, url, output_path, progress_callback=None, progress_details=None):
+        def fake_download(_client, url, output_path, progress_callback=None, progress_details=None, **_kwargs):
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(b"image")
 
@@ -1011,7 +1011,7 @@ class MediaDownloaderTest(unittest.TestCase):
         }
         downloaded_urls = []
 
-        def fake_download(_client, url, output_path, progress_callback=None, progress_details=None):
+        def fake_download(_client, url, output_path, progress_callback=None, progress_details=None, **_kwargs):
             downloaded_urls.append(url)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(b"image")
@@ -1345,7 +1345,7 @@ class MediaDownloaderTest(unittest.TestCase):
         }
         progress = []
 
-        def fake_download(_client, _url, output_path, progress_callback=None, progress_details=None):
+        def fake_download(_client, _url, output_path, progress_callback=None, progress_details=None, **_kwargs):
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(b"video")
             media.report_progress(
