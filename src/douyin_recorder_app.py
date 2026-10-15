@@ -1907,7 +1907,7 @@ class MonitorEngine:
         if not path.exists() or path.stat().st_size <= 0:
             raise RuntimeError("Final MKV was not created or is empty")
         if not probe_path:
-            return
+            raise RuntimeError("FFprobe is unavailable; raw MKV parts cannot be safely removed")
         result = subprocess.run(
             [
                 probe_path,
@@ -1933,23 +1933,33 @@ class MonitorEngine:
         if not stream_types.intersection({"audio", "video"}):
             raise RuntimeError("Final MKV contains no audio or video streams")
 
+    @staticmethod
+    def _recording_part_stamp(path):
+        st = path.stat()
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"Missing MKV part: {path}")
+        return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
     def _finalize_recording_worker(self, recording, reason):
         final_output = Path(recording["final_output"])
         session_dir = Path(recording["session_dir"])
-        parts = [Path(value) for value in recording.get("parts") or [] if Path(value).exists() and Path(value).stat().st_size]
+        parts = [Path(value) for value in recording.get("parts") or []]
         profile_id = recording["profile_id"]
-        if not parts:
-            recording["status"] = "failed"
-            recording["stop_reason"] = f"{reason}: no usable MKV parts"
-            self._save_recording_manifest(recording)
-            self.emit(profile_id, "Recording finalization failed: no usable MKV parts.", status="Finalization failed", recording=False)
-            return
         concat_path = session_dir / "parts.txt"
         temporary_output = final_output.with_name(final_output.stem + ".finalizing.mkv")
         finalize_log = session_dir / "finalize.log"
         try:
+            if not parts:
+                raise RuntimeError("No usable MKV parts")
+            # Missing parts must not silently shorten the capture. A failed
+            # connection may leave a zero-byte part; track it too so growth
+            # during the remux cannot be lost, but omit it from the concat.
+            stamps = [self._recording_part_stamp(path) for path in parts]
+            usable_parts = [path for path, stamp in zip(parts, stamps) if stamp[2] > 0]
+            if not usable_parts:
+                raise RuntimeError("No usable MKV parts")
             with open(concat_path, "w", encoding="utf-8") as fh:
-                fh.write("\n".join(self._concat_file_line(path) for path in parts) + "\n")
+                fh.write("\n".join(self._concat_file_line(path) for path in usable_parts) + "\n")
             recording["status"] = "finalizing"
             recording["stop_reason"] = reason
             self._save_recording_manifest(recording)
@@ -1991,6 +2001,8 @@ class MonitorEngine:
             if result.returncode != 0:
                 raise RuntimeError(f"FFmpeg concat exited with code {result.returncode}")
             self._validate_final_recording(temporary_output)
+            if [self._recording_part_stamp(path) for path in parts] != stamps:
+                raise RuntimeError("MKV parts changed during finalization; raw parts preserved")
             final_output.parent.mkdir(parents=True, exist_ok=True)
             temporary_output.replace(final_output)
             recording["status"] = "complete"
@@ -2003,14 +2015,14 @@ class MonitorEngine:
                 logging.warning("Could not clean up session dir %s (non-fatal)", session_dir)
             self.emit(
                 profile_id,
-                f"Recording finalized: {final_output.name} ({len(parts)} MKV part{'s' if len(parts) != 1 else ''}).",
+                f"Recording finalized: {final_output.name} ({len(usable_parts)} MKV part{'s' if len(usable_parts) != 1 else ''}).",
                 status="Offline",
                 recording=False,
                 current_file=str(final_output),
                 file_size=file_size_text(final_output),
                 cooldown="Complete",
             )
-            logging.info("Finalized %s from %s MKV part(s): %s", profile_id, len(parts), final_output)
+            logging.info("Finalized %s from %s MKV part(s): %s", profile_id, len(usable_parts), final_output)
         except Exception as exc:
             recording["status"] = "failed"
             recording["stop_reason"] = f"{reason}: {exc}"

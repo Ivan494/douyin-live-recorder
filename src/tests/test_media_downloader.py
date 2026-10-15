@@ -102,9 +102,15 @@ class MediaDownloaderTest(unittest.TestCase):
         self.assertEqual("ok", summary["videos"]["status"])
 
     def test_available_cdp_port_zero_returns_assigned_port(self):
-        port = media.available_cdp_port(0)
+        with patch.object(media, "cdp_is_available", return_value=False), patch.object(
+            media.socket, "socket"
+        ) as socket_factory:
+            probe = socket_factory.return_value.__enter__.return_value
+            probe.getsockname.return_value = ("127.0.0.1", 43123)
+            port = media.available_cdp_port(0)
 
-        self.assertGreater(port, 0)
+        self.assertEqual(port, 43123)
+        probe.bind.assert_called_once_with(("127.0.0.1", 0))
 
     def test_profile_identity_uses_saved_profile_url_without_live_request(self):
         sec_uid = "MS4wLjABAAAA-test-profile"
