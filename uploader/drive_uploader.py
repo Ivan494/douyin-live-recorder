@@ -19,7 +19,7 @@ LOCK = HERE / "uploader.lock"
 REMOTE = os.environ.get("DOUYIN_DRIVE_REMOTE", "saridq:Douyin")
 MIN_AGE = 300
 SKIP_NAMES = {"douyin_media_state.json"}
-SKIP_SUFFIX = (".part", ".tmp", ".partial", ".download", ".finalizing.mkv", ".lock")
+SKIP_SUFFIX = (".log", ".part", ".tmp", ".partial", ".download", ".finalizing.mkv", ".lock")
 VIDEO = {".mkv", ".mp4", ".flv", ".ts"}
 ID_RE = re.compile(r"_(\d{15,21})(?:_|\.|$)")
 
@@ -35,17 +35,26 @@ def open_files():
 
 def busy_profiles():
     """Profile folder names (anchor/name) with active recording; '*' if unknown."""
-    try:
-        d = json.loads(STATUS.read_text(encoding="utf-8"))
-    except Exception:
-        return {"*"}
-    eng = d.get("engines", {})
     busy = set()
-    for p in d.get("profiles", []):
-        if (p.get("state") or {}).get("recording"):
-            busy.update(filter(None, [p.get("name"), (p.get("state") or {}).get("anchor_name")]))
-    if (eng.get("active_finalizers") or eng.get("deferred_finalizers")) and not busy:
-        busy.add("*")
+    # src/status.json (service) plus src/status.*.json (test harnesses).
+    for status_path in [STATUS, *sorted(STATUS.parent.glob("status.*.json"))]:
+        try:
+            d = json.loads(status_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            if status_path == STATUS:
+                return {"*"}
+            continue
+        except Exception:
+            return {"*"}
+        eng = d.get("engines", {})
+        found = set()
+        for p in d.get("profiles", []):
+            state = p.get("state") or {}
+            if state.get("recording"):
+                found.update(filter(None, [p.get("name"), state.get("anchor_name")]))
+        if (eng.get("active_recordings") or eng.get("active_finalizers") or eng.get("deferred_finalizers")) and not found:
+            found.add("*")
+        busy |= found
     return busy
 
 
