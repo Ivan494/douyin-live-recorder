@@ -49,3 +49,6 @@ src/status.json
 *-probe.json
 *-update.tar
 linux-tests.tar
+uploader/uploaded.jsonl
+uploader/uploader.lock
+backups/

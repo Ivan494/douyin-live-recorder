@@ -1,4 +1,5 @@
-Ubuntu server: ubuntu@100.90.83.101 (Tailscale SSH)
+Ubuntu server access: ssh -i ~/.ssh/oracle_a1 ubuntu@164.152.109.219 (plain key SSH, public IP)
+Tailscale (ubuntu@100.90.83.101) only for Tailscale-required functions.
 Installation: /home/ubuntu/douyin-live-recorder
 Recordings and stories: /home/ubuntu/douyin-live-recorder/downloads/<profile folder>
 All 17 profile IDs imported; the original 14 enabled and 3 disabled flags are retained.
@@ -20,12 +21,22 @@ rejected, reimport a renewed local session or use src/import_linux_session.py
 with JSON stdin; never paste credentials into a command line or Git.
 
 Disk guard pauses new captures below 5 GiB free and stops active captures below
-1 GiB free. Files are never automatically deleted. Check disk usage until Drive
-upload and retention have been configured.
+1 GiB free.
 
-Google Drive upload is not configured. A later uploader should consume completed
-recordings only, verify uploaded copies, and apply an agreed retention policy.
-Do not copy, move or delete live segment files while a recording is active.
+Google Drive upload (rclone remote saridq:, account saridq):
+  uploader/drive_uploader.py via douyin-drive-upload.timer (every 5 min, flock).
+  Eligible: file mtime >= 5 min old, not open (lsof), no live video while that
+  profile is recording/finalizing per src/status.json; state json/.part skipped.
+  Destination: saridq:Douyin/<profile>/lives/<file> for recordings at the profile
+  root; other sub-folders keep their name (stories/, videos/, images/).
+  Each file: rclone copyto -> rclone check --one-way + md5 match -> append
+  uploader/uploaded.jsonl -> delete local copy. Failures keep the local file.
+  The media downloader treats IDs in uploaded.jsonl as done (no re-download).
+  Commands:
+    systemctl list-timers douyin-drive-upload.timer
+    sudo journalctl -u douyin-drive-upload -n 50 --no-pager
+    python3 uploader/drive_uploader.py --dry-run
+  Never copy, move or delete live segment files while a recording is active.
 
 Modified code is based on upstream b18de53894c0e302ff08048323dc61aea2b25bf1.
 The Linux changes are maintained on the server branch linux-live-stories;

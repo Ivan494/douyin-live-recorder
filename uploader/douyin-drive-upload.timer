@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Douyin Drive uploader every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

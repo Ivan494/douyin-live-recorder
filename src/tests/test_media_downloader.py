@@ -764,6 +764,40 @@ class MediaDownloaderTest(unittest.TestCase):
         self.assertEqual(0, result.failed)
         self.assertEqual(["residue-story"], state["downloaded_story_ids"])
 
+    def test_recorded_story_id_with_changed_caption_is_not_downloaded_twice(self):
+        original = {
+            "aweme_id": "stable-story-id",
+            "desc": "Original caption",
+            "create_time": 1786893660,
+            "video": {"play_addr": {"url_list": ["https://example.test/story.mp4"]}},
+        }
+        edited = {**original, "desc": "Edited caption"}
+        downloads = []
+
+        def fake_download(_client, url, output_path, progress_callback=None,
+                          progress_details=None, **_kwargs):
+            downloads.append(url)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00\x00\x00 ftypisom" + b"\0" * 4096)
+
+        with tempfile.TemporaryDirectory() as temporary_directory, patch.object(
+            media, "download_bytes", side_effect=fake_download
+        ):
+            state_path, state = media.load_state(temporary_directory)
+            first = media.download_aweme_items(
+                object(), {}, [original], temporary_directory, state, "story"
+            )
+            media.save_state(state_path, state)
+            _, restarted_state = media.load_state(temporary_directory)
+            second = media.download_aweme_items(
+                object(), {}, [edited], temporary_directory, restarted_state, "story"
+            )
+
+        self.assertEqual(1, first.downloaded)
+        self.assertEqual(0, second.downloaded)
+        self.assertEqual(1, second.skipped)
+        self.assertEqual(1, len(downloads))
+
     def test_recorded_story_with_present_file_is_still_skipped(self):
         aweme = {
             "aweme_id": "present-story",
@@ -782,6 +816,40 @@ class MediaDownloaderTest(unittest.TestCase):
 
         self.assertEqual(1, result.skipped)
         self.assertEqual(0, result.downloaded)
+
+    def test_recorded_image_story_id_with_changed_caption_is_not_downloaded_twice(self):
+        original = {
+            "aweme_id": "stable-image-story-id",
+            "desc": "Original image caption",
+            "create_time": 1786893660,
+            "images": [{"url_list": ["https://example.test/story.jpg"]}],
+        }
+        edited = {**original, "desc": "Edited image caption"}
+        downloads = []
+
+        def fake_download(_client, url, output_path, progress_callback=None,
+                          progress_details=None, **_kwargs):
+            downloads.append(url)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\xff\xd8\xff" + b"x" * 600)
+
+        with tempfile.TemporaryDirectory() as temporary_directory, patch.object(
+            media, "download_bytes", side_effect=fake_download
+        ):
+            state_path, state = media.load_state(temporary_directory)
+            first = media.download_aweme_items(
+                object(), {}, [original], temporary_directory, state, "story"
+            )
+            media.save_state(state_path, state)
+            _, restarted_state = media.load_state(temporary_directory)
+            second = media.download_aweme_items(
+                object(), {}, [edited], temporary_directory, restarted_state, "story"
+            )
+
+        self.assertEqual(1, first.downloaded)
+        self.assertEqual(0, second.downloaded)
+        self.assertEqual(1, second.skipped)
+        self.assertEqual(1, len(downloads))
 
     def test_recorded_image_story_without_local_images_is_downloaded_again(self):
         """Image items store <stem>_01.jpg, never the .mp4 output_path."""
@@ -1591,3 +1659,22 @@ class MediaDownloaderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UploadedLogSkipTests(unittest.TestCase):
+    def test_uploaded_ids_from_log_and_state(self):
+        with tempfile.TemporaryDirectory() as root:
+            out = Path(root) / "downloads" / "acct"
+            out.mkdir(parents=True)
+            log = Path(root) / "uploader" / "uploaded.jsonl"
+            log.parent.mkdir()
+            log.write_text(json.dumps({"item_id": "111"}) + "\nnot json\n" + json.dumps({"path": "x"}) + "\n", encoding="utf-8")
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop(media.UPLOADED_LOG_ENV, None)
+                ids = media._uploaded_aweme_ids(out, {"uploaded_aweme_ids": ["222"]})
+            self.assertEqual(ids, {"111", "222"})
+
+    def test_env_override_and_missing_log(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict(os.environ, {media.UPLOADED_LOG_ENV: str(Path(root) / "none.jsonl")}):
+                self.assertEqual(media._uploaded_aweme_ids(Path(root), {}), set())

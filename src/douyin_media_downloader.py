@@ -3773,25 +3773,110 @@ def _saved_file_exists(path):
         return False
 
 
+def _previously_saved_paths_by_aweme_id(target_dir, aweme, subdir_by_aweme_id=False):
+    """Find saved assets for an item even when its caption has since changed."""
+    aweme_id = _aweme_id_for_name(aweme)
+    search_root = Path(target_dir) / aweme_id if subdir_by_aweme_id else Path(target_dir)
+    try:
+        candidates = search_root.iterdir()
+        if subdir_by_aweme_id:
+            return [path for path in candidates if path.is_file()]
+        marker = f"_{aweme_id}_"
+        return [path for path in candidates if path.is_file() and marker in path.name]
+    except OSError:
+        return []
+
+
+UPLOADED_LOG_ENV = "DOUYIN_UPLOADED_LOG"
+
+
+def _uploaded_log_path(output_dir):
+    """uploaded.jsonl written by uploader/drive_uploader.py (Drive offload)."""
+    env = os.environ.get(UPLOADED_LOG_ENV)
+    if env:
+        return Path(env)
+    # output_dir is <downloads root>/<profile>; the uploader lives beside downloads.
+    return Path(output_dir).resolve().parent.parent / "uploader" / "uploaded.jsonl"
+
+
+def _uploaded_aweme_ids(output_dir, state=None):
+    """IDs already offloaded to Drive: local copy deleted on purpose, never re-download."""
+    ids = set()
+    if isinstance(state, dict):
+        ids.update(str(item) for item in state.get("uploaded_aweme_ids", []) or [])
+    log_path = _uploaded_log_path(output_dir)
+    try:
+        with open(log_path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                item_id = str(entry.get("item_id") or "")
+                if item_id:
+                    ids.add(item_id)
+    except OSError:
+        pass
+    return ids
+
+
 def _already_saved_media_file(output_path, image_urls, target_dir, aweme,
                               subdir_by_aweme_id=False, keep_full_title=True):
     """
     Return the on-disk file that proves this item was saved by an earlier run.
 
     Video items live at output_path. Every expected still and motion clip must
-    be valid before an album can be treated as complete.
+    be valid before an album can be treated as complete. If a caption changes,
+    filenames change too, so fall back to the stable aweme ID in the existing
+    filename/subdirectory before deciding to download the same story again.
     """
     motion_paths = _expected_live_photo_paths(
         target_dir, aweme, subdir_by_aweme_id, keep_full_title
     )
     if image_urls or motion_paths:
+        image_entries = collect_indexed_image_urls(aweme)
+        motion_indices = [index for index, _urls in collect_image_motion_urls(aweme)]
         stem = media_item_path(target_dir, aweme, suffix="", subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title)
-        required = [Path(f"{stem}_{index:02d}.jpg") for index, _url in collect_indexed_image_urls(aweme)] + motion_paths
+        required = [Path(f"{stem}_{index:02d}.jpg") for index, _url in image_entries] + motion_paths
         if required and all(_has_valid_media_file(path) for path in required):
             return required[0]
+        candidates = _previously_saved_paths_by_aweme_id(
+            target_dir, aweme, subdir_by_aweme_id
+        )
+        if image_entries:
+            first_index = image_entries[0][0]
+            suffix = f"_{first_index:02d}.jpg"
+            for candidate in candidates:
+                if not candidate.name.endswith(suffix):
+                    continue
+                prior_stem = candidate.with_name(candidate.name[:-len(suffix)])
+                prior_required = [
+                    Path(f"{prior_stem}_{index:02d}.jpg") for index, _url in image_entries
+                ] + [
+                    Path(f"{prior_stem}_{index:02d}_live.mp4") for index in motion_indices
+                ]
+                if prior_required and all(_has_valid_media_file(path) for path in prior_required):
+                    return prior_required[0]
+        elif motion_indices:
+            first_index = motion_indices[0]
+            suffix = f"_{first_index:02d}_live.mp4"
+            for candidate in candidates:
+                if not candidate.name.endswith(suffix):
+                    continue
+                prior_stem = candidate.with_name(candidate.name[:-len(suffix)])
+                prior_required = [
+                    Path(f"{prior_stem}_{index:02d}_live.mp4") for index in motion_indices
+                ]
+                if prior_required and all(_has_valid_media_file(path) for path in prior_required):
+                    return prior_required[0]
         return None
     if _has_valid_media_file(output_path):
         return output_path
+    for candidate in _previously_saved_paths_by_aweme_id(
+        target_dir, aweme, subdir_by_aweme_id
+    ):
+        if candidate.suffix.lower() == output_path.suffix.lower() and _has_valid_media_file(candidate):
+            return candidate
     return None
 
 
@@ -3821,6 +3906,7 @@ def download_aweme_items(
     downloaded_ids = set(str(item) for item in state.get(state_key, []))
     invalidated_ids = state.setdefault("_invalidated_download_ids", {}).setdefault(state_key, set())
     default_target_dir = Path(output_dir) / ("stories" if media_kind == "story" else "videos")
+    uploaded_ids = _uploaded_aweme_ids(output_dir, state)
     total_items = len(items)
     report_progress(
         progress_callback,
@@ -3853,6 +3939,9 @@ def download_aweme_items(
         existing_media = _already_saved_media_file(
             output_path, image_urls, target_dir, aweme, subdir_by_aweme_id, keep_full_title
         )
+        if existing_media is None and aweme_id and aweme_id in uploaded_ids:
+            # Uploaded to Drive and verified; local copy was removed on purpose.
+            existing_media = "uploaded"
         if existing_media is not None:
             result.skipped += 1
             if aweme_id:
