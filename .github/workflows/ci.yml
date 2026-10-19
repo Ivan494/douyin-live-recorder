@@ -29,4 +29,7 @@ jobs:
         run: |
           $env:PYTHONPATH = "src"
           python scripts/release_artifacts.py --source
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pytest src/tests scripts/test_release_defaults.py scripts/test_release_artifacts.py -q -W error::pytest.PytestUnraisableExceptionWarning
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/test_release_launcher.ps1
