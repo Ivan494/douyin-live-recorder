@@ -13,11 +13,11 @@ public static class ReleaseLauncher
         if (!File.Exists(executable))
             return "找不到录制程序：" + executable + "\n请完整解压发布包后重试。";
 
+        var windowsError = error as Win32Exception;
         var detail = new StringBuilder("无法启动录制程序：")
             .Append(executable)
-            .Append("\n\nWindows 报错：")
+            .Append(windowsError != null ? "\n\nWindows 报错：" : "\n\n错误详情：")
             .Append(error.Message);
-        var windowsError = error as Win32Exception;
         if (windowsError != null)
             detail.Append("\nWindows 错误代码: ").Append(windowsError.NativeErrorCode);
         detail.Append("\n\n如果 Windows 同时提示智能应用控制拦截，请将此错误和被拦截的文件路径告知开发者；用户名等个人目录信息可以打码。");
@@ -61,7 +61,13 @@ public static class ReleaseLauncher
                     if (!child.WaitForExit(90000)) { child.Kill(); return 2; }
                     return child.ExitCode;
                 }
-                return child.WaitForExit(2500) ? child.ExitCode : 0;
+                if (child.WaitForExit(2500))
+                {
+                    if (child.ExitCode != 0)
+                        throw new InvalidOperationException("录制程序启动后立即退出，退出代码: " + child.ExitCode);
+                    return 0;
+                }
+                return 0;
             }
         }
         catch (Exception error)
