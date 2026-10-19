@@ -19,6 +19,8 @@ Cookie），因此不会把你已经打开的抖音网页挤下线。
 `DouyinLiveRecorder-vX.Y.Z-win64.zip`。解压到任意目录，运行
 `DouyinLiveRecorder.exe`。已内置 Python 和 ffmpeg，不用再装别的。
 只有使用 YouTube 直播资料时才需要另行配置 yt-dlp；抖音功能无需它。
+当前 v1.2.9 发布包未签名，开启 Windows 智能应用控制的设备可能阻止启动；
+进展见 [issue #11](https://github.com/Ivan494/douyin-live-recorder/issues/11)。
 
 默认**不会**开机自启。若需要，在设置里打开即可。
 界面默认简体中文，可在设置里改成 English。
@@ -100,7 +102,14 @@ pwsh ./scripts/build_release.ps1 -Version 1.2.9 -FfmpegDir <含 ffmpeg.exe 和 f
 
 推送 `v*` 标签会在 GitHub Actions 上走同样的打包流程。
 
-发布流程使用独立的锁定依赖环境，验证源码与默认配置，只打包白名单文件，
+上面的本地命令生成未签名的测试包；Windows 智能应用控制开启时可能会拦截它。
+正式发布需要可信的 Windows 代码签名：使用 `-SignCommand` 指定签名程序，
+由它对打包目录中的每个原生文件（包括 EXE、DLL、PYD 和 FFmpeg）签名。
+签名程序每次接收一个文件的完整路径，不应把证书或密钥提交到仓库。
+发布工作流只会在配置了 `RELEASE_SIGN_COMMAND` 且所有签名验证通过时发布新标签；
+还需在开启智能应用控制的 Windows 环境验证最终压缩包。
+
+发布流程使用独立的锁定依赖环境，验证源码与默认配置，仅打包应用构建产物和明确列出的其他文件，
 解压到中文/空格路径后运行 EXE 自检。下载时可用 `SHA256SUMS.txt` 校验压缩包。
 发布包不包含个人资料、登录态、设备标识、浏览器配置、日志或录制文件。
 PR 会先验证完整构建；标签构建通过后才会公开发布。

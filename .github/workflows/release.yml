@@ -63,11 +63,22 @@ jobs:
           python scripts/release_artifacts.py --source
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pytest src/tests scripts/test_release_defaults.py scripts/test_release_artifacts.py -q -W error::pytest.PytestUnraisableExceptionWarning
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/test_release_launcher.ps1
       - name: Build, inspect, extract and run release self-test
         shell: pwsh
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
-        run: ./scripts/build_release.ps1 -Version $env:RELEASE_VERSION -FfmpegDir tools
+          RELEASE_SIGN_COMMAND: ${{ vars.RELEASE_SIGN_COMMAND }}
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            if (!$env:RELEASE_SIGN_COMMAND) {
+              throw 'Public releases require a trusted signer. Configure RELEASE_SIGN_COMMAND before creating a tag.'
+            }
+            ./scripts/build_release.ps1 -Version $env:RELEASE_VERSION -FfmpegDir tools -SignCommand $env:RELEASE_SIGN_COMMAND -RequireSignatures
+          } else {
+            ./scripts/build_release.ps1 -Version $env:RELEASE_VERSION -FfmpegDir tools
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: release-package
@@ -103,7 +114,7 @@ jobs:
           $zip = "release/DouyinLiveRecorder-v$env:RELEASE_VERSION-win64.zip"
           $expected = ((Get-Content release/SHA256SUMS.txt -Raw).Trim() -split '\s+')[0]
           if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Asset checksum mismatch' }
-          python scripts/release_artifacts.py --zip $zip
+          python scripts/release_artifacts.py --zip $zip --require-signatures
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           gh release create $env:GITHUB_REF_NAME --verify-tag --draft --title "抖音直播录制 v$env:RELEASE_VERSION" --notes-file .github/release-notes.md $zip release/SHA256SUMS.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
