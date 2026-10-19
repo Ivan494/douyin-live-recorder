@@ -52,6 +52,16 @@ $bundle = Join-Path $work 'exe\DouyinLiveRecorder'
 $executable = Join-Path $bundle 'DouyinLiveRecorder.exe'
 if (!(Test-Path -LiteralPath $executable)) { throw 'PyInstaller produced no executable.' }
 Invoke-Python @((Join-Path $PSScriptRoot 'release_artifacts.py'), '--exe', $executable)
+# pip may add environment-specific REQUESTED markers to copied distribution
+# metadata. They are install records, not runtime data; omit them before the
+# reviewed bundle inventory is checked and packaged.
+$internal = Join-Path $bundle '_internal'
+foreach ($metadata in Get-ChildItem -LiteralPath $internal -Directory -Filter '*.dist-info') {
+    $requested = Join-Path $metadata.FullName 'REQUESTED'
+    if (Test-Path -LiteralPath $requested -PathType Leaf) {
+        Remove-Item -LiteralPath $requested -Force
+    }
+}
 foreach ($item in Get-ChildItem -LiteralPath $bundle -Force) {
     Copy-Item -LiteralPath $item.FullName -Destination $app -Recurse -Force
 }
