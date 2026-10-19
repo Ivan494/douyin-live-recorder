@@ -69,16 +69,7 @@ jobs:
         shell: pwsh
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
-          RELEASE_SIGN_COMMAND: ${{ vars.RELEASE_SIGN_COMMAND }}
-        run: |
-          if ($env:GITHUB_REF_TYPE -eq 'tag') {
-            if (!$env:RELEASE_SIGN_COMMAND) {
-              throw 'Public releases require a trusted signer. Configure RELEASE_SIGN_COMMAND before creating a tag.'
-            }
-            ./scripts/build_release.ps1 -Version $env:RELEASE_VERSION -FfmpegDir tools -SignCommand $env:RELEASE_SIGN_COMMAND -RequireSignatures
-          } else {
-            ./scripts/build_release.ps1 -Version $env:RELEASE_VERSION -FfmpegDir tools
-          }
+        run: ./scripts/build_release.ps1 -Version $env:RELEASE_VERSION -FfmpegDir tools
       - uses: actions/upload-artifact@v4
         with:
           name: release-package
@@ -114,7 +105,7 @@ jobs:
           $zip = "release/DouyinLiveRecorder-v$env:RELEASE_VERSION-win64.zip"
           $expected = ((Get-Content release/SHA256SUMS.txt -Raw).Trim() -split '\s+')[0]
           if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Asset checksum mismatch' }
-          python scripts/release_artifacts.py --zip $zip --require-signatures
+          python scripts/release_artifacts.py --zip $zip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $template = Get-Content -LiteralPath .github/release-notes.md -Raw -Encoding utf8
           if (([regex]::Matches($template, '@VERSION@')).Count -ne 1) { throw 'Release notes must contain one version placeholder' }

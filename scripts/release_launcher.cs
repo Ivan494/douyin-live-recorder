@@ -59,7 +59,9 @@ public static class ReleaseLauncher
                 if (args.Contains("--self-test-report"))
                 {
                     if (!child.WaitForExit(90000)) { child.Kill(); return 2; }
-                    return child.ExitCode;
+                    if (child.ExitCode != 0)
+                        throw new InvalidOperationException("录制程序启动后立即退出，退出代码: " + child.ExitCode);
+                    return 0;
                 }
                 if (child.WaitForExit(2500))
                 {

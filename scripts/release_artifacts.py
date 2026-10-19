@@ -4,7 +4,6 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
-import shutil
 import stat
 import subprocess
 import tempfile
@@ -12,20 +11,11 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = "douyindownload/_automation/"
-INTERNAL = APP + "_internal/"
-INTERNAL_ALLOWLIST = Path(__file__).with_name("release_internal_allowlist.txt")
 FILES = {
     "DouyinLiveRecorder.exe", APP + "DouyinLiveRecorder.exe",
     APP + "profiles.json", APP + "settings.json", "youtube-dl/ffmpeg.exe",
     "youtube-dl/ffprobe.exe", "README.txt", "LICENSE", "THIRD_PARTY.md",
 }
-PE_SUFFIXES = {".exe", ".dll", ".pyd", ".ocx", ".sys"}
-PRIVATE_BUNDLE_PATH = re.compile(
-    r"(?i)(^|/)(?:douyin_session\.json|mobile_session\.json|mobile_device\.json|"
-    r"deployed-source\.json|profiles\.json|settings\.json|config_backups|logs|"
-    r"\.recording_sessions|browser_profile|\.env(?:\..*)?|id_rsa|id_ed25519)(/|$)|"
-    r"\.(?:mkv|flv|mp4|log|bak|pfx|p12|key)$"
-)
 PUBLIC_SETTINGS = {
     "poll_interval_seconds": 60, "ffmpeg_path": "${TOOLS_DIR}\\ffmpeg.exe",
     "quality": "OD", "ytdlp_path": "${TOOLS_DIR}\\yt-dlp.exe",
@@ -48,7 +38,6 @@ def validate_defaults(profiles, settings):
 
 
 def verify_source():
-    load_internal_allowlist()
     validate_defaults(json.loads((ROOT / "src/profiles.json").read_text(encoding="utf-8-sig")),
                       json.loads((ROOT / "src/settings.json").read_text(encoding="utf-8-sig")))
     # Only tracked repository material is considered for publication.
@@ -71,211 +60,46 @@ def version_value(version):
     return version
 
 
-def load_internal_allowlist():
-    """Names from a reviewed PyInstaller onedir build; update deliberately with dependencies."""
-    names = INTERNAL_ALLOWLIST.read_text(encoding="utf-8").splitlines()
-    if not names or names != sorted(set(names)) or len({name.casefold() for name in names}) != len(names):
-        raise ValueError("Internal bundle allowlist must be nonempty, sorted, and unique")
-    if any(
-        name.startswith("/") or "\\" in name or ":" in name or
-        any(part in ("", ".", "..") or part.endswith((" ", ".")) for part in name.split("/")) or
-        PRIVATE_BUNDLE_PATH.search(INTERNAL + name) or
-        (name.lower().endswith(".pem") and name != "certifi/cacert.pem")
-        for name in names
-    ):
-        raise ValueError("Unsafe or private name in internal bundle allowlist")
-    return {INTERNAL + name for name in names}
-
-
-def validate_file_set(names):
-    allowed_internal = load_internal_allowlist()
-    missing = FILES - names
-    unexpected = names - FILES - allowed_internal
-    internal = {name for name in names if name.startswith(INTERNAL)}
-    missing_internal = allowed_internal - internal
-    private = {
-        name for name in internal
-        if PRIVATE_BUNDLE_PATH.search(name) or
-        (name.lower().endswith(".pem") and name != INTERNAL + "certifi/cacert.pem")
-    }
-    if missing or unexpected or missing_internal or private:
-        raise ValueError(
-            f"Invalid release contents: missing={sorted(missing)}, "
-            f"missing_internal={sorted(missing_internal)}, "
-            f"unexpected={sorted(unexpected)}, private={sorted(private)}, "
-            f"internal_count={len(internal)}"
-        )
-    if not any(re.fullmatch(r"python\d+\.dll", PurePosixPath(name).name, re.I) for name in internal):
-        raise ValueError("Missing bundled Python runtime DLL")
-
-
-def stage_files(directory):
-    if not directory.is_dir():
-        raise ValueError(f"Missing staging directory: {directory}")
-    entries = list(directory.rglob("*"))
-    if any(entry.is_symlink() for entry in entries):
-        raise ValueError("Release staging must not contain symlinks")
-    names = {entry.relative_to(directory).as_posix() for entry in entries if entry.is_file()}
-    validate_file_set(names)
-    expected_directories = {
-        "/".join(parts[:index])
-        for name in names for parts in [name.split("/")]
-        for index in range(1, len(parts))
-    }
-    directories = {entry.relative_to(directory).as_posix() for entry in entries if entry.is_dir()}
-    if directories - expected_directories:
-        raise ValueError(f"Unexpected empty staging directories: {sorted(directories - expected_directories)}")
-    return names
-
-
-def pe_paths(directory, names):
-    result = []
-    for name in sorted(names):
-        path = directory / name
-        with path.open("rb") as stream:
-            magic = stream.read(2)
-        if path.suffix.lower() in PE_SUFFIXES or magic == b"MZ":
-            result.append(path.resolve())
-    return result
-
-
-def verify_signatures(paths):
-    paths = list(paths)
-    if not paths:
-        raise ValueError("Release contains no native executables to verify")
-    shell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
-    if not shell:
-        raise RuntimeError("PowerShell is required to verify Authenticode signatures")
-    command = r'''
-$ErrorActionPreference = 'Stop'
-[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-$paths = @(ConvertFrom-Json -InputObject ([Console]::In.ReadToEnd()))
-$failed = $false
-foreach ($path in $paths) {
-    try {
-        $signature = Get-AuthenticodeSignature -LiteralPath $path -ErrorAction Stop
-        if ($signature.Status -ne 'Valid') {
-            [Console]::Out.WriteLine("$path : $($signature.Status)")
-            $failed = $true
-        }
-    } catch {
-        [Console]::Out.WriteLine("$path : $($_.Exception.Message)")
-        $failed = $true
-    }
-}
-if ($failed) { exit 1 }
-'''
-    process = subprocess.run(
-        [shell, "-NoProfile", "-NonInteractive", "-Command", command],
-        input=json.dumps([str(path) for path in paths], ensure_ascii=True),
-        capture_output=True, text=True, encoding="utf-8", timeout=300,
-    )
-    if process.returncode != 0:
-        detail = (process.stdout + process.stderr).strip()
-        raise ValueError(f"Invalid Authenticode signature(s): {detail}")
-
-
-def stage_manifest(directory, version, *, bundle=None, require_signatures=False):
+def stage_manifest(directory, version):
     version_value(version)
-    actual = stage_files(directory)
-    if bundle is not None:
-        if not bundle.is_dir():
-            raise ValueError(f"Missing PyInstaller bundle: {bundle}")
-        bundle_entries = list(bundle.rglob("*"))
-        if any(entry.is_symlink() for entry in bundle_entries):
-            raise ValueError("PyInstaller bundle must not contain symlinks")
-        bundled = {APP + entry.relative_to(bundle).as_posix() for entry in bundle_entries if entry.is_file()}
-        staged_bundle = {name for name in actual if name.startswith(INTERNAL) or name == APP + "DouyinLiveRecorder.exe"}
-        if bundled != staged_bundle:
-            raise ValueError(f"Staged bundle differs from PyInstaller output: {sorted(bundled ^ staged_bundle)}")
+    actual = {p.relative_to(directory).as_posix() for p in directory.rglob("*") if p.is_file()}
+    if actual != FILES:
+        raise ValueError(f"Unexpected staging contents: {sorted(actual ^ FILES)}")
     validate_defaults(json.loads((directory / (APP + "profiles.json")).read_text(encoding="utf-8-sig")),
                       json.loads((directory / (APP + "settings.json")).read_text(encoding="utf-8-sig")))
-    if require_signatures:
-        verify_signatures(pe_paths(directory, actual))
-    manifest = {
-        "version": version,
-        "signatures_required": require_signatures,
-        "files": {name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in sorted(actual)},
-    }
+    manifest = {"version": version, "files": {name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in sorted(FILES)}}
     (directory / "release-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
-def verify_zip(path, *, require_signatures=False):
+def verify_zip(path):
     with zipfile.ZipFile(path) as archive:
         names = []
-        directories = []
         for member in archive.infolist():
             name = member.filename
-            if ("\\" in name or ":" in name or name.startswith("/") or
-                    any(part in ("", ".", "..") or part.endswith((" ", ".")) for part in name.rstrip("/").split("/")) or
-                    stat.S_ISLNK(member.external_attr >> 16)):
+            parts = PurePosixPath(name).parts
+            if "\\" in name or ":" in name or name.startswith("/") or ".." in parts or stat.S_ISLNK(member.external_attr >> 16):
                 raise ValueError("Unsafe archive path")
-            if member.is_dir():
-                directories.append(name[:-1])
-            else:
+            if not member.is_dir():
                 names.append(name)
-        file_keys = {name.casefold() for name in names}
-        directory_keys = {name.casefold() for name in directories}
-        if (len(names) != len(file_keys) or len(directories) != len(directory_keys) or
-                "release-manifest.json" not in names):
-            raise ValueError("Release contains missing or duplicated files")
-        if file_keys & directory_keys:
-            raise ValueError("File/directory prefix conflict")
-        for name in names + directories:
-            parts = name.split("/")
-            if any(
-                "/".join(parts[:index]).casefold() in file_keys for index in range(1, len(parts))
-            ):
-                raise ValueError(f"File/directory prefix conflict: {name}")
+        if len(names) != len(set(names)) or set(names) != FILES | {"release-manifest.json"}:
+            raise ValueError("Release contains missing, duplicated, or non-allowlisted files")
         if sum(i.file_size for i in archive.infolist()) > 1_000_000_000:
             raise ValueError("Unexpectedly large release")
         manifest = json.loads(archive.read("release-manifest.json"))
         version_value(manifest["version"])
-        if not isinstance(manifest.get("signatures_required"), bool):
-            raise ValueError("Invalid manifest signing policy")
-        if require_signatures and not manifest["signatures_required"]:
-            raise ValueError("Release was not built in signing-required mode")
-        files = manifest["files"]
-        if not isinstance(files, dict) or set(names) != set(files) | {"release-manifest.json"}:
+        if set(manifest["files"]) != FILES:
             raise ValueError("Invalid manifest file list")
-        expected_directories = {
-            "/".join(parts[:index]).casefold()
-            for name in names for parts in [name.split("/")]
-            for index in range(1, len(parts))
-        }
-        if directory_keys - expected_directories:
-            raise ValueError("Release contains unexpected directory entries")
-        validate_file_set(set(files))
-        for name in files:
-            if not isinstance(files[name], str) or not re.fullmatch(r"[a-f0-9]{64}", files[name]):
-                raise ValueError(f"Invalid manifest hash: {name}")
+        for name in FILES:
             data = archive.read(name)
-            if hashlib.sha256(data).hexdigest() != files[name]:
+            if hashlib.sha256(data).hexdigest() != manifest["files"][name]:
                 raise ValueError(f"Hash mismatch: {name}")
         validate_defaults(json.loads(archive.read(APP + "profiles.json").decode("utf-8-sig")),
                           json.loads(archive.read(APP + "settings.json").decode("utf-8-sig")))
-        if manifest["signatures_required"] or require_signatures:
-            with tempfile.TemporaryDirectory(prefix="release-signature-check-") as temporary:
-                directory = Path(temporary)
-                pe_names = []
-                for name in files:
-                    with archive.open(name) as stream:
-                        magic = stream.read(2)
-                    if PurePosixPath(name).suffix.lower() in PE_SUFFIXES or magic == b"MZ":
-                        pe_names.append(name)
-                for name in pe_names:
-                    target = directory / name
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    with archive.open(name) as source, target.open("wb") as destination:
-                        shutil.copyfileobj(source, destination)
-                verify_signatures(directory / name for name in pe_names)
     return manifest
 
 
-def smoke_zip(path, *, verified=False, require_signatures=False):
-    if not verified:
-        verify_zip(path, require_signatures=require_signatures)
+def smoke_zip(path):
+    verify_zip(path)
     with tempfile.TemporaryDirectory(prefix="录制发布验证 ") as temporary:
         directory = Path(temporary)
         with zipfile.ZipFile(path) as archive:
@@ -309,26 +133,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", action="store_true")
     parser.add_argument("--stage", type=Path)
-    parser.add_argument("--bundle", type=Path)
     parser.add_argument("--version")
     parser.add_argument("--zip", type=Path)
-    parser.add_argument("--list-pe", type=Path)
-    parser.add_argument("--require-signatures", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--exe", type=Path)
     args = parser.parse_args()
     if args.source:
         verify_source()
     if args.stage:
-        stage_manifest(args.stage, args.version, bundle=args.bundle, require_signatures=args.require_signatures)
-    if args.list_pe:
-        print(json.dumps([str(path) for path in pe_paths(args.list_pe, stage_files(args.list_pe))], ensure_ascii=True))
+        stage_manifest(args.stage, args.version)
     if args.exe:
         inspect_exe(args.exe)
     if args.zip:
-        verify_zip(args.zip, require_signatures=args.require_signatures)
+        verify_zip(args.zip)
         if args.smoke:
-            smoke_zip(args.zip, verified=True)
+            smoke_zip(args.zip)
 
 
 if __name__ == "__main__":

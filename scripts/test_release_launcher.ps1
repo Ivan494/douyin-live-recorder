@@ -61,7 +61,20 @@ try {
         throw "The launcher did not identify the genuinely missing child executable. Exit=$($missing.ExitCode); stderr=$($missing.ErrorText)"
     }
 
-    Write-Output 'PASS: launcher reports Windows start failures and distinguishes a missing child executable.'
+    $quickExitSource = Join-Path $tempRoot 'QuickExit.cs'
+    [IO.File]::WriteAllText($quickExitSource, 'public static class QuickExit { public static int Main(string[] args) { return 23; } }')
+    & $compiler /nologo /target:winexe /platform:x64 /optimize+ "/out:$child" $quickExitSource
+    if ($LASTEXITCODE -ne 0) { throw 'Quick-exit test executable compilation failed.' }
+    Write-Output 'Checking immediate child failure...'
+    $quickExit = Invoke-Launcher $launcher
+    if ($quickExit.ExitCode -ne 1 -or
+        !$quickExit.ErrorText.Contains('23') -or
+        !$quickExit.ErrorText.Contains($child) -or
+        $quickExit.ErrorText.Contains($extractAdvice)) {
+        throw "The launcher concealed an immediate child exit code. Exit=$($quickExit.ExitCode); stderr=$($quickExit.ErrorText)"
+    }
+
+    Write-Output 'PASS: launcher reports Windows start failures, missing files, and immediate child exits.'
 }
 finally {
     if (Test-Path -LiteralPath $tempRoot) {

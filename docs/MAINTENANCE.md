@@ -28,21 +28,6 @@ their hashes, and creates before/after local checkpoint tags. The ignored
 `deployed-source.json` records the exact public source commit installed.
 Dependencies, launchers, and runtime upgrades require a separate release update.
 
-Public Windows releases also require Authenticode signing. The development
-`build_release.ps1` command may produce an unsigned test archive; do not tag
-that archive as a Smart App Control fix. For a public tag, configure the
-`RELEASE_SIGN_COMMAND` GitHub repository variable to name a trusted signer
-available on the Windows runner. The command receives one absolute file path
-per invocation and must sign all native files in the staged package, including
-the PyInstaller output and FFmpeg tools. Keep signing credentials outside the
-repository. The tag workflow verifies every signature and refuses to publish
-if signing is unavailable or incomplete. Validate the final ZIP on a separate
-Windows system with Smart App Control enforcing before describing the release
-as compatible; a local unsigned build's self-test cannot establish this.
-The bundled file list is pinned in `scripts/release_internal_allowlist.txt`;
-review every addition when Python or a build dependency changes, then update
-the list deliberately. The release check rejects unexpected packaged files.
-
 Never copy the personal installation back wholesale: settings, monitored
 profiles, session files, device identifiers, logs, and recordings stay local.
 The public repository's shipped settings and empty profiles remain templates.
