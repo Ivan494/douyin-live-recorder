@@ -49,7 +49,7 @@ def test_clean_package_is_accepted(tmp_path):
 
 def test_checked_in_inventory_is_sorted_and_matches_reviewed_build():
     names = REAL_ALLOWLIST_LOADER()
-    assert len(names) == 1179
+    assert len(names) == 1175
     assert release.INTERNAL + 'certifi/cacert.pem' in names
     assert release.INTERNAL + 'python311.dll' in names
 

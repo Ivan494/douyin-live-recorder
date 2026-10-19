@@ -1076,7 +1076,6 @@ httpcore-1.0.9.dist-info/licenses/LICENSE.md
 httpx-0.28.1.dist-info/INSTALLER
 httpx-0.28.1.dist-info/METADATA
 httpx-0.28.1.dist-info/RECORD
-httpx-0.28.1.dist-info/REQUESTED
 httpx-0.28.1.dist-info/WHEEL
 httpx-0.28.1.dist-info/entry_points.txt
 httpx-0.28.1.dist-info/licenses/LICENSE.md
@@ -1098,7 +1097,6 @@ pycryptodome-3.23.0.dist-info/INSTALLER
 pycryptodome-3.23.0.dist-info/LICENSE.rst
 pycryptodome-3.23.0.dist-info/METADATA
 pycryptodome-3.23.0.dist-info/RECORD
-pycryptodome-3.23.0.dist-info/REQUESTED
 pycryptodome-3.23.0.dist-info/WHEEL
 pycryptodome-3.23.0.dist-info/top_level.txt
 pyexecjs-1.5.1.dist-info/INSTALLER
@@ -1112,7 +1110,6 @@ python311.dll
 requests-2.34.2.dist-info/INSTALLER
 requests-2.34.2.dist-info/METADATA
 requests-2.34.2.dist-info/RECORD
-requests-2.34.2.dist-info/REQUESTED
 requests-2.34.2.dist-info/WHEEL
 requests-2.34.2.dist-info/licenses/LICENSE
 requests-2.34.2.dist-info/licenses/NOTICE
@@ -1127,7 +1124,6 @@ six-1.17.0.dist-info/top_level.txt
 streamget-4.0.10.dist-info/INSTALLER
 streamget-4.0.10.dist-info/METADATA
 streamget-4.0.10.dist-info/RECORD
-streamget-4.0.10.dist-info/REQUESTED
 streamget-4.0.10.dist-info/WHEEL
 streamget-4.0.10.dist-info/entry_points.txt
 streamget-4.0.10.dist-info/licenses/LICENSE
