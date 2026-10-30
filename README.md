@@ -85,6 +85,23 @@ life/feed。需要已保存的抖音 App 登录（界面里的 **抖音 App 登�
 python src/douyin_media_downloader.py --profile-url <用户主页> --stories --output-dir <目录>
 ```
 
+近期日常超过首批 20 条时，优先使用接口返回的完整日常 ID/游标目录，按官方 App
+的 `/aweme/v2/new/story/feed/` 请求加载其余内容，验证所属用户并合并去重。
+每轮主页请求及目录加载合计最多 15 次，未完成的目录保存进度，下轮继续。
+该路径已在真实 40 条日常的账号验证。目录缺失或不完整时，才尝试扩大主页窗口
+（最多 320 条）；没有新内容就停止并显示未完成，不会声称已取完。
+历史列表仍使用明确返回的 `next_offset`；日常目录使用其自身游标及上下界，
+不会把某个作品的发布时间猜成历史列表偏移量。
+扩大近期日常数量的请求失败或缺少必要元数据时，保留已取得的内容，并用上次
+成功的请求数量继续历史列表；近期日常仍显示未完成，不会误报全部取完。
+
+“下次继续扫描”表示本次达到页数上限且已保存翻页位置。
+“分页停滞”“获取上限”或“接口请求失败”表示列表仍不完整，重复检查不保证补齐。
+作品能下载不代表日常接口也可用；先确认同一登录账号能在 App 中看到目标日常。
+诊断原因保存在输出目录的 `douyin_media_state.json` → `last_summary.stories.message`
+（界面使用 `scan_reason` 显示简短分类）。反馈时只提供脱敏后的原因，不要上传整个
+状态文件、Cookie、账号标识或带签名的媒体链接。
+
 ## 测试
 
 ```text
@@ -200,6 +217,28 @@ profile, or:
 ```text
 python src/douyin_media_downloader.py --profile-url <user-url> --stories --output-dir <dir>
 ```
+
+When the active bucket exceeds 20 stories, a complete ID/cursor catalog is
+loaded through the official app's `/aweme/v2/new/story/feed/` protocol. Results
+must match the catalog and author. Profile requests and catalog pages share a
+15-request budget, with unfinished catalog progress saved for the next check.
+This path was verified on a live 40-story account. Missing or incomplete catalogs
+retain the bounded larger-window fallback (up to 320); stalled responses remain
+explicitly incomplete. Archive pages follow explicit `next_offset` values, while
+active catalogs use their own item cursors and group bounds. Publication times
+are never guessed as archive offsets. Access still depends on the saved login.
+If an active-window retry fails or loses required metadata, available items
+are retained and archive pagination continues with the last working request
+size. The active scan remains incomplete rather than claiming full recovery.
+
+“Continuing next check” means the request budget was reached and a continuation
+was saved. A stalled list, active limit, or failed request remains incomplete;
+another check does not guarantee recovery. Working post downloads do not prove
+that the story API is available. Confirm the same login can see the stories in
+the app. Local diagnostics are in the output folder's `douyin_media_state.json`
+under `last_summary.stories.message`; `scan_reason` supplies the short UI label.
+Share only the redacted reason, not the whole state file, cookies, account IDs,
+or signed media links.
 
 ## Tests
 
