@@ -235,8 +235,10 @@ def test_download_profile_uses_same_selected_account_for_metadata_and_binary(
         metadata_cookies.append(cookie_header)
         return [item], "synthetic story metadata"
 
-    def author_stories(_client, _sec_uid, *, user_id="", cookie_header="", scan_state=None):
+    def author_stories(_client, _sec_uid, *, user_id="", cookie_header="", scan_state=None,
+                       defer_completion_reset=False):
         assert isinstance(scan_state, dict)
+        assert defer_completion_reset
         if route == "stories_author":
             metadata_cookies.append(cookie_header)
             return media.MobileStoryFeedResult([item], "synthetic author story metadata", complete=True)
