@@ -89,6 +89,8 @@ python src/douyin_media_downloader.py --profile-url <用户主页> --stories --o
 合并去重；如果服务端不再返回新内容，就停止扩大并提示分页停滞。
 这不是已验证的独立分页接口，不能保证每个账号都能取完；历史列表仍只使用接口
 明确返回的 `next_offset`，不会把时间戳猜成翻页游标。
+扩大近期日常数量的请求失败或缺少必要元数据时，保留已取得的内容，并用上次
+成功的请求数量继续历史列表；近期日常仍显示未完成，不会误报全部取完。
 
 “下次继续扫描”表示本次达到页数上限且已保存翻页位置。
 “分页停滞”“获取上限”或“接口请求失败”表示列表仍不完整，重复检查不保证补齐。
@@ -219,6 +221,9 @@ unique items. It stops expanding if the server returns no new items. This is
 a bounded recovery attempt, not a verified separate active-page protocol or a
 guarantee of full access for every account. Archive pagination still follows
 only explicit `next_offset` values; timestamps are never guessed as offsets.
+If an active-window retry fails or loses required metadata, available items
+are retained and archive pagination continues with the last working request
+size. The active scan remains incomplete rather than claiming full recovery.
 
 “Continuing next check” means the request budget was reached and a continuation
 was saved. A stalled list, active limit, or failed request remains incomplete;

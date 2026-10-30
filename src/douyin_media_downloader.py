@@ -745,6 +745,7 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
         active_ids = set()
         active_retry = False
         active_blocked = False
+        active_archive_page = None
         for page in range(15):
             data = None
             page_error = "invalid response"
@@ -774,14 +775,23 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                 break
             if data is None:
                 author_error(f"{path}: {page_error}")
-                break
+                if not active_retry or page_extra["offset"] != "0" or active_archive_page is None:
+                    break
+                # Enlarging the active window must not discard a successful
+                # archive head. Continue its explicit cursor with the last
+                # working request size while keeping the active scan partial.
+                data, page_extra = active_archive_page
+                active_blocked = True
+                active_retry = False
             append_items(_story_items_from_feed_payload(data))
             active_data = data.get("active_data")
             if (active_retry and page_extra["offset"] == "0"
                     and (not isinstance(active_data, dict) or "has_more" not in active_data)):
                 author_error(f"{path}: missing active pagination result", "pagination")
                 active_blocked = True
-            if (path == STORY_PROFILE_LIST_PATH and page_extra["offset"] == "0"
+                if active_archive_page is not None:
+                    data, page_extra = active_archive_page
+            if (not active_blocked and path == STORY_PROFILE_LIST_PATH and page_extra["offset"] == "0"
                     and isinstance(active_data, dict)
                     and _story_has_more(active_data.get("has_more"))):
                 # active_data.has_more is independent of the archive's
@@ -803,10 +813,18 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                 else:
                     active_ids.update(current_ids)
                     active_retry = True
+                    active_archive_page = (data, dict(page_extra))
+                    # Retain progress even if cancellation interrupts the
+                    # enlargement before the archive loop gets another turn.
+                    pending_offset = _story_cursor(data.get("next_offset"))
+                    if (continuation is not None and _story_has_more(data.get("has_more"))
+                            and pending_offset and pending_offset not in seen_offsets):
+                        continuation["author_offsets"][path] = resume_offset or pending_offset
                     page_extra["active_data_size"] = str(min(size * 2, MAX_ACTIVE_STORY_WINDOW))
                     _cancel_wait(0.3)
                     continue
-            elif isinstance(active_data, dict) and _story_has_more(active_data.get("has_more")):
+            elif (not active_blocked and isinstance(active_data, dict)
+                  and _story_has_more(active_data.get("has_more"))):
                 # A later archive page (or another endpoint) can also report
                 # an unfinished active bucket. Do not mistake archive exhaustion
                 # for active completion or map its cursor to the active list.

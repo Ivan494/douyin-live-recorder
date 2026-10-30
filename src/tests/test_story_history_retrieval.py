@@ -581,6 +581,105 @@ def test_failed_active_retry_preserves_downloadable_first_page():
     assert [item["aweme_id"] for item in result[0]] == ["first"]
 
 
+@pytest.mark.parametrize("failure", ["timeout", "status", "invalid_json", "missing_metadata"])
+@pytest.mark.parametrize("resume", [None, "300"])
+def test_failed_active_enlargement_still_reads_archive(failure, resume):
+    state = {}
+    if resume:
+        media._story_scan_state(state, AUTHOR, "sessionid=test")["author_offsets"][media.STORY_PROFILE_LIST_PATH] = resume
+    visible = [story(str(n)) for n in range(20)]
+
+    def response(path, extra, _host):
+        if path != media.STORY_PROFILE_LIST_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        if extra["offset"] != "0":
+            assert extra["offset"] == (resume or "20")
+            assert extra["active_data_size"] == "20"
+            return {"status_code": 0, "data": [story("archive")], "has_more": False}
+        if extra["active_data_size"] != "20":
+            if failure == "timeout":
+                raise httpx.ReadTimeout("synthetic timeout")
+            if failure == "invalid_json":
+                raise ValueError("synthetic invalid JSON")
+            if failure == "status":
+                return {"status_code": 5}
+            return {"status_code": 0, "has_more": False}
+        return {"status_code": 0, "active_data": {"data": visible, "has_more": True},
+                "has_more": True, "next_offset": 20}
+
+    with mobile_requests(response) as calls:
+        result = fetch(scan_state=state)
+    assert not result.complete
+    assert result.scan_reason == ("pagination" if failure == "missing_metadata" else "request_failed")
+    assert [item["aweme_id"] for item in result[0]] == [*[str(n) for n in range(20)], "archive"]
+    assert state["story_scan"]["author_offsets"] == {}
+    assert [extra["offset"] for path, extra, _ in calls
+            if path == media.STORY_PROFILE_LIST_PATH][-1] == (resume or "20")
+
+
+def test_failed_later_enlargement_uses_last_working_size_for_archive():
+    def response(path, extra, _host):
+        if path != media.STORY_PROFILE_LIST_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        size = int(extra["active_data_size"])
+        if size > 40:
+            raise httpx.ReadTimeout("synthetic window limit")
+        if extra["offset"] != "0":
+            assert size == 40
+            return {"status_code": 0, "data": [story("archive")], "has_more": False}
+        return {"status_code": 0, "active_data": {
+            "data": [story(str(n)) for n in range(size)], "has_more": True},
+            "has_more": True, "next_offset": 20}
+
+    with mobile_requests(response):
+        result = fetch()
+    assert len(result[0]) == 41
+    assert not result.complete
+    assert result.scan_reason == "request_failed"
+
+
+def test_archive_checkpoint_survives_cancellation_during_active_enlargement():
+    state = {}
+    def response(path, extra, _host):
+        if extra["active_data_size"] != "20":
+            raise InterruptedError("synthetic cancellation")
+        return {"status_code": 0, "active_data": {"data": [story("first")], "has_more": True},
+                "has_more": True, "next_offset": 20}
+
+    with mobile_requests(response), pytest.raises(InterruptedError):
+        fetch(scan_state=state)
+    assert state["story_scan"]["author_offsets"][media.STORY_PROFILE_LIST_PATH] == "20"
+
+
+def test_failed_enlargement_retains_bounded_archive_resume():
+    state = {}
+    def response(path, extra, _host):
+        if path != media.STORY_PROFILE_LIST_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        if extra["active_data_size"] != "20":
+            raise httpx.ReadTimeout("synthetic window limit")
+        offset = int(extra["offset"])
+        if offset == 0:
+            return {"status_code": 0, "active_data": {"data": [story("active")], "has_more": True},
+                    "has_more": True, "next_offset": 20}
+        return {"status_code": 0, "data": [story(str(offset))],
+                "has_more": offset < 300, "next_offset": offset + 20}
+
+    with mobile_requests(response) as calls:
+        first = fetch(scan_state=state)
+        assert not first.complete
+        assert state["story_scan"]["author_offsets"][media.STORY_PROFILE_LIST_PATH] == "280"
+        assert len([c for c in calls if c[0] == media.STORY_PROFILE_LIST_PATH]) == 16
+        calls.clear()
+        second = fetch(scan_state=state)
+    assert [extra["offset"] for path, extra, _ in calls
+            if path == media.STORY_PROFILE_LIST_PATH] == ["0", "0", "0", "280", "300"]
+    assert [item["aweme_id"] for item in second[0]] == ["active", "280", "300"]
+    assert not second.complete
+    assert second.scan_reason == "request_failed"
+    assert state["story_scan"]["author_offsets"] == {}
+
+
 def test_active_more_on_archive_page_cannot_be_declared_complete():
     def response(path, extra, _host):
         if path != media.STORY_PROFILE_LIST_PATH:
