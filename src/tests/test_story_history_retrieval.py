@@ -581,6 +581,23 @@ def test_failed_active_retry_preserves_downloadable_first_page():
     assert [item["aweme_id"] for item in result[0]] == ["first"]
 
 
+def test_active_more_on_archive_page_cannot_be_declared_complete():
+    def response(path, extra, _host):
+        if path != media.STORY_PROFILE_LIST_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        if extra["offset"] == "0":
+            return {"status_code": 0, "active_data": {"data": [], "has_more": False},
+                    "has_more": True, "next_offset": 20}
+        return {"status_code": 0, "active_data": {"data": [story("later")], "has_more": True},
+                "has_more": False}
+
+    with mobile_requests(response):
+        result = fetch()
+    assert not result.complete
+    assert result.scan_reason == "pagination"
+    assert [item["aweme_id"] for item in result[0]] == ["later"]
+
+
 @pytest.mark.parametrize("error", [InterruptedError("cancelled"), media.LoginRequiredError("expired")])
 def test_active_retry_respects_cancellation_and_login_rejection(error):
     def response(_path, extra, _host):

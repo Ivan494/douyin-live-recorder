@@ -806,6 +806,12 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                     page_extra["active_data_size"] = str(min(size * 2, MAX_ACTIVE_STORY_WINDOW))
                     _cancel_wait(0.3)
                     continue
+            elif isinstance(active_data, dict) and _story_has_more(active_data.get("has_more")):
+                # A later archive page (or another endpoint) can also report
+                # an unfinished active bucket. Do not mistake archive exhaustion
+                # for active completion or map its cursor to the active list.
+                author_error(f"{path}: no verified active pagination cursor", "pagination")
+                active_blocked = True
             if not _story_has_more(data.get("has_more")):
                 complete = not active_blocked
                 if continuation is not None:
