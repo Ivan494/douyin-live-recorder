@@ -85,10 +85,13 @@ life/feed。需要已保存的抖音 App 登录（界面里的 **抖音 App 登�
 python src/douyin_media_downloader.py --profile-url <用户主页> --stories --output-dir <目录>
 ```
 
-近期日常超过首批 20 条时，程序会尝试扩大同一接口的获取数量（最多 320 条），
-合并去重；如果服务端不再返回新内容，就停止扩大并提示分页停滞。
-这不是已验证的独立分页接口，不能保证每个账号都能取完；历史列表仍只使用接口
-明确返回的 `next_offset`，不会把时间戳猜成翻页游标。
+近期日常超过首批 20 条时，优先使用接口返回的完整日常 ID/游标目录，按官方 App
+的 `/aweme/v2/new/story/feed/` 请求加载其余内容，验证所属用户并合并去重。
+每轮主页请求及目录加载合计最多 15 次，未完成的目录保存进度，下轮继续。
+该路径已在真实 40 条日常的账号验证。目录缺失或不完整时，才尝试扩大主页窗口
+（最多 320 条）；没有新内容就停止并显示未完成，不会声称已取完。
+历史列表仍使用明确返回的 `next_offset`；日常目录使用其自身游标及上下界，
+不会把某个作品的发布时间猜成历史列表偏移量。
 扩大近期日常数量的请求失败或缺少必要元数据时，保留已取得的内容，并用上次
 成功的请求数量继续历史列表；近期日常仍显示未完成，不会误报全部取完。
 
@@ -215,12 +218,15 @@ profile, or:
 python src/douyin_media_downloader.py --profile-url <user-url> --stories --output-dir <dir>
 ```
 
-When the active bucket reports more than its first 20 stories, the downloader
-tries a larger `active_data_size` on the same endpoint, up to 320, and merges
-unique items. It stops expanding if the server returns no new items. This is
-a bounded recovery attempt, not a verified separate active-page protocol or a
-guarantee of full access for every account. Archive pagination still follows
-only explicit `next_offset` values; timestamps are never guessed as offsets.
+When the active bucket exceeds 20 stories, a complete ID/cursor catalog is
+loaded through the official app's `/aweme/v2/new/story/feed/` protocol. Results
+must match the catalog and author. Profile requests and catalog pages share a
+15-request budget, with unfinished catalog progress saved for the next check.
+This path was verified on a live 40-story account. Missing or incomplete catalogs
+retain the bounded larger-window fallback (up to 320); stalled responses remain
+explicitly incomplete. Archive pages follow explicit `next_offset` values, while
+active catalogs use their own item cursors and group bounds. Publication times
+are never guessed as archive offsets. Access still depends on the saved login.
 If an active-window retry fails or loses required metadata, available items
 are retained and archive pagination continues with the last working request
 size. The active scan remains incomplete rather than claiming full recovery.
