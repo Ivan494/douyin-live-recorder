@@ -250,15 +250,22 @@ def expand_portable_path(value):
         "%DOWNLOAD_ROOT%": ROOT_DOWNLOAD_DIR,
         "${TOOLS_DIR}": TOOLS_DIR,
         "%TOOLS_DIR%": TOOLS_DIR,
-        r"E:\douyindownload": ROOT_DOWNLOAD_DIR,
-        "E:/douyindownload": ROOT_DOWNLOAD_DIR,
-        r"E:\youtube-dl": TOOLS_DIR,
-        "E:/youtube-dl": TOOLS_DIR,
     }
-    expanded = value
     for marker, path in replacements.items():
-        expanded = expanded.replace(marker, str(path))
-    return expanded
+        if value == marker or value.startswith((marker + "\\", marker + "/")):
+            return str(path) + value[len(marker):]
+    # Do not remigrate a current install nested under a historical root, or
+    # recursively replace a root just produced by expanding a portable token.
+    normalized = value.replace("/", "\\").casefold()
+    for root in (PACK_ROOT, ROOT_DOWNLOAD_DIR, TOOLS_DIR):
+        prefix = str(root).replace("/", "\\").rstrip("\\").casefold()
+        if normalized == prefix or normalized.startswith(prefix + "\\"):
+            return value
+    for legacy, root in ((r"E:\douyindownload", ROOT_DOWNLOAD_DIR), (r"E:\youtube-dl", TOOLS_DIR)):
+        prefix = legacy.casefold()
+        if normalized == prefix or normalized.startswith(prefix + "\\"):
+            return str(root) + value[len(legacy):]
+    return value
 
 
 def portableize_path(value):
@@ -266,11 +273,13 @@ def portableize_path(value):
         return value
 
     def replace_prefix(text, root, marker):
-        root_text = str(root)
+        root_text = str(root).rstrip("\\/")
         if os.name == "nt":
-            matches = text.casefold().startswith(root_text.casefold())
+            candidate = text.replace("/", "\\").casefold()
+            prefix = root_text.replace("/", "\\").casefold()
+            matches = candidate == prefix or candidate.startswith(prefix + "\\")
         else:
-            matches = text.startswith(root_text)
+            matches = text == root_text or text.startswith(root_text + "/")
         if not matches:
             return text
         return marker + text[len(root_text):]
