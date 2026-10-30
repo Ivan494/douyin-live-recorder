@@ -19,6 +19,8 @@ Cookie），因此不会把你已经打开的抖音网页挤下线。
 `DouyinLiveRecorder-vX.Y.Z-win64.zip`。解压到任意目录，运行
 `DouyinLiveRecorder.exe`。已内置 Python 和 ffmpeg，不用再装别的。
 只有使用 YouTube 直播资料时才需要另行配置 yt-dlp；抖音功能无需它。
+发布包未做 Windows 代码签名，开启智能应用控制的设备可能阻止启动；
+[#11](https://github.com/Ivan494/douyin-live-recorder/issues/11) 尚未解决。
 
 默认**不会**开机自启。若需要，在设置里打开即可。
 界面默认简体中文，可在设置里改成 English。
@@ -117,6 +119,9 @@ pwsh ./scripts/build_release.ps1 -Version 1.2.9 -FfmpegDir <含 ffmpeg.exe 和 f
 
 推送 `v*` 标签会在 GitHub Actions 上走同样的打包流程。
 
+发布包未签名；解压后的离线自检不能证明 Windows 智能应用控制会放行。
+从源码运行需要自己安装 Python 和 FFmpeg，也不能保证避开该拦截。
+
 发布流程使用独立的锁定依赖环境，验证源码与默认配置，只打包白名单文件，
 解压到中文/空格路径后运行 EXE 自检。下载时可用 `SHA256SUMS.txt` 校验压缩包。
 发布包不包含个人资料、登录态、设备标识、浏览器配置、日志或录制文件。
@@ -149,6 +154,8 @@ Grab the latest `DouyinLiveRecorder-vX.Y.Z-win64.zip` from
 Unzip anywhere and run `DouyinLiveRecorder.exe`. Python and ffmpeg are
 bundled; nothing else to install.
 yt-dlp is only needed for YouTube live profiles and must be configured separately.
+Release ZIPs are unsigned and may be blocked by Windows Smart App Control;
+[issue #11](https://github.com/Ivan494/douyin-live-recorder/issues/11) remains open.
 
 The app does **not** start with Windows unless you turn that on in Settings.
 The interface defaults to Simplified Chinese; switch to English in Settings.
@@ -254,6 +261,10 @@ pwsh ./scripts/build_release.ps1 -Version 1.2.9 -FfmpegDir <folder-with-ffmpeg.e
 ```
 
 Pushing a `v*` tag runs the same packaging on GitHub Actions.
+
+Release ZIPs are unsigned. The extracted-package self-test does not establish
+Smart App Control compatibility. Running from source requires your own Python
+and FFmpeg installation and is not a guaranteed workaround for this block.
 
 ## Disclaimer
 
