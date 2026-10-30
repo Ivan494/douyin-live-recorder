@@ -762,7 +762,7 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                 seen_ids.add(item_id)
             collected.append(item)
 
-    def recover_active_catalog(active_data, budget):
+    def recover_active_catalog(active_data, archive_head, budget):
         # Official Android 40.9.1 Story25FeedApi / Story25 pager:
         # GET v2/new/story/feed, direct=0 (LOAD_MORE), item cursor + 1,
         # with the group's explicit min/max bounds. This was verified live
@@ -782,6 +782,32 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
         if catalog is None:
             return None
         entries, lower, upper = catalog
+        if continuation is not None:
+            from hashlib import sha256
+            # A completed stream is reusable only while the catalog (including
+            # its cursor bounds) and the effective archive head stay the same.
+            # Hash only pagination/identity metadata, not volatile media URLs.
+            archive_ids = sorted(str(item.get("aweme_id") or item.get("group_id"))
+                                 for item in _story_items_from_feed_payload(
+                                     {k: v for k, v in archive_head.items() if k != "active_data"})
+                                 if item.get("aweme_id") or item.get("group_id"))
+            scan_key = sha256(json.dumps(
+                [entries, lower, upper, sorted(head_ids), archive_ids,
+                 _story_has_more(archive_head.get("has_more")),
+                 _story_cursor(archive_head.get("next_offset"))], sort_keys=True
+            ).encode("utf-8")).hexdigest()
+            if continuation.get("profile_scan_key") != scan_key:
+                continuation.pop("active_story_ids", None)
+                continuation.pop("profile_archive_complete", None)
+                if "profile_scan_key" in continuation:
+                    continuation["author_offsets"].pop(STORY_PROFILE_LIST_PATH, None)
+                continuation["profile_scan_key"] = scan_key
+        # Reserve an archive turn even when this is the head saved before an
+        # enlargement fallback. Once exhausted, retain that fact until the
+        # catalog finishes instead of restarting the archive on the next poll.
+        archive_complete = continuation is not None and continuation.get("profile_archive_complete") is True
+        if _story_has_more(archive_head.get("has_more")) and not archive_complete:
+            budget -= 1
         previous = continuation.get("active_story_ids", []) if continuation is not None else []
         visited = set(str(item) for item in previous) & entries.keys() if isinstance(previous, list) else set()
         visited.update(seen_ids & entries.keys())
@@ -827,7 +853,7 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                 return False, used
             group = payload.get("story_group")
             returned_catalog = _story_group_catalog(group)
-            if returned_catalog is None or returned_catalog[0] != entries:
+            if returned_catalog != catalog:
                 author_error("active story catalog: missing or changed pagination metadata", "pagination")
                 return False, used
             page_items = [item for item in _story_items_from_feed_payload({"data": group})
@@ -840,7 +866,8 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
             visited.update(added)
             _cancel_wait(0.3)
         if continuation is not None:
-            continuation.pop("active_story_ids", None)
+            # Keep active completion until the archive also finishes.
+            continuation["active_story_ids"] = sorted(visited)
         return True, used
 
     # Both author sources must finish successfully before their empty result
@@ -899,24 +926,26 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                 active_retry = False
             append_items(_story_items_from_feed_payload(data))
             active_data = data.get("active_data")
+            missing_active_page = (active_retry and page_extra["offset"] == "0"
+                                   and (not isinstance(active_data, dict) or "has_more" not in active_data))
+            if missing_active_page and active_archive_page is not None:
+                # Select the effective archive head before spending the shared
+                # budget, while keeping the enlarged active catalog available.
+                data, page_extra = active_archive_page
             catalog_result = None
             if (path == STORY_PROFILE_LIST_PATH and page_extra["offset"] == "0"
                     and isinstance(active_data, dict) and not active_blocked):
-                # Reserve one request for a pending archive page so a catalog
-                # that fills the budget cannot starve archive pagination on
-                # every poll (its completion is not persisted across checks).
-                archive_pending = 1 if _story_has_more(data.get("has_more")) else 0
-                catalog_result = recover_active_catalog(active_data, 15 - pages_fetched - archive_pending)
+                catalog_result = recover_active_catalog(active_data, data, 15 - pages_fetched)
                 if catalog_result is not None:
                     catalog_complete, used = catalog_result
                     pages_fetched += used
                     active_blocked = not catalog_complete
-            if (active_retry and page_extra["offset"] == "0"
-                    and (not isinstance(active_data, dict) or "has_more" not in active_data)):
+                    if continuation is not None:
+                        # Catalog/head changes invalidate the saved offset too.
+                        resume_offset = _story_cursor(continuation["author_offsets"].get(path))
+            if missing_active_page and catalog_result is None:
                 author_error(f"{path}: missing active pagination result", "pagination")
                 active_blocked = True
-                if active_archive_page is not None:
-                    data, page_extra = active_archive_page
             if (catalog_result is None and not active_blocked
                     and path == STORY_PROFILE_LIST_PATH and page_extra["offset"] == "0"
                     and isinstance(active_data, dict)
@@ -957,10 +986,27 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                 # for active completion or map its cursor to the active list.
                 author_error(f"{path}: no verified active pagination cursor", "pagination")
                 active_blocked = True
-            if not _story_has_more(data.get("has_more")):
+            if (path == STORY_PROFILE_LIST_PATH and page_extra["offset"] == "0"
+                    and catalog_result is None and continuation is not None):
+                # A catalog may first appear during enlargement, so only
+                # discard old catalog progress after those retries settle.
+                if "profile_scan_key" in continuation:
+                    continuation["author_offsets"].pop(path, None)
+                    resume_offset = ""
+                for key in ("profile_scan_key", "active_story_ids", "profile_archive_complete"):
+                    continuation.pop(key, None)
+            archive_complete = (catalog_result is not None and continuation is not None
+                                and continuation.get("profile_archive_complete") is True)
+            if not _story_has_more(data.get("has_more")) or archive_complete:
                 complete = not active_blocked
                 if continuation is not None:
                     continuation["author_offsets"].pop(path, None)
+                    if (path == STORY_PROFILE_LIST_PATH and "profile_scan_key" in continuation
+                            and (page_extra["offset"] == "0" or not (
+                                isinstance(active_data, dict) and _story_has_more(active_data.get("has_more"))))):
+                        # Do not cache an archive response whose active bucket
+                        # still needs unverified pagination.
+                        continuation["profile_archive_complete"] = True
                 break
             next_offset = data.get("next_offset")
             if isinstance(next_offset, bool) or not isinstance(next_offset, (int, str)):
@@ -991,6 +1037,9 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
             _cancel_wait(0.3)
         if complete:
             completed_author_variants += 1
+            if path == STORY_PROFILE_LIST_PATH and continuation is not None:
+                for key in ("profile_scan_key", "active_story_ids", "profile_archive_complete"):
+                    continuation.pop(key, None)
 
     author_source = f"{MOBILE_API_HOST}{STORY_PROFILE_LIST_PATH} + {STORY_FEED_PATH}"
     author_complete = len(profile_variants) == 2 and completed_author_variants == 2
