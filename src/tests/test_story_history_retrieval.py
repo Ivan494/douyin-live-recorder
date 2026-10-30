@@ -817,6 +817,28 @@ def test_catalog_cancel_and_login_errors_propagate(error):
         fetch(scan_state={})
 
 
+@pytest.mark.parametrize("failure", ["timeout", "server_error"])
+def test_catalog_transient_failure_retries_once_within_the_shared_budget(failure):
+    attempts = {}
+    def response(path, extra, _host):
+        if path == media.STORY_PROFILE_LIST_PATH:
+            return catalog_head()
+        if path != media.NEW_STORY_FEED_V2_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        cursor = extra["cursor"]
+        attempts[cursor] = attempts.get(cursor, 0) + 1
+        if attempts[cursor] == 1:
+            if failure == "timeout":
+                raise httpx.ReadTimeout("synthetic transient failure")
+            return {"status_code": 5}
+        return catalog_page(extra)
+    with mobile_requests(response):
+        result = fetch(scan_state={})
+    assert result.complete
+    assert len(result[0]) == 40
+    assert set(attempts.values()) == {2}
+
+
 def test_catalog_request_budget_preserves_independent_archive_checkpoint():
     state = {}
     def response(path, extra, _host):

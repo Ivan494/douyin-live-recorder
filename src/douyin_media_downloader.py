@@ -795,21 +795,35 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
             item_id = next(item_id for item_id in entries if item_id not in visited)
             extra = {"to_uid": numeric_uid, "cursor": str(int(entries[item_id]) + 1),
                      "direct": "0", "min_cursor": lower, "max_cursor": upper}
-            used += 1
-            try:
-                response = _mobile_signed_request(client, "GET", NEW_STORY_FEED_V2_PATH, extra,
-                                                  cookie_header, device_id, install_id,
-                                                  host=MOBILE_API_HOST, full_sign=True)
-                response.raise_for_status()
-                payload = response.json()
-                _raise_mobile_login_required(payload)
-                if not isinstance(payload, dict) or payload.get("status_code") != 0:
-                    author_error("active story catalog: request failed")
-                    return False, used
-            except (LoginRequiredError, InterruptedError):
-                raise
-            except Exception:
-                author_error("active story catalog: request failed")
+            payload = None
+            failure = "invalid response"
+            for attempt in range(2):
+                if used >= budget:
+                    break
+                used += 1
+                try:
+                    response = _mobile_signed_request(client, "GET", NEW_STORY_FEED_V2_PATH, extra,
+                                                      cookie_header, device_id, install_id,
+                                                      host=MOBILE_API_HOST, full_sign=True)
+                    response.raise_for_status()
+                    candidate = response.json()
+                    _raise_mobile_login_required(candidate)
+                    if isinstance(candidate, dict) and candidate.get("status_code") == 0:
+                        payload = candidate
+                        break
+                    status = candidate.get("status_code") if isinstance(candidate, dict) else "non-object response"
+                    failure = f"status_code={status}"
+                except (LoginRequiredError, InterruptedError):
+                    raise
+                except Exception as exc:
+                    failure = (f"HTTP {exc.response.status_code}" if isinstance(exc, httpx.HTTPStatusError)
+                               else type(exc).__name__)
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+                        break
+                if attempt == 0 and used < budget:
+                    _cancel_wait(0.5)
+            if payload is None:
+                author_error(f"active story catalog: request failed ({failure})")
                 return False, used
             group = payload.get("story_group")
             returned_catalog = _story_group_catalog(group)
@@ -3642,12 +3656,32 @@ def normalize_items(data):
 
 def resolve_numeric_user_id(client, profile, sec_user_id):
     """Best-effort numeric uid for life/feed packing."""
+    cookies = _profile_cookie_header(profile)
+    if cookies and _check_mobile_signer():
+        try:
+            device_id, install_id = _persistent_mobile_device()
+            response = _mobile_signed_request(
+                client, "GET", "/aweme/v1/user/profile/other/", {"sec_user_id": sec_user_id},
+                cookies, device_id, install_id, full_sign=True,
+            )
+            response.raise_for_status()
+            data = response.json()
+            _raise_mobile_login_required(data)
+            user = data.get("user") if isinstance(data, dict) and data.get("status_code") == 0 else None
+            if (isinstance(user, dict) and user.get("sec_uid") == sec_user_id
+                    and str(user.get("uid") or "").isdigit()):
+                return str(user["uid"])
+        except (InterruptedError, LoginRequiredError):
+            raise
+        except Exception:
+            pass
     try:
         data = request_json(
             client, profile, "/aweme/v1/web/user/profile/other/", sec_user_id, 0, 1, path_kind="post"
         )
         user = data.get("user") if isinstance(data, dict) else None
-        if isinstance(user, dict) and user.get("uid"):
+        if (isinstance(user, dict) and str(user.get("uid") or "").isdigit()
+                and user.get("sec_uid") in (None, "", sec_user_id)):
             return str(user["uid"])
     except InterruptedError:
         raise

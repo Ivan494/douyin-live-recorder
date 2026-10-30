@@ -27,13 +27,22 @@ The outer author-feed request also needs the app's refresh parameters
 an empty unfinished response without a continuation. With them, it returned
 the target author's feed and an explicit completed response.
 
+The Windows app normally starts with only a profile URL. Its web identity
+lookup intermittently returned empty responses, so the signed mobile
+`/aweme/v1/user/profile/other/` lookup is now preferred with a saved App login.
+The returned secondary ID must match the requested profile before its numeric
+ID is used. Web lookup remains a fallback. The default identity path was
+verified live without supplying a numeric ID manually. Catalog requests retry
+one transient failure within the same request budget; login/cancellation
+propagate immediately and HTTP 429 is not immediately retried.
+
 Regression coverage includes capped active windows, failed enlargement with
 an available archive cursor, last-working request sizes, cancellation, login
 rejection, foreign items, stale metadata, saved catalog progress across the
 15-request budget, independent archive continuation, and translated summaries.
 
 Local validation used Windows 10 x64 build 19045, CPython 3.11.14, locked release
-dependencies, and real FFmpeg tools: 438 tests and 8 subtests passed, including
+dependencies, and real FFmpeg tools: 445 tests and 8 subtests passed, including
 one independent reproduction outside the repository. Public test fixtures use
 synthetic identifiers. Account data, session files, signed URLs, APK contents,
 and downloaded private media remain outside the repository.
