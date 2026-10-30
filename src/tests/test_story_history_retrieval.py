@@ -864,6 +864,9 @@ def test_catalog_request_budget_preserves_independent_archive_checkpoint():
     state = {}
     def response(path, extra, _host):
         if path == media.STORY_PROFILE_LIST_PATH:
+            if extra["offset"] == "20":
+                return {"status_code": 0, "data": [story("archive-20")],
+                        "has_more": True, "next_offset": 40}
             return catalog_head(200, archive=True)
         if path == media.NEW_STORY_FEED_V2_PATH and "direct" in extra:
             return catalog_page(extra, 200)
@@ -872,4 +875,32 @@ def test_catalog_request_budget_preserves_independent_archive_checkpoint():
         result = fetch(scan_state=state)
     assert not result.complete
     assert result.scan_reason == "page_limit"
-    assert state["story_scan"]["author_offsets"][media.STORY_PROFILE_LIST_PATH] == "20"
+    # One request is reserved for the archive, so its checkpoint advances
+    # even while the active catalog is still incomplete.
+    assert "archive-20" in {str(item.get("aweme_id")) for item in result[0]}
+    assert state["story_scan"]["author_offsets"][media.STORY_PROFILE_LIST_PATH] == "40"
+
+
+def test_catalog_that_fills_the_budget_cannot_starve_archive_pages_across_polls():
+    # 20-item head + 14 catalog continuations exactly consume the 15-request
+    # budget. The archive page at offset 20 must still be read on a later poll.
+    state = {}
+    archive_requests = []
+    def response(path, extra, _host):
+        if path == media.STORY_PROFILE_LIST_PATH:
+            if extra["offset"] == "20":
+                archive_requests.append(extra["offset"])
+                return {"status_code": 0, "data": [story("archive-only")],
+                        "has_more": False, "next_offset": 0}
+            return catalog_head(104, archive=True)
+        if path == media.NEW_STORY_FEED_V2_PATH and "direct" in extra:
+            return catalog_page(extra, 104)
+        return {"status_code": 0, "data": [], "has_more": False}
+    seen = set()
+    with mobile_requests(response):
+        for _ in range(3):
+            result = fetch(scan_state=state)
+            seen.update(str(item.get("aweme_id")) for item in result[0])
+    assert archive_requests
+    assert "archive-only" in seen
+    assert {str(1000 + n) for n in range(104)} <= seen

@@ -902,7 +902,11 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
             catalog_result = None
             if (path == STORY_PROFILE_LIST_PATH and page_extra["offset"] == "0"
                     and isinstance(active_data, dict) and not active_blocked):
-                catalog_result = recover_active_catalog(active_data, 15 - pages_fetched)
+                # Reserve one request for a pending archive page so a catalog
+                # that fills the budget cannot starve archive pagination on
+                # every poll (its completion is not persisted across checks).
+                archive_pending = 1 if _story_has_more(data.get("has_more")) else 0
+                catalog_result = recover_active_catalog(active_data, 15 - pages_fetched - archive_pending)
                 if catalog_result is not None:
                     catalog_complete, used = catalog_result
                     pages_fetched += used
