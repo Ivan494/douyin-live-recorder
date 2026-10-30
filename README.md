@@ -114,7 +114,7 @@ python -m pytest src/tests
 
 ```text
 pip install -r requirements-release.txt
-pwsh ./scripts/build_release.ps1 -Version 1.2.9 -FfmpegDir <含 ffmpeg.exe 和 ffprobe.exe 的目录>
+pwsh ./scripts/build_release.ps1 -Version 1.2.10 -FfmpegDir <含 ffmpeg.exe 和 ffprobe.exe 的目录>
 ```
 
 推送 `v*` 标签会在 GitHub Actions 上走同样的打包流程。
@@ -257,7 +257,7 @@ python -m pytest src/tests
 
 ```text
 pip install -r requirements-release.txt
-pwsh ./scripts/build_release.ps1 -Version 1.2.9 -FfmpegDir <folder-with-ffmpeg.exe>
+pwsh ./scripts/build_release.ps1 -Version 1.2.10 -FfmpegDir <folder-with-ffmpeg.exe>
 ```
 
 Pushing a `v*` tag runs the same packaging on GitHub Actions.
