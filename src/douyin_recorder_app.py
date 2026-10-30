@@ -2637,12 +2637,17 @@ class MediaDownloadEngine:
         if status == "disabled":
             return ""
         if status in {"ok", "partial"}:
+            reason = result.get("scan_reason", "")
+            reason_key = ("story_scan_" + reason if reason in {
+                "active_limit", "pagination", "request_failed", "identity", "page_limit"
+            } else "story_scan_incomplete")
             return t(
                 "summary_partial" if status == "partial" else "summary_ok",
                 label=label,
                 downloaded=result.get("downloaded", 0),
                 skipped=result.get("skipped", 0),
                 failed=result.get("failed", 0),
+                reason=t(reason_key),
             )
         if status == "no_active_stories":
             return t("stories_none")

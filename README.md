@@ -85,6 +85,18 @@ life/feed。需要已保存的抖音 App 登录（界面里的 **抖音 App 登�
 python src/douyin_media_downloader.py --profile-url <用户主页> --stories --output-dir <目录>
 ```
 
+近期日常超过首批 20 条时，程序会尝试扩大同一接口的获取数量（最多 320 条），
+合并去重；如果服务端不再返回新内容，就停止扩大并提示分页停滞。
+这不是已验证的独立分页接口，不能保证每个账号都能取完；历史列表仍只使用接口
+明确返回的 `next_offset`，不会把时间戳猜成翻页游标。
+
+“下次继续扫描”表示本次达到页数上限且已保存翻页位置。
+“分页停滞”“获取上限”或“接口请求失败”表示列表仍不完整，重复检查不保证补齐。
+作品能下载不代表日常接口也可用；先确认同一登录账号能在 App 中看到目标日常。
+诊断原因保存在输出目录的 `douyin_media_state.json` → `last_summary.stories.message`
+（界面使用 `scan_reason` 显示简短分类）。反馈时只提供脱敏后的原因，不要上传整个
+状态文件、Cookie、账号标识或带签名的媒体链接。
+
 ## 测试
 
 ```text
@@ -200,6 +212,22 @@ profile, or:
 ```text
 python src/douyin_media_downloader.py --profile-url <user-url> --stories --output-dir <dir>
 ```
+
+When the active bucket reports more than its first 20 stories, the downloader
+tries a larger `active_data_size` on the same endpoint, up to 320, and merges
+unique items. It stops expanding if the server returns no new items. This is
+a bounded recovery attempt, not a verified separate active-page protocol or a
+guarantee of full access for every account. Archive pagination still follows
+only explicit `next_offset` values; timestamps are never guessed as offsets.
+
+“Continuing next check” means the request budget was reached and a continuation
+was saved. A stalled list, active limit, or failed request remains incomplete;
+another check does not guarantee recovery. Working post downloads do not prove
+that the story API is available. Confirm the same login can see the stories in
+the app. Local diagnostics are in the output folder's `douyin_media_state.json`
+under `last_summary.stories.message`; `scan_reason` supplies the short UI label.
+Share only the redacted reason, not the whole state file, cookies, account IDs,
+or signed media links.
 
 ## Tests
 

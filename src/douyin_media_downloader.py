@@ -340,22 +340,36 @@ def _is_mobile_post_story(aweme):
 class MobileStoryFeedResult(tuple):
     """Two-value compatibility plus mobile scan/capability metadata."""
 
-    def __new__(cls, items, source, *, complete, attempted=True, unavailable_reason=""):
+    def __new__(cls, items, source, *, complete, attempted=True, unavailable_reason="", scan_reason=""):
         result = super().__new__(cls, (items, source))
         result.complete = complete
         result.attempted = attempted
         result.unavailable_reason = unavailable_reason
+        result.scan_reason = scan_reason
         return result
 
 
 class StoryFetchResult(tuple):
     """Three-value compatibility plus explicit overall scan completeness."""
 
-    def __new__(cls, items, source, supported, *, complete, unavailable_reason=""):
+    def __new__(cls, items, source, supported, *, complete, unavailable_reason="", scan_reason=""):
         result = super().__new__(cls, (items, source, supported))
         result.complete = complete
         result.unavailable_reason = unavailable_reason
+        result.scan_reason = scan_reason
         return result
+
+
+def _story_scan_reason(reasons):
+    # A blocked source takes precedence over another source's resumable scan.
+    return next((reason for reason in (
+        "active_limit", "pagination", "request_failed", "identity", "page_limit"
+    ) if reason in reasons), "request_failed")
+
+
+def _story_has_more(value):
+    # JSON endpoints can encode flags as booleans, numbers or numeric strings.
+    return value not in (None, False, 0, "", "0", "false", "False")
 
 
 def _story_scan_state(scan_state, sec_user_id, cookie_header):
@@ -452,7 +466,7 @@ def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header="", *, 
                         seen_ids.add(item_id)
                     stories.append(aweme)
 
-            has_more = data.get("has_more", 0)
+            has_more = _story_has_more(data.get("has_more", 0))
             pages_fetched += 1
 
             if not has_more:
@@ -501,10 +515,25 @@ def fetch_stories_via_mobile_post_api(client, sec_user_id, cookie_header="", *, 
         source = f"{MOBILE_API_HOST}/aweme/v1/aweme/post/ (mobile, {len(stories)} stories)"
         if partial_message:
             source += f" (partial: {partial_message})"
-        return MobileStoryFeedResult(stories, source, complete=not bool(partial_message))
+        return MobileStoryFeedResult(stories, source, complete=not bool(partial_message),
+                                     scan_reason=_post_scan_reason(partial_message))
     if partial_message:
-        return MobileStoryFeedResult(None, f"mobile_post_api: partial: {partial_message}", complete=False)
+        return MobileStoryFeedResult(None, f"mobile_post_api: partial: {partial_message}", complete=False,
+                                     scan_reason=_post_scan_reason(partial_message))
     return MobileStoryFeedResult(None, "mobile_post_api: no time-limited stories in post feed", complete=True)
+
+
+def _post_scan_reason(message):
+    if not message:
+        return ""
+    if message.startswith("page limit"):
+        return "page_limit"
+    if "pagination cursor" in message:
+        return "pagination"
+    return "request_failed"
+
+
+MAX_ACTIVE_STORY_WINDOW = 320
 
 
 STORY_PAYLOAD_BUCKET_KEYS = (
@@ -672,6 +701,11 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
     seen_ids = set()
     completed_author_variants = 0
     author_errors = []
+    author_reasons = []
+
+    def author_error(message, reason="request_failed"):
+        author_errors.append(message)
+        author_reasons.append(reason)
 
     def append_items(items, *, tray=False):
         for item in items:
@@ -708,6 +742,9 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
         if resume_offset == "0":
             resume_offset = ""
         complete = False
+        active_ids = set()
+        active_retry = False
+        active_blocked = False
         for page in range(15):
             data = None
             page_error = "invalid response"
@@ -736,39 +773,67 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                 data = payload
                 break
             if data is None:
-                author_errors.append(f"{path}: {page_error}")
+                author_error(f"{path}: {page_error}")
                 break
             append_items(_story_items_from_feed_payload(data))
-            if not data.get("has_more", False):
-                active_data = data.get("active_data")
-                if isinstance(active_data, dict) and active_data.get("has_more", False):
-                    author_errors.append(f"{path}: no verified active pagination cursor")
-                    break
-                complete = True
+            active_data = data.get("active_data")
+            if (active_retry and page_extra["offset"] == "0"
+                    and (not isinstance(active_data, dict) or "has_more" not in active_data)):
+                author_error(f"{path}: missing active pagination result", "pagination")
+                active_blocked = True
+            if (path == STORY_PROFILE_LIST_PATH and page_extra["offset"] == "0"
+                    and isinstance(active_data, dict)
+                    and _story_has_more(active_data.get("has_more"))):
+                # active_data.has_more is independent of the archive's
+                # has_more/next_offset. No active cursor mapping is verified.
+                # Retry the captured size parameter at the head instead;
+                # never invent an offset from a timestamp or item count.
+                current_ids = {str(item.get("aweme_id") or item.get("group_id"))
+                               for item in _story_items_from_feed_payload({"active_data": active_data})
+                               if item.get("aweme_id") or item.get("group_id")}
+                size = int(page_extra["active_data_size"])
+                if not current_ids or (active_retry and not current_ids - active_ids):
+                    author_error(f"{path}: active window stalled; no verified active pagination cursor",
+                                 "pagination")
+                    active_blocked = True
+                elif size >= MAX_ACTIVE_STORY_WINDOW:
+                    author_error(f"{path}: active window limit ({MAX_ACTIVE_STORY_WINDOW}) reached",
+                                 "active_limit")
+                    active_blocked = True
+                else:
+                    active_ids.update(current_ids)
+                    active_retry = True
+                    page_extra["active_data_size"] = str(min(size * 2, MAX_ACTIVE_STORY_WINDOW))
+                    _cancel_wait(0.3)
+                    continue
+            if not _story_has_more(data.get("has_more")):
+                complete = not active_blocked
                 if continuation is not None:
                     continuation["author_offsets"].pop(path, None)
                 break
             next_offset = data.get("next_offset")
             if isinstance(next_offset, bool) or not isinstance(next_offset, (int, str)):
-                author_errors.append(f"{path}: no verified pagination cursor")
-                break
-            next_offset = _story_cursor(next_offset)
-            if not next_offset:
-                author_errors.append(f"{path}: invalid pagination cursor")
+                author_error(f"{path}: no verified pagination cursor", "pagination")
                 if continuation is not None:
                     continuation["author_offsets"].pop(path, None)
                 break
-            if page == 0 and resume_offset:
+            next_offset = _story_cursor(next_offset)
+            if not next_offset:
+                author_error(f"{path}: invalid pagination cursor", "pagination")
+                if continuation is not None:
+                    continuation["author_offsets"].pop(path, None)
+                break
+            if page_extra["offset"] == "0" and resume_offset:
                 next_offset = resume_offset
             if next_offset in seen_offsets:
-                author_errors.append(f"{path}: repeated pagination cursor")
+                author_error(f"{path}: repeated pagination cursor", "pagination")
                 if continuation is not None:
                     continuation["author_offsets"].pop(path, None)
                 break
             if continuation is not None:
                 continuation["author_offsets"][path] = next_offset
             if page == 14:
-                author_errors.append(f"{path}: page limit (15) reached")
+                author_error(f"{path}: page limit (15) reached", "page_limit")
                 break
             seen_offsets.add(next_offset)
             page_extra = {**page_extra, "offset": next_offset}
@@ -784,6 +849,7 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
         return MobileStoryFeedResult([], f"{author_source} (author endpoints complete): empty pack", complete=True)
 
     partial_source = f"{author_source} (partial author results: {'; '.join(author_errors) or 'numeric user_id unavailable'})"
+    scan_reason = _story_scan_reason(author_reasons if profile_variants else ["identity"])
     # A partial author result must keep available, verified tray items and
     # explicitly tell fetch_stories to continue its other fallbacks.
     for path, extra in tray_variants:
@@ -818,9 +884,11 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
         count_before = len(collected)
         append_items(_story_items_from_feed_payload(data), tray=True)
         if len(collected) > count_before:
-            return MobileStoryFeedResult(collected, f"{MOBILE_API_HOST}{path}; {partial_source}", complete=False)
+            return MobileStoryFeedResult(collected, f"{MOBILE_API_HOST}{path}; {partial_source}", complete=False,
+                                         scan_reason=scan_reason)
         last_message = f"{MOBILE_API_HOST}{path}: empty pack"
-    return MobileStoryFeedResult(collected or None, f"{partial_source}; {last_message}", complete=False)
+    return MobileStoryFeedResult(collected or None, f"{partial_source}; {last_message}", complete=False,
+                                 scan_reason=scan_reason)
 
 
 def fetch_stories_via_mobile_life_feed(client, sec_user_id, user_id="", cookie_header=""):
@@ -3699,6 +3767,7 @@ class MediaResult:
     failed: int = 0
     message: str = ""
     files: list[str] = field(default_factory=list)
+    scan_reason: str = ""
 
 
 
@@ -4399,6 +4468,7 @@ def fetch_stories(client, profile, sec_user_id, user_id="", *, scan_state=None):
     author_empty_source = ""
     unavailable_reason = ""
     capability_source = ""
+    scan_reasons = []
 
     def merge_partial(items):
         merged = []
@@ -4416,9 +4486,11 @@ def fetch_stories(client, profile, sec_user_id, user_id="", *, scan_state=None):
         return f"{source}; {partial_source}" if partial_source else source
 
     def result(items, source, is_supported, *, complete=True):
+        complete = complete and author_scan_complete
         return StoryFetchResult(items, source, is_supported,
-                                complete=complete and author_scan_complete,
-                                unavailable_reason=unavailable_reason if not items else "")
+                                complete=complete,
+                                unavailable_reason=unavailable_reason if not items else "",
+                                scan_reason="" if complete else _story_scan_reason(scan_reasons))
 
     # Query actual story sources before scanning the ordinary post feed.
     try:
@@ -4438,6 +4510,7 @@ def fetch_stories(client, profile, sec_user_id, user_id="", *, scan_state=None):
             capability_source = feed_source
         elif not feed_complete:
             partial_source = feed_source
+            scan_reasons.append(getattr(feed_result, "scan_reason", "") or "request_failed")
         if feed_items:
             items = _filter_story_items(
                 feed_items,
@@ -4476,6 +4549,7 @@ def fetch_stories(client, profile, sec_user_id, user_id="", *, scan_state=None):
         last_message = f"mobile_story_feed: {exc}"
         author_scan_complete = False
         partial_source = last_message
+        scan_reasons.append("request_failed")
 
     # 3) Signed mobile life/feed POST — this is the real 24h pack API.
     try:
@@ -4655,6 +4729,7 @@ def fetch_stories(client, profile, sec_user_id, user_id="", *, scan_state=None):
             capability_source = capability_source or mobile_source
         elif not post_complete:
             post_incomplete_source = mobile_source
+            scan_reasons.append(getattr(post_result, "scan_reason", "") or "request_failed")
         if mobile_items:
             post_fallback = _filter_story_items(
                 mobile_items, sec_user_id, require_story_marker=True,
@@ -4668,6 +4743,7 @@ def fetch_stories(client, profile, sec_user_id, user_id="", *, scan_state=None):
     except Exception as exc:
         last_message = f"mobile_post_api: {exc}"
         post_incomplete_source = last_message
+        scan_reasons.append("request_failed")
 
     if post_fallback:
         logging.info(
@@ -4697,6 +4773,7 @@ def result_to_dict(result):
         "failed": result.failed,
         "message": result.message,
         "files": result.files,
+        "scan_reason": result.scan_reason,
     }
 
 
@@ -4945,6 +5022,7 @@ def _download_profile(
                 )
                 if not getattr(story_fetch, "complete", True):
                     result.status = "partial"
+                    result.scan_reason = getattr(story_fetch, "scan_reason", "") or "request_failed"
                 elif story_items:
                     result.status = "ok"
                 elif getattr(story_fetch, "unavailable_reason", "") == "login_required":
