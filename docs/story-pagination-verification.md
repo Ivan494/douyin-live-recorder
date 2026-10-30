@@ -34,7 +34,9 @@ The returned secondary ID must match the requested profile before its numeric
 ID is used. Web lookup remains a fallback. The default identity path was
 verified live without supplying a numeric ID manually. Catalog requests retry
 one transient failure within the same request budget; login/cancellation
-propagate immediately and HTTP 429 is not immediately retried.
+propagate immediately and HTTP 429 is not immediately retried. The packaged
+acceptance run encountered an actual HTTP 503 on the continuation request;
+regression coverage includes retrying that HTTP failure and respecting 429.
 
 Regression coverage includes capped active windows, failed enlargement with
 an available archive cursor, last-working request sizes, cancellation, login

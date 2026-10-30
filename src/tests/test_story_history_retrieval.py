@@ -26,6 +26,8 @@ def mobile_requests(handler):
     def request(_client, method, path, extra, *_args, **kwargs):
         calls.append((path, dict(extra), kwargs.get("host")))
         payload = handler(path, extra, kwargs.get("host"))
+        if isinstance(payload, httpx.Response):
+            return payload
         return httpx.Response(200, json=payload,
                               request=httpx.Request(method, "https://example.test" + path))
 
@@ -817,7 +819,7 @@ def test_catalog_cancel_and_login_errors_propagate(error):
         fetch(scan_state={})
 
 
-@pytest.mark.parametrize("failure", ["timeout", "server_error"])
+@pytest.mark.parametrize("failure", ["timeout", "server_error", "http_503"])
 def test_catalog_transient_failure_retries_once_within_the_shared_budget(failure):
     attempts = {}
     def response(path, extra, _host):
@@ -830,6 +832,8 @@ def test_catalog_transient_failure_retries_once_within_the_shared_budget(failure
         if attempts[cursor] == 1:
             if failure == "timeout":
                 raise httpx.ReadTimeout("synthetic transient failure")
+            if failure == "http_503":
+                return httpx.Response(503, request=httpx.Request("GET", "https://example.test/story"))
             return {"status_code": 5}
         return catalog_page(extra)
     with mobile_requests(response):
@@ -837,6 +841,23 @@ def test_catalog_transient_failure_retries_once_within_the_shared_budget(failure
     assert result.complete
     assert len(result[0]) == 40
     assert set(attempts.values()) == {2}
+
+
+def test_catalog_http_429_stops_without_an_immediate_retry():
+    attempts = []
+    def response(path, extra, _host):
+        if path == media.STORY_PROFILE_LIST_PATH:
+            return catalog_head()
+        if path == media.NEW_STORY_FEED_V2_PATH and "direct" in extra:
+            attempts.append(extra["cursor"])
+            return httpx.Response(429, request=httpx.Request("GET", "https://example.test/story"))
+        return {"status_code": 0, "data": [], "has_more": False}
+    with mobile_requests(response):
+        result = fetch(scan_state={})
+    assert len(attempts) == 1
+    assert not result.complete
+    assert result.scan_reason == "request_failed"
+    assert "HTTP 429" in result[1]
 
 
 def test_catalog_request_budget_preserves_independent_archive_checkpoint():
