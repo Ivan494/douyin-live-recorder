@@ -1,11 +1,12 @@
 """Active catalogs and profile archives must share bounded, resumable scans."""
 import json
+from unittest.mock import patch
 
 import pytest
 
 import douyin_media_downloader as media
 from .test_story_history_retrieval import (
-    AUTHOR, catalog_head, catalog_page, fetch, mobile_requests, story,
+    AUTHOR, UID, catalog_head, catalog_page, fetch, mobile_requests, story,
 )
 
 
@@ -252,6 +253,226 @@ def test_unfinished_active_bucket_on_archive_page_is_not_cached_as_complete():
             assert_profile_budget(calls[start:])
 
 
+@pytest.mark.parametrize("reload_state", [False, True])
+@pytest.mark.parametrize("unfinished_offset", ["20", "40"])
+def test_unresolved_archive_bucket_survives_catalog_budget_and_terminal_page(reload_state, unfinished_offset):
+    """Reviewer three-poll reproduction, including terminal-page evidence."""
+    state = {}
+    unresolved = True
+
+    def response(path, extra, _host):
+        if path == media.STORY_PROFILE_LIST_PATH:
+            if extra["offset"] == "0":
+                return catalog_head(200, archive=True)
+            assert extra["offset"] in ("20", "40")
+            page = {**successful_empty(), "has_more": extra["offset"] == "20", "next_offset": 40}
+            if unresolved and extra["offset"] == unfinished_offset:
+                page["active_data"] = {"data": [story("uncatalogued")], "has_more": True}
+            return page
+        if path == media.NEW_STORY_FEED_V2_PATH and "direct" in extra:
+            return catalog_page(extra, 200)
+        return successful_empty()
+
+    with mobile_requests(response) as calls, patch.object(
+        media, "fetch_stories_via_mobile_life_feed", return_value=([story("life-only")], "life/feed")
+    ) as life:
+        for poll in range(3):
+            start = len(calls)
+            result = media.fetch_stories(object(), {"cookies": "sessionid=test"}, AUTHOR,
+                                         user_id=UID, scan_state=state)
+            assert_profile_budget(calls[start:])
+            assert not result.complete
+            assert life.call_count == poll + 1
+            assert "life-only" in {item["aweme_id"] for item in result[0]}
+            assert any(path == media.STORY_FEED_PATH and "to_uid" not in extra
+                       for path, extra, _host in calls[start:])
+            if unfinished_offset == "20" or poll >= 1:
+                assert result.scan_reason == "pagination"
+                assert not state["story_scan"].get("profile_archive_complete")
+            if reload_state:
+                state = json.loads(json.dumps(state))
+        # A fresh, successful archive traversal can resolve the evidence;
+        # it must not turn into a permanently latched partial result either.
+        unresolved = False
+        start = len(calls)
+        result = media.fetch_stories(object(), {"cookies": "sessionid=test"}, AUTHOR,
+                                     user_id=UID, scan_state=state)
+        assert result.complete
+        assert life.call_count == 3
+        assert_profile_budget(calls[start:])
+
+
+def test_legacy_archive_completion_without_bucket_evidence_is_revalidated():
+    state = seeded_state(260)
+    with mobile_requests(replay_response):
+        assert not fetch(scan_state=state).complete
+    assert state["story_scan"]["profile_archive_complete"]
+    # Round-1 states have the archive flag but no per-variant evidence.
+    state["story_scan"].pop("author_scans")
+    state = json.loads(json.dumps(state))
+    with mobile_requests(replay_response) as calls:
+        result = fetch(scan_state=state)
+        assert not result.complete
+        assert_profile_budget(calls)
+        assert [extra["offset"] for extra in profile_calls(calls)][1] == "20"
+        result = fetch(scan_state=state)
+        assert result.complete
+
+
+def author_replay_response(path, extra, _host):
+    if path == media.STORY_PROFILE_LIST_PATH:
+        offset = int(extra["offset"])
+        if offset == 0:
+            return catalog_head(98, archive=True)
+        assert offset in range(20, 261, 20)
+        return {"status_code": 0, "data": [story(f"archive-{offset}")],
+                "has_more": offset < 260, "next_offset": offset + 20}
+    if path == media.NEW_STORY_FEED_V2_PATH and "direct" in extra:
+        return catalog_page(extra, 98)
+    if path == media.STORY_FEED_PATH and "to_uid" in extra:
+        offset = int(extra["offset"])
+        assert offset in range(0, 301, 20)
+        return {"status_code": 0, "data": [story(f"history-{offset}")],
+                "has_more": offset < 300, "next_offset": offset + 20}
+    return successful_empty()
+
+
+@pytest.mark.parametrize("reload_state", [False, True])
+def test_author_variants_complete_every_two_polls_within_baseline_request_budget(reload_state):
+    state = {}
+    media._story_scan_state(state, AUTHOR, "sessionid=test")["author_offsets"][media.STORY_FEED_PATH] = "300"
+    complete_polls = 0
+    with mobile_requests(author_replay_response) as calls:
+        for poll in range(100):
+            start = len(calls)
+            result = fetch(scan_state=state)
+            assert_profile_budget(calls[start:])
+            assert sum(path == media.STORY_FEED_PATH and "to_uid" in extra
+                       for path, extra, _host in calls[start:]) <= 15
+            # Both the saved scan and every fresh scan finish within two checks.
+            assert result.complete == (poll % 2 == 1)
+            complete_polls += result.complete
+            if reload_state:
+                state = json.loads(json.dumps(state))
+    assert complete_polls == 50
+    assert len(calls) <= 2400  # oracle-local; e7fe8e6 took 2,638 on this fixture.
+    print(f"100-poll author replay (JSON reload={reload_state}): "
+          f"{len(calls)} total requests, {complete_polls} complete polls")
+
+
+@pytest.mark.parametrize("with_catalog", [False, True])
+def test_completed_profile_waits_for_long_outer_feed(with_catalog):
+    state = {}
+
+    def response(path, extra, _host):
+        if path == media.STORY_PROFILE_LIST_PATH:
+            if extra["offset"] == "0":
+                if with_catalog:
+                    return catalog_head(40, archive=True)
+                return {**successful_empty(), "has_more": True, "next_offset": 20}
+            assert extra["offset"] == "20"
+            return {**successful_empty(), "data": [story("archive-only")]}
+        if path == media.NEW_STORY_FEED_V2_PATH and "direct" in extra:
+            return catalog_page(extra)
+        if path == media.STORY_FEED_PATH and "to_uid" in extra:
+            offset = int(extra["offset"])
+            return {**successful_empty(), "has_more": offset < 700, "next_offset": offset + 20}
+        return successful_empty()
+
+    with mobile_requests(response) as calls:
+        for poll in range(3):
+            start = len(calls)
+            result = fetch(scan_state=state)
+            assert_profile_budget(calls[start:])
+            assert result.complete == (poll == 2)
+            if poll:
+                assert [extra["offset"] for extra in profile_calls(calls[start:])] == ["0"]
+                assert not any("direct" in extra for _path, extra, _host in calls[start:])
+            state = json.loads(json.dumps(state))
+    assert "author_scans" not in state["story_scan"]
+
+
+@pytest.mark.parametrize("variant", [media.STORY_PROFILE_LIST_PATH, media.STORY_FEED_PATH])
+@pytest.mark.parametrize("change", ["head", "next_offset", "active_head", "catalog", "no_catalog"])
+def test_completed_author_variant_is_invalidated_by_changed_head(variant, change):
+    state = {}
+    changed = False
+
+    def response(path, extra, _host):
+        if path == media.NEW_STORY_FEED_V2_PATH and "direct" in extra:
+            return catalog_page(extra, 98)
+        if path == variant and "to_uid" in extra:
+            if extra["offset"] != "0":
+                return {**successful_empty(), "data": [story("changed-archive" if changed else "old-archive")]}
+            head = {**successful_empty(), "has_more": True, "next_offset": 20}
+            if change == "no_catalog":
+                head = catalog_head(20, archive=True)
+            if changed:
+                if change == "head":
+                    head["data"] = [story("new-head")]
+                elif change == "next_offset":
+                    head["next_offset"] = 40
+                elif change == "active_head":
+                    head["active_data"] = {"data": [story("new-active")], "has_more": False}
+                elif change == "catalog":
+                    head = catalog_head(20, archive=True)
+                else:
+                    head.pop("active_data")
+            return head
+        if path == media.STORY_PROFILE_LIST_PATH:
+            # Keep the other variant incomplete for both checks.
+            if extra["offset"] == "0":
+                return catalog_head(98, archive=True)
+            offset = int(extra["offset"])
+            return {**successful_empty(), "has_more": offset < 700, "next_offset": offset + 20}
+        if path == media.STORY_FEED_PATH and "to_uid" in extra:
+            offset = int(extra["offset"])
+            return {**successful_empty(), "has_more": offset < 700, "next_offset": offset + 20}
+        return successful_empty()
+
+    with mobile_requests(response) as calls:
+        assert not fetch(scan_state=state).complete
+        assert state["story_scan"]["author_scans"][variant]["complete"]
+        state = json.loads(json.dumps(state))
+        changed = True
+        calls.clear()
+        result = fetch(scan_state=state)
+        assert_profile_budget(calls)
+    assert "changed-archive" in {item["aweme_id"] for item in result[0]}
+    assert [extra["offset"] for path, extra, _host in calls if path == variant and "to_uid" in extra] == [
+        "0", "40" if change == "next_offset" else "20"]
+
+
+def test_cached_archive_completion_cannot_hide_incomplete_catalog_or_life_fallback():
+    state = {}
+    fail_catalog = False
+
+    def response(path, extra, _host):
+        if path == media.STORY_PROFILE_LIST_PATH:
+            return catalog_head(200, archive=True) if extra["offset"] == "0" else successful_empty()
+        if path == media.NEW_STORY_FEED_V2_PATH and "direct" in extra:
+            page = catalog_page(extra, 200)
+            if fail_catalog:
+                page["story_group"]["min_cursor"] -= 1
+            return page
+        return successful_empty()
+
+    with mobile_requests(response) as calls, patch.object(
+        media, "fetch_stories_via_mobile_life_feed", return_value=([story("life-only")], "life/feed")
+    ) as life:
+        for poll in range(3):
+            start = len(calls)
+            result = media.fetch_stories(object(), {"cookies": "sessionid=test"}, AUTHOR,
+                                         user_id=UID, scan_state=state)
+            assert not result.complete
+            assert life.call_count == poll + 1
+            assert "life-only" in {item["aweme_id"] for item in result[0]}
+            assert state["story_scan"]["profile_archive_complete"]
+            assert_profile_budget(calls[start:])
+            fail_catalog = True
+            state = json.loads(json.dumps(state))
+
+
 @pytest.mark.parametrize("change", ["entries", "min_cursor", "max_cursor", "head", "next_offset", "no_catalog"])
 @pytest.mark.parametrize("archive_finished", [False, True])
 def test_catalog_or_head_change_invalidates_saved_progress(change, archive_finished):
@@ -324,3 +545,4 @@ def test_new_progress_fields_follow_existing_scope_reset(change):
     assert "active_story_ids" not in continuation
     assert "profile_scan_key" not in continuation
     assert "profile_archive_complete" not in continuation
+    assert "author_scans" not in continuation
