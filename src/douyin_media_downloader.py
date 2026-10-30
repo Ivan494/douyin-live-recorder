@@ -652,7 +652,8 @@ def _story_items_from_feed_payload(data):
     return unique
 
 
-def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_header="", *, scan_state=None):
+def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_header="", *, scan_state=None,
+                                      defer_completion_reset=False):
     """
     Fetch the active 24h/日常 pack via mobile story endpoints.
 
@@ -661,6 +662,8 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
     tab /aweme/v1/story/profile/list/. Returns a two-value result with explicit
     ``complete`` metadata. [] means both author sources completed empty;
     None means no items could be obtained from an incomplete author scan.
+    A caller joining other paginated sources can defer clearing completed
+    author checkpoints until its overall result is complete.
     """
     if not _check_mobile_signer():
         return MobileStoryFeedResult(None, "mobile_story_feed: signer module not available",
@@ -1087,7 +1090,7 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
     author_source = f"{MOBILE_API_HOST}{STORY_PROFILE_LIST_PATH} + {STORY_FEED_PATH}"
     author_complete = len(profile_variants) == 2 and completed_author_variants == 2
     if author_complete:
-        if continuation is not None:
+        if continuation is not None and not defer_completion_reset:
             for key in ("profile_scan_key", "active_story_ids", "profile_archive_complete", "author_scans"):
                 continuation.pop(key, None)
         if collected:
@@ -4753,6 +4756,13 @@ def fetch_stories(client, profile, sec_user_id, user_id="", *, scan_state=None):
 
     def result(items, source, is_supported, *, complete=True):
         complete = complete and author_scan_complete
+        if complete and isinstance(scan_state, dict):
+            continuation = scan_state.get("story_scan")
+            if isinstance(continuation, dict):
+                # Empty author feeds still need the retained-post fallback.
+                # Reset the validated author checkpoints only at the join.
+                for key in ("profile_scan_key", "active_story_ids", "profile_archive_complete", "author_scans"):
+                    continuation.pop(key, None)
         return StoryFetchResult(items, source, is_supported,
                                 complete=complete,
                                 unavailable_reason=unavailable_reason if not items else "",
@@ -4765,7 +4775,7 @@ def fetch_stories(client, profile, sec_user_id, user_id="", *, scan_state=None):
             sec_user_id,
             user_id=user_id,
             cookie_header=mobile_cookie,
-            **({"scan_state": scan_state} if scan_state is not None else {}),
+            **({"scan_state": scan_state, "defer_completion_reset": True} if scan_state is not None else {}),
         )
         feed_items, feed_source = feed_result
         feed_complete = getattr(feed_result, "complete", True)

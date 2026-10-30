@@ -355,7 +355,7 @@ def test_author_variants_complete_every_two_polls_within_baseline_request_budget
             if reload_state:
                 state = json.loads(json.dumps(state))
     assert complete_polls == 50
-    assert len(calls) <= 2400  # oracle-local; e7fe8e6 took 2,638 on this fixture.
+    assert len(calls) <= 2386  # Round 2; e7fe8e6 took 2,638 on this fixture.
     print(f"100-poll author replay (JSON reload={reload_state}): "
           f"{len(calls)} total requests, {complete_polls} complete polls")
 
