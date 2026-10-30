@@ -6,6 +6,7 @@ import pytest
 
 import douyin_media_downloader as media
 import douyin_recorder_app as app
+from i18n import DEFAULT_LANGUAGE, set_language
 
 
 def profile(directory):
@@ -115,3 +116,45 @@ def test_successful_public_result_clears_mobile_capability_warning():
     assert result.complete
     assert result.unavailable_reason == ""
     assert [item["aweme_id"] for item in result[0]] == ["public-story"]
+
+
+@pytest.mark.parametrize("reason", ["pagination", "active_limit", "identity", "request_failed", "page_limit"])
+def test_partial_reason_survives_fallback_download_and_saved_summary(tmp_path, reason):
+    failed = media.MobileStoryFeedResult(None, "synthetic diagnostics", complete=False, scan_reason=reason)
+    with unavailable_mobile(signer=True, cookie="sessionid=test"), patch.object(
+        media, "fetch_stories_via_mobile_story_feed", return_value=failed
+    ), patch.object(media, "fetch_stories_via_mobile_post_api", return_value=(None, "no stories")):
+        summary = media.download_profile(profile(tmp_path), videos=False, stories=True)
+    assert summary["stories"]["status"] == "partial"
+    assert summary["stories"]["scan_reason"] == reason
+    saved = json.loads((tmp_path / "douyin_media_state.json").read_text())
+    assert saved["last_summary"]["stories"]["scan_reason"] == reason
+    assert "synthetic diagnostics" in summary["stories"]["message"]
+
+
+@pytest.mark.parametrize("language,continuation", [("en", "continuing next check"), ("zh-CN", "下次继续扫描")])
+def test_only_page_limit_promises_continuation(language, continuation):
+    try:
+        set_language(language)
+        for reason in ("pagination", "active_limit", "identity", "request_failed", "page_limit", "", "unknown"):
+            summary = {"stories": {"status": "partial", "scan_reason": reason,
+                                   "message": "private diagnostics", "downloaded": 2}}
+            text = app.MediaDownloadEngine.summarize_kind(summary, "stories")
+            assert (continuation in text) == (reason == "page_limit")
+            assert "private diagnostics" not in text
+            assert "+2" in text
+            assert "{reason}" not in text
+    finally:
+        set_language(DEFAULT_LANGUAGE)
+
+
+def test_blocked_author_takes_priority_over_resumable_post_scan():
+    with unavailable_mobile(signer=True, cookie="sessionid=test"), patch.object(
+        media, "fetch_stories_via_mobile_story_feed", return_value=media.MobileStoryFeedResult(
+            None, "author stalled", complete=False, scan_reason="pagination")
+    ), patch.object(media, "fetch_stories_via_mobile_post_api", return_value=media.MobileStoryFeedResult(
+        None, "post limit", complete=False, scan_reason="page_limit")
+    ):
+        result = media.fetch_stories(object(), {}, "target")
+    assert not result.complete
+    assert result.scan_reason == "pagination"

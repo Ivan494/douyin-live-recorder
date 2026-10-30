@@ -26,6 +26,8 @@ def mobile_requests(handler):
     def request(_client, method, path, extra, *_args, **kwargs):
         calls.append((path, dict(extra), kwargs.get("host")))
         payload = handler(path, extra, kwargs.get("host"))
+        if isinstance(payload, httpx.Response):
+            return payload
         return httpx.Response(200, json=payload,
                               request=httpx.Request(method, "https://example.test" + path))
 
@@ -467,3 +469,407 @@ def test_active_bucket_more_flag_is_not_silently_declared_complete():
     assert result[0] is None
     assert not result.complete
     assert "active pagination cursor" in result[1]
+
+
+@pytest.mark.parametrize("more,no_more", [(True, False), (1, 0), ("1", "0")])
+def test_active_window_fetches_beyond_twenty_without_using_archive_offset(more, no_more):
+    visible = [story(str(n)) for n in range(47)]
+
+    def response(path, extra, _host):
+        if path != media.STORY_PROFILE_LIST_PATH:
+            return {"status_code": 0, "data": [visible[0]], "has_more": False}
+        assert extra["offset"] == "0"
+        size = int(extra["active_data_size"])
+        return {"status_code": 0, "active_data": {
+            "data": visible[:size], "has_more": more if size < len(visible) else no_more},
+            "has_more": no_more, "next_offset": 0}
+
+    with mobile_requests(response) as calls:
+        result = fetch()
+    assert result.complete
+    assert [item["aweme_id"] for item in result[0]] == [str(n) for n in range(47)]
+    assert [extra["active_data_size"] for path, extra, _ in calls
+            if path == media.STORY_PROFILE_LIST_PATH] == ["20", "40", "80"]
+
+
+def test_capped_active_window_keeps_items_and_still_scans_archive():
+    visible = [story(str(n)) for n in range(20)]
+
+    def response(path, extra, _host):
+        if path != media.STORY_PROFILE_LIST_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        if extra["offset"] == "0":
+            return {"status_code": 0, "active_data": {"data": visible, "has_more": True},
+                    "has_more": True, "next_offset": 20}
+        return {"status_code": 0, "data": [story("archive")], "has_more": False}
+
+    with mobile_requests(response) as calls:
+        result = fetch()
+    assert not result.complete
+    assert result.scan_reason == "pagination"
+    assert [item["aweme_id"] for item in result[0]] == [*[str(n) for n in range(20)], "archive"]
+    assert [(extra["offset"], extra["active_data_size"]) for path, extra, _ in calls
+            if path == media.STORY_PROFILE_LIST_PATH] == [("0", "20"), ("0", "40"), ("20", "40")]
+
+
+def test_active_window_is_bounded_even_when_every_response_adds_items():
+    def response(path, extra, _host):
+        if path != media.STORY_PROFILE_LIST_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        size = int(extra["active_data_size"])
+        return {"status_code": 0, "active_data": {
+            "data": [story(str(n)) for n in range(size)], "has_more": True}, "has_more": False}
+
+    with mobile_requests(response) as calls:
+        result = fetch()
+    assert not result.complete
+    assert result.scan_reason == "active_limit"
+    assert len(result[0]) == 320
+    assert len([call for call in calls if call[0] == media.STORY_PROFILE_LIST_PATH]) == 5
+
+
+@pytest.mark.parametrize("second", [None, {"data": []}])
+def test_active_retry_cannot_claim_complete_when_bucket_metadata_disappears(second):
+    def response(path, extra, _host):
+        if path != media.STORY_PROFILE_LIST_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        active = {"data": [story("first")], "has_more": True} if extra["active_data_size"] == "20" else second
+        return {"status_code": 0, "active_data": active, "has_more": False}
+
+    with mobile_requests(response):
+        result = fetch()
+    assert not result.complete
+    assert result.scan_reason == "pagination"
+    assert [item["aweme_id"] for item in result[0]] == ["first"]
+
+
+def test_archive_checkpoint_survives_active_window_retries_and_new_stories():
+    state = {}
+    media._story_scan_state(state, AUTHOR, "sessionid=test")["author_offsets"][media.STORY_PROFILE_LIST_PATH] = "300"
+    visible = [story(str(n)) for n in range(21)]
+
+    def response(path, extra, _host):
+        if path != media.STORY_PROFILE_LIST_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        if extra["offset"] == "0":
+            size = int(extra["active_data_size"])
+            return {"status_code": 0, "active_data": {"data": visible[:size], "has_more": size < 21},
+                    "has_more": True, "next_offset": 20}
+        assert extra["offset"] == "300"
+        return {"status_code": 0, "data": [story("old")], "has_more": False}
+
+    with mobile_requests(response) as calls:
+        result = fetch(scan_state=state)
+    assert result.complete
+    assert len(result[0]) == 22
+    assert [extra["offset"] for path, extra, _ in calls
+            if path == media.STORY_PROFILE_LIST_PATH] == ["0", "0", "300"]
+    assert state["story_scan"]["author_offsets"] == {}
+
+
+def test_failed_active_retry_preserves_downloadable_first_page():
+    def response(path, extra, _host):
+        if path != media.STORY_PROFILE_LIST_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        if extra["active_data_size"] != "20":
+            raise httpx.ReadTimeout("synthetic timeout")
+        return {"status_code": 0, "active_data": {"data": [story("first")], "has_more": True},
+                "has_more": False}
+
+    with mobile_requests(response):
+        result = fetch()
+    assert not result.complete
+    assert result.scan_reason == "request_failed"
+    assert [item["aweme_id"] for item in result[0]] == ["first"]
+
+
+@pytest.mark.parametrize("failure", ["timeout", "status", "invalid_json", "missing_metadata"])
+@pytest.mark.parametrize("resume", [None, "300"])
+def test_failed_active_enlargement_still_reads_archive(failure, resume):
+    state = {}
+    if resume:
+        media._story_scan_state(state, AUTHOR, "sessionid=test")["author_offsets"][media.STORY_PROFILE_LIST_PATH] = resume
+    visible = [story(str(n)) for n in range(20)]
+
+    def response(path, extra, _host):
+        if path != media.STORY_PROFILE_LIST_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        if extra["offset"] != "0":
+            assert extra["offset"] == (resume or "20")
+            assert extra["active_data_size"] == "20"
+            return {"status_code": 0, "data": [story("archive")], "has_more": False}
+        if extra["active_data_size"] != "20":
+            if failure == "timeout":
+                raise httpx.ReadTimeout("synthetic timeout")
+            if failure == "invalid_json":
+                raise ValueError("synthetic invalid JSON")
+            if failure == "status":
+                return {"status_code": 5}
+            return {"status_code": 0, "has_more": False}
+        return {"status_code": 0, "active_data": {"data": visible, "has_more": True},
+                "has_more": True, "next_offset": 20}
+
+    with mobile_requests(response) as calls:
+        result = fetch(scan_state=state)
+    assert not result.complete
+    assert result.scan_reason == ("pagination" if failure == "missing_metadata" else "request_failed")
+    assert [item["aweme_id"] for item in result[0]] == [*[str(n) for n in range(20)], "archive"]
+    assert state["story_scan"]["author_offsets"] == {}
+    assert [extra["offset"] for path, extra, _ in calls
+            if path == media.STORY_PROFILE_LIST_PATH][-1] == (resume or "20")
+
+
+def test_failed_later_enlargement_uses_last_working_size_for_archive():
+    def response(path, extra, _host):
+        if path != media.STORY_PROFILE_LIST_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        size = int(extra["active_data_size"])
+        if size > 40:
+            raise httpx.ReadTimeout("synthetic window limit")
+        if extra["offset"] != "0":
+            assert size == 40
+            return {"status_code": 0, "data": [story("archive")], "has_more": False}
+        return {"status_code": 0, "active_data": {
+            "data": [story(str(n)) for n in range(size)], "has_more": True},
+            "has_more": True, "next_offset": 20}
+
+    with mobile_requests(response):
+        result = fetch()
+    assert len(result[0]) == 41
+    assert not result.complete
+    assert result.scan_reason == "request_failed"
+
+
+def test_archive_checkpoint_survives_cancellation_during_active_enlargement():
+    state = {}
+    def response(path, extra, _host):
+        if extra["active_data_size"] != "20":
+            raise InterruptedError("synthetic cancellation")
+        return {"status_code": 0, "active_data": {"data": [story("first")], "has_more": True},
+                "has_more": True, "next_offset": 20}
+
+    with mobile_requests(response), pytest.raises(InterruptedError):
+        fetch(scan_state=state)
+    assert state["story_scan"]["author_offsets"][media.STORY_PROFILE_LIST_PATH] == "20"
+
+
+def test_failed_enlargement_retains_bounded_archive_resume():
+    state = {}
+    def response(path, extra, _host):
+        if path != media.STORY_PROFILE_LIST_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        if extra["active_data_size"] != "20":
+            raise httpx.ReadTimeout("synthetic window limit")
+        offset = int(extra["offset"])
+        if offset == 0:
+            return {"status_code": 0, "active_data": {"data": [story("active")], "has_more": True},
+                    "has_more": True, "next_offset": 20}
+        return {"status_code": 0, "data": [story(str(offset))],
+                "has_more": offset < 300, "next_offset": offset + 20}
+
+    with mobile_requests(response) as calls:
+        first = fetch(scan_state=state)
+        assert not first.complete
+        assert state["story_scan"]["author_offsets"][media.STORY_PROFILE_LIST_PATH] == "280"
+        assert len([c for c in calls if c[0] == media.STORY_PROFILE_LIST_PATH]) == 16
+        calls.clear()
+        second = fetch(scan_state=state)
+    assert [extra["offset"] for path, extra, _ in calls
+            if path == media.STORY_PROFILE_LIST_PATH] == ["0", "0", "0", "280", "300"]
+    assert [item["aweme_id"] for item in second[0]] == ["active", "280", "300"]
+    assert not second.complete
+    assert second.scan_reason == "request_failed"
+    assert state["story_scan"]["author_offsets"] == {}
+
+
+def test_active_more_on_archive_page_cannot_be_declared_complete():
+    def response(path, extra, _host):
+        if path != media.STORY_PROFILE_LIST_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        if extra["offset"] == "0":
+            return {"status_code": 0, "active_data": {"data": [], "has_more": False},
+                    "has_more": True, "next_offset": 20}
+        return {"status_code": 0, "active_data": {"data": [story("later")], "has_more": True},
+                "has_more": False}
+
+    with mobile_requests(response):
+        result = fetch()
+    assert not result.complete
+    assert result.scan_reason == "pagination"
+    assert [item["aweme_id"] for item in result[0]] == ["later"]
+
+
+@pytest.mark.parametrize("error", [InterruptedError("cancelled"), media.LoginRequiredError("expired")])
+def test_active_retry_respects_cancellation_and_login_rejection(error):
+    def response(_path, extra, _host):
+        if extra["active_data_size"] != "20":
+            raise error
+        return {"status_code": 0, "active_data": {"data": [story("first")], "has_more": True},
+                "has_more": False}
+
+    with mobile_requests(response), pytest.raises(type(error)):
+        fetch()
+
+
+def catalog_group(count=40):
+    return {"total": count, "min_cursor": 100000, "max_cursor": 100000 + count - 1,
+            "story_id_list": [{"id": str(1000 + n), "cursor": 100000 + n, "offset": n}
+                              for n in range(count)]}
+
+
+def catalog_head(count=40, *, archive=False):
+    return {"status_code": 0, "active_data": {
+        "data": [story(str(1000 + n)) for n in range(min(20, count))], "has_more": count > 20,
+        "story_group_v2_items": [{"item_id": 1000, "story_group_v2": catalog_group(count)}]},
+        "has_more": archive, "next_offset": 20 if archive else 0}
+
+
+def catalog_page(extra, count=40):
+    assert extra["to_uid"] == UID
+    assert extra["direct"] == "0"
+    assert extra["min_cursor"] == "100000"
+    assert extra["max_cursor"] == str(100000 + count - 1)
+    assert "delete_ids" not in extra and "published_ids" not in extra
+    start = int(extra["cursor"]) - 100001
+    return {"status_code": 0, "story_group": {
+        **catalog_group(count), "story_list": [{"story": story(str(1000 + n)), "unread": True}
+                                              for n in range(start, min(start + 6, count))]}}
+
+
+def test_verified_catalog_pager_recovers_all_forty_when_profile_window_is_capped():
+    def response(path, extra, _host):
+        if path == media.STORY_PROFILE_LIST_PATH:
+            assert extra["active_data_size"] == "20"
+            return catalog_head()
+        if path == media.NEW_STORY_FEED_V2_PATH:
+            return catalog_page(extra)
+        if path == media.STORY_FEED_PATH:
+            # Live server shape: the old incomplete author request returns
+            # no items and no next_offset. A proper outer-feed refresh does.
+            if (extra.get("source"), extra.get("pull_type"), extra.get("level")) != ("9", "1", "1"):
+                return {"status_code": 0, "data": [], "has_more": True}
+            return {"status_code": 0, "data": [story("1000")], "has_more": False, "next_offset": 0}
+        return {"status_code": 0, "data": [], "has_more": False}
+    with mobile_requests(response) as calls:
+        result = fetch(scan_state={})
+    assert result.complete
+    assert [x["aweme_id"] for x in result[0]] == [str(1000 + n) for n in range(40)]
+    assert len([c for c in calls if c[0] == media.NEW_STORY_FEED_V2_PATH]) == 4
+
+
+def test_catalog_budget_resumes_remaining_ids_across_checks():
+    state = {}
+    def response(path, extra, _host):
+        if path == media.STORY_PROFILE_LIST_PATH:
+            return catalog_head(200)
+        if path == media.NEW_STORY_FEED_V2_PATH:
+            return catalog_page(extra, 200)
+        return {"status_code": 0, "data": [], "has_more": False}
+    all_ids = set()
+    with mobile_requests(response) as calls:
+        for check in range(3):
+            calls.clear()
+            result = fetch(scan_state=state)
+            all_ids.update(x["aweme_id"] for x in result[0])
+            assert len([c for c in calls if c[0] == media.STORY_PROFILE_LIST_PATH
+                        or (c[0] == media.NEW_STORY_FEED_V2_PATH and "direct" in c[1])]) <= 15
+            assert result.complete == (check == 2)
+            if check < 2:
+                assert result.scan_reason == "page_limit"
+    assert all_ids == {str(1000 + n) for n in range(200)}
+    assert "active_story_ids" not in state["story_scan"]
+
+
+@pytest.mark.parametrize("failure", ["timeout", "status", "missing_group", "changed_catalog", "foreign", "stalled"])
+def test_catalog_failures_keep_verified_items_and_never_claim_complete(failure):
+    def response(path, extra, _host):
+        if path == media.STORY_PROFILE_LIST_PATH:
+            return catalog_head()
+        if path != media.NEW_STORY_FEED_V2_PATH or "direct" not in extra:
+            return {"status_code": 0, "data": [], "has_more": False}
+        if failure == "timeout":
+            raise httpx.ReadTimeout("synthetic timeout")
+        if failure == "status":
+            return {"status_code": 5}
+        if failure == "missing_group":
+            return {"status_code": 0}
+        payload = catalog_page(extra)
+        if failure == "changed_catalog":
+            payload["story_group"]["total"] = 41
+        elif failure == "foreign":
+            for wrapped in payload["story_group"]["story_list"]:
+                wrapped["story"]["author"]["sec_uid"] = "different-author"
+        else:
+            payload["story_group"]["story_list"] = [{"story": story("1000")}]
+        return payload
+    with mobile_requests(response):
+        result = fetch(scan_state={})
+    assert not result.complete
+    assert len(result[0]) == 20
+    assert result.scan_reason == ("request_failed" if failure in ("timeout", "status") else "pagination")
+
+
+@pytest.mark.parametrize("error", [InterruptedError("cancelled"), media.LoginRequiredError("expired")])
+def test_catalog_cancel_and_login_errors_propagate(error):
+    def response(path, extra, _host):
+        if path == media.STORY_PROFILE_LIST_PATH:
+            return catalog_head()
+        raise error
+    with mobile_requests(response), pytest.raises(type(error)):
+        fetch(scan_state={})
+
+
+@pytest.mark.parametrize("failure", ["timeout", "server_error", "http_503"])
+def test_catalog_transient_failure_retries_once_within_the_shared_budget(failure):
+    attempts = {}
+    def response(path, extra, _host):
+        if path == media.STORY_PROFILE_LIST_PATH:
+            return catalog_head()
+        if path != media.NEW_STORY_FEED_V2_PATH:
+            return {"status_code": 0, "data": [], "has_more": False}
+        cursor = extra["cursor"]
+        attempts[cursor] = attempts.get(cursor, 0) + 1
+        if attempts[cursor] == 1:
+            if failure == "timeout":
+                raise httpx.ReadTimeout("synthetic transient failure")
+            if failure == "http_503":
+                return httpx.Response(503, request=httpx.Request("GET", "https://example.test/story"))
+            return {"status_code": 5}
+        return catalog_page(extra)
+    with mobile_requests(response):
+        result = fetch(scan_state={})
+    assert result.complete
+    assert len(result[0]) == 40
+    assert set(attempts.values()) == {2}
+
+
+def test_catalog_http_429_stops_without_an_immediate_retry():
+    attempts = []
+    def response(path, extra, _host):
+        if path == media.STORY_PROFILE_LIST_PATH:
+            return catalog_head()
+        if path == media.NEW_STORY_FEED_V2_PATH and "direct" in extra:
+            attempts.append(extra["cursor"])
+            return httpx.Response(429, request=httpx.Request("GET", "https://example.test/story"))
+        return {"status_code": 0, "data": [], "has_more": False}
+    with mobile_requests(response):
+        result = fetch(scan_state={})
+    assert len(attempts) == 1
+    assert not result.complete
+    assert result.scan_reason == "request_failed"
+    assert "HTTP 429" in result[1]
+
+
+def test_catalog_request_budget_preserves_independent_archive_checkpoint():
+    state = {}
+    def response(path, extra, _host):
+        if path == media.STORY_PROFILE_LIST_PATH:
+            return catalog_head(200, archive=True)
+        if path == media.NEW_STORY_FEED_V2_PATH and "direct" in extra:
+            return catalog_page(extra, 200)
+        return {"status_code": 0, "data": [], "has_more": False}
+    with mobile_requests(response):
+        result = fetch(scan_state=state)
+    assert not result.complete
+    assert result.scan_reason == "page_limit"
+    assert state["story_scan"]["author_offsets"][media.STORY_PROFILE_LIST_PATH] == "20"
