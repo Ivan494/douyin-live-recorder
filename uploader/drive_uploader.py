@@ -161,7 +161,16 @@ def _upload_one(path, rel, size, dry):
     if file_stamp(path) != stamp:
         log(f"SKIP {rel}: changed while hashing")
         return False
-    r = subprocess.run(["rclone", "copyto", "--retries", "3", str(path), dest], capture_output=True, text=True)
+    # Stall guard: a hung Drive upload must not hold the flock forever.
+    # Overall cap: 30 min + 5 min/GiB (expected ~0.5 min/GiB).
+    cap = 1800 + int(size / (1 << 30) * 300)
+    try:
+        r = subprocess.run(["rclone", "copyto", "--retries", "3", "--timeout", "5m",
+                            "--contimeout", "60s", "--low-level-retries", "10",
+                            str(path), dest], capture_output=True, text=True, timeout=cap)
+    except subprocess.TimeoutExpired:
+        log(f"FAIL copy {rel}: rclone exceeded {cap}s; will retry next run")
+        return False
     if r.returncode:
         log(f"FAIL copy {rel}: {r.stderr.strip()[-300:]}")
         return False

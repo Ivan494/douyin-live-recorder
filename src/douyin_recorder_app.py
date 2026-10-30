@@ -1398,6 +1398,7 @@ class MonitorEngine:
             "rotate_at",
             "segment_started_at",
             "profile_url",
+            "finalize_attempts",
         )
         return {key: recording.get(key) for key in keys}
 
@@ -1943,6 +1944,18 @@ class MonitorEngine:
             raise RuntimeError(f"Missing MKV part: {path}")
         return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
 
+    def _finalize_timeout(self, parts):
+        # Stream-copy concat scales with size: a fixed 240 s killed a 10 GB
+        # session at 8 GB. Allow base + 120 s per GiB.
+        base = max(30, int(self.store.settings.get("headless_finalize_timeout_seconds", 240)))
+        size = 0
+        for path in parts:
+            try:
+                size += Path(path).stat().st_size
+            except OSError:
+                pass
+        return base + int(size / (1 << 30) * 120)
+
     def _finalize_recording_worker(self, recording, reason):
         final_output = Path(recording["final_output"])
         session_dir = Path(recording["session_dir"])
@@ -1998,7 +2011,7 @@ class MonitorEngine:
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=log_handle,
-                    timeout=max(30, int(self.store.settings.get("headless_finalize_timeout_seconds", 240))) if HEADLESS else None,
+                    timeout=self._finalize_timeout(usable_parts) if HEADLESS else None,
                     **hidden_subprocess_kwargs(),
                 )
             if result.returncode != 0:
@@ -2027,7 +2040,15 @@ class MonitorEngine:
             )
             logging.info("Finalized %s from %s MKV part(s): %s", profile_id, len(usable_parts), final_output)
         except Exception as exc:
+            # A killed/failed concat leaves a partial temp file the uploader
+            # skips forever; it is never the only copy (raw parts remain).
+            try:
+                if temporary_output.exists():
+                    temporary_output.unlink()
+            except OSError:
+                logging.warning("Could not remove partial %s", temporary_output)
             recording["status"] = "failed"
+            recording["finalize_attempts"] = int(recording.get("finalize_attempts") or 0) + 1
             recording["stop_reason"] = f"{reason}: {exc}"
             try:
                 self._save_recording_manifest(recording)

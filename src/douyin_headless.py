@@ -187,13 +187,29 @@ class HeadlessMonitorEngine(app.MonitorEngine):
             root = Path(profile["output_dir"]) / ".recording_sessions"
             for manifest_path in root.glob("*/session.json"):
                 manifest = self._read_recording_manifest(manifest_path)
-                if not manifest or manifest.get("status") not in {"waiting_for_disk", "finalizing"} or manifest.get("profile_id") != profile["id"]:
+                if not manifest or manifest.get("profile_id") != profile["id"]:
+                    continue
+                if not self._should_retry_finalize(manifest):
                     continue
                 manifest["manifest_path"] = str(manifest_path)
                 manifest["session_dir"] = str(manifest_path.parent)
                 with self.deferred_lock:
                     self.deferred_finalizers[str(manifest_path.parent)] = (manifest, manifest.get("stop_reason", "Disk space recovered"))
         return super().recover_pending_recording_sessions()
+
+    MAX_FINALIZE_ATTEMPTS = 3
+
+    @classmethod
+    def _should_retry_finalize(cls, manifest):
+        status = manifest.get("status")
+        if status in {"waiting_for_disk", "finalizing"}:
+            return True
+        # Orphan sweep: failed finalizes keep raw parts; retry them (bounded)
+        # instead of leaving parts + a partial .finalizing.mkv on disk forever.
+        if status == "failed" and int(manifest.get("finalize_attempts") or 0) < cls.MAX_FINALIZE_ATTEMPTS:
+            parts = [Path(v) for v in manifest.get("parts") or []]
+            return bool(parts) and all(p.is_file() for p in parts)
+        return False
 
     def _check_profile(self, profile):
         if not self.disk.can_start(profile):
