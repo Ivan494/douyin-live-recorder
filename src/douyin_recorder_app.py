@@ -264,7 +264,10 @@ def expand_portable_path(value):
     for legacy, root in ((r"E:\douyindownload", ROOT_DOWNLOAD_DIR), (r"E:\youtube-dl", TOOLS_DIR)):
         prefix = legacy.casefold()
         if normalized == prefix or normalized.startswith(prefix + "\\"):
-            return str(root) + value[len(legacy):]
+            rest = value[len(legacy):]
+            if os.name != "nt":
+                rest = rest.replace("\\", "/")
+            return str(root) + rest
     return value
 
 
