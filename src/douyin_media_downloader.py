@@ -4738,6 +4738,7 @@ def fetch_stories(client, profile, sec_user_id, user_id="", *, scan_state=None):
     unavailable_reason = ""
     capability_source = ""
     scan_reasons = []
+    post_scan_attempted = False
 
     def merge_partial(items):
         merged = []
@@ -4755,7 +4756,38 @@ def fetch_stories(client, profile, sec_user_id, user_id="", *, scan_state=None):
         return f"{source}; {partial_source}" if partial_source else source
 
     def result(items, source, is_supported, *, complete=True):
+        nonlocal post_scan_attempted
         complete = complete and author_scan_complete
+        pending = scan_state.get("story_scan") if isinstance(scan_state, dict) else None
+        if (not post_scan_attempted and isinstance(pending, dict)
+                and _story_cursor(pending.get("post_cursor")) not in ("", "0")):
+            # New active/life items must not strand a post traversal started
+            # on an earlier poll. Recheck its target/login scope before joining
+            # that bounded scan with whichever story source is returning now.
+            pending = _story_scan_state(scan_state, sec_user_id, mobile_cookie)
+            if _story_cursor(pending.get("post_cursor")) not in ("", "0"):
+                post_scan_attempted = True
+                try:
+                    post_result = fetch_stories_via_mobile_post_api(
+                        client, sec_user_id, cookie_header=mobile_cookie, scan_state=scan_state)
+                    post_items, post_source = post_result
+                    if post_items:
+                        retained = _filter_story_items(post_items, sec_user_id,
+                                                       require_story_marker=True, require_author_match=True)
+                        items = merge_partial([*items, *retained])
+                        is_supported = is_supported or bool(retained)
+                    post_complete = getattr(post_result, "complete", True)
+                    complete = complete and post_complete
+                    if not post_complete:
+                        scan_reasons.append(getattr(post_result, "scan_reason", "") or "request_failed")
+                    if post_source:
+                        source = f"{source}; {post_source} (resumed post scan)"
+                except (LoginRequiredError, InterruptedError):
+                    raise
+                except Exception as exc:
+                    complete = False
+                    scan_reasons.append("request_failed")
+                    source = f"{source}; pending post scan failed ({type(exc).__name__})"
         if complete and isinstance(scan_state, dict):
             continuation = scan_state.get("story_scan")
             if isinstance(continuation, dict):
@@ -4993,6 +5025,7 @@ def fetch_stories(client, profile, sec_user_id, user_id="", *, scan_state=None):
     post_complete = False
     post_incomplete_source = ""
     try:
+        post_scan_attempted = True
         post_result = fetch_stories_via_mobile_post_api(
             client, sec_user_id, cookie_header=mobile_cookie,
             **({"scan_state": scan_state} if scan_state is not None else {}),

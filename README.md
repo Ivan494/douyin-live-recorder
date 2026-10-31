@@ -96,6 +96,9 @@ python src/douyin_media_downloader.py --profile-url <用户主页> --stories --o
 不会把某个作品的发布时间猜成历史列表偏移量。
 扩大近期日常数量的请求失败或缺少必要元数据时，保留已取得的内容，并用上次
 成功的请求数量继续历史列表；近期日常仍显示未完成，不会误报全部取完。
+大量近期日常也会给待续的历史列表保留请求机会。已完成的来源会保留进度，
+等待其他已开始的扫描完成；每轮仍检查最新内容，账号或列表变化时重新验证。
+已经开始的作品流日常扫描也会继续，不会因为发现新的近期日常而被跳过。
 
 “下次继续扫描”表示本次达到页数上限且已保存翻页位置。
 “分页停滞”“获取上限”或“接口请求失败”表示列表仍不完整，重复检查不保证补齐。
@@ -237,6 +240,10 @@ are never guessed as archive offsets. Access still depends on the saved login.
 If an active-window retry fails or loses required metadata, available items
 are retained and archive pagination continues with the last working request
 size. The active scan remains incomplete rather than claiming full recovery.
+Large active catalogs leave room for a pending archive page. Completed source
+checkpoints are retained while other started scans catch up, with fresh heads
+checked on every poll and completion revalidated when the login or list changes.
+An existing post-feed continuation also advances when new active stories appear.
 
 “Continuing next check” means the request budget was reached and a continuation
 was saved. A stalled list, active limit, or failed request remains incomplete;

@@ -1,9 +1,6 @@
 """Full-fetch joins must retain validated author scans until posts catch up."""
-import ast
 from contextlib import contextmanager
 import json
-from pathlib import Path
-import subprocess
 from unittest.mock import patch
 
 import httpx
@@ -25,22 +22,6 @@ def legacy_checkpoint():
     scan["author_offsets"][media.STORY_FEED_PATH] = "580"
     scan["post_cursor"] = "580"
     return state
-
-
-@pytest.fixture(scope="module")
-def legacy_functions():
-    # Execute the actual pre-upgrade implementation without checking it out.
-    # Include its caller as well: its author helper predates the defer option.
-    source = subprocess.check_output(
-        ["git", "show", "e7fe8e6:src/douyin_media_downloader.py"],
-        cwd=Path(__file__).resolve().parents[2], text=True)
-    names = {"fetch_stories", "fetch_stories_via_mobile_story_feed"}
-    nodes = [node for node in ast.parse(source).body
-             if isinstance(node, ast.FunctionDef) and node.name in names]
-    namespace = {}
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<e7fe8e6>", "exec"),
-         media.__dict__, namespace)
-    return namespace
 
 
 @contextmanager
@@ -81,58 +62,38 @@ def retained_post_requests(author_response=None, *, post_items=True):
 
 @pytest.mark.parametrize("seed_from_parent", [False, True])
 @pytest.mark.parametrize("reload_state", [False, True])
-@pytest.mark.parametrize("revision", ["e7fe8e6", "working"])
 def test_empty_author_and_retained_post_scans_complete_within_four_polls(
-        legacy_functions, seed_from_parent, reload_state, revision):
-    state = legacy_checkpoint()
+        seed_from_parent, reload_state):
+    # The migration fixture is serialized data, not code loaded from a local
+    # development-only Git object. This also runs in shallow/source ZIP checkouts.
+    state = json.loads(json.dumps(legacy_checkpoint())) if seed_from_parent else {}
     with retained_post_requests() as (calls, post_calls):
-        if seed_from_parent:
-            state = {}
-            with patch.object(media, "fetch_stories_via_mobile_story_feed",
-                              legacy_functions["fetch_stories_via_mobile_story_feed"]):
-                for _ in range(2):
-                    legacy_functions["fetch_stories"](
-                        object(), {"cookies": "sessionid=test"}, AUTHOR, user_id=UID, scan_state=state)
-                    if reload_state:
-                        state = json.loads(json.dumps(state))
-            assert state == legacy_checkpoint()
-        calls.clear()
-        post_calls.clear()
         complete_polls = []
         seen = set()
-        functions = legacy_functions if revision == "e7fe8e6" else {
-            name: getattr(media, name) for name in legacy_functions}
-        with patch.object(media, "fetch_stories_via_mobile_story_feed",
-                          functions["fetch_stories_via_mobile_story_feed"]):
-            for poll in range(1, 101):
-                start, post_start = len(calls), len(post_calls)
-                result = functions["fetch_stories"](
-                    object(), {"cookies": "sessionid=test"}, AUTHOR, user_id=UID, scan_state=state)
-                current_calls = calls[start:]
-                assert_profile_budget(current_calls)
-                assert sum(path == media.STORY_FEED_PATH and "to_uid" in extra
-                           for path, extra, _ in current_calls) <= 15
-                assert len(post_calls) - post_start <= 15
-                # Retention never replaces the fresh heads of either author
-                # source or the post source with a cached response.
-                for path in (media.STORY_PROFILE_LIST_PATH, media.STORY_FEED_PATH):
-                    assert next(extra["offset"] for p, extra, _ in current_calls
-                                if p == path and "to_uid" in extra) == "0"
-                assert post_calls[post_start] == 0
-                seen.update(item["aweme_id"] for item in result[0])
-                if result.complete:
-                    complete_polls.append(poll)
-                    assert "author_scans" not in state["story_scan"]
-                    assert "post_cursor" not in state["story_scan"]
-                if reload_state:
-                    state = json.loads(json.dumps(state))
+        for poll in range(1, 101):
+            start, post_start = len(calls), len(post_calls)
+            result = fetch_all(state)
+            current_calls = calls[start:]
+            assert_profile_budget(current_calls)
+            assert sum(path == media.STORY_FEED_PATH and "to_uid" in extra
+                       for path, extra, _ in current_calls) <= 15
+            assert len(post_calls) - post_start <= 15
+            for path in (media.STORY_PROFILE_LIST_PATH, media.STORY_FEED_PATH):
+                assert next(extra["offset"] for p, extra, _ in current_calls
+                            if p == path and "to_uid" in extra) == "0"
+            assert post_calls[post_start] == 0
+            seen.update(item["aweme_id"] for item in result[0])
+            if result.complete:
+                complete_polls.append(poll)
+                assert "author_scans" not in state["story_scan"]
+                assert "post_cursor" not in state["story_scan"]
+            if reload_state:
+                state = json.loads(json.dumps(state))
         assert "post-only" in seen
         assert complete_polls and complete_polls[0] <= 4
         assert max(b - a for a, b in zip(complete_polls, complete_polls[1:])) <= 6
-        assert len(complete_polls) >= 17  # Measured e7fe8e6 baseline: 17/100.
-        if revision == "e7fe8e6":
-            assert complete_polls == list(range(4, 101, 6))
-        print(f"full fetch {revision}, parent seed={seed_from_parent}, JSON reload={reload_state}: "
+        assert len(complete_polls) >= 17
+        print(f"full fetch, parent seed={seed_from_parent}, JSON reload={reload_state}: "
               f"{len(complete_polls)} completes, {len(calls) + len(post_calls)} mobile requests")
 
 
@@ -224,3 +185,72 @@ def test_completed_full_fetch_restarts_author_traversals(post_items):
         for path in (media.STORY_PROFILE_LIST_PATH, media.STORY_FEED_PATH):
             offsets = [extra["offset"] for p, extra, _ in calls if p == path and "to_uid" in extra]
             assert offsets[:2] == ["0", "20"]
+
+
+def test_new_active_story_cannot_strand_an_existing_post_scan():
+    state = pending_post_state()
+    def response(path, extra, _host):
+        if path == media.STORY_PROFILE_LIST_PATH:
+            return {**successful_empty(), "data": [story("fresh-active")]}
+        if path == media.STORY_FEED_PATH and "to_uid" in extra:
+            return successful_empty()
+        return None
+    with retained_post_requests(response) as (_calls, post_calls):
+        first = fetch_all(state)
+        assert post_calls and not first.complete
+        assert state["story_scan"]["post_cursor"] == "580"
+        assert [x["aweme_id"] for x in first[0]] == ["fresh-active"]
+        state = json.loads(json.dumps(state))
+        second = fetch_all(state)
+    assert second.complete
+    assert {x["aweme_id"] for x in second[0]} == {"fresh-active", "post-only"}
+    assert "post_cursor" not in state["story_scan"]
+
+
+@pytest.mark.parametrize("source", ["author", "life"])
+@pytest.mark.parametrize("error", [httpx.ReadTimeout, media.LoginRequiredError, InterruptedError])
+def test_pending_post_failure_is_not_hidden_by_visible_stories(source, error):
+    state = pending_post_state()
+    feed = media.MobileStoryFeedResult([story("visible")] if source == "author" else None,
+                                      "author", complete=source == "author")
+    with retained_post_requests(), patch.object(media, "fetch_stories_via_mobile_story_feed", return_value=feed), patch.object(
+        media, "fetch_stories_via_mobile_life_feed", return_value=([story("visible")], "life")
+    ), patch.object(media, "_mobile_signed_get", side_effect=error("synthetic")):
+        if error is httpx.ReadTimeout:
+            result = fetch_all(state)
+            assert not result.complete
+            assert result.scan_reason == "request_failed"
+            assert [x["aweme_id"] for x in result[0]] == ["visible"]
+        else:
+            with pytest.raises(error):
+                fetch_all(state)
+    assert state["story_scan"]["post_cursor"] == "300"
+
+
+def test_pending_post_join_filters_nonstories_and_foreign_authors_and_deduplicates():
+    state = pending_post_state()
+    post = media.MobileStoryFeedResult([story("visible"), story("retained"),
+        story("foreign", author="other"), {"aweme_id": "ordinary", "author": {"sec_uid": AUTHOR}}],
+        "post", complete=False, scan_reason="page_limit")
+    with retained_post_requests(), patch.object(media, "fetch_stories_via_mobile_story_feed",
+        return_value=media.MobileStoryFeedResult([story("visible")], "author", complete=True)), patch.object(
+        media, "fetch_stories_via_mobile_post_api", return_value=post
+    ) as fetch_post:
+        result = fetch_all(state)
+    assert not result.complete and result.scan_reason == "page_limit"
+    assert [x["aweme_id"] for x in result[0]] == ["visible", "retained"]
+    fetch_post.assert_called_once()
+
+
+@pytest.mark.parametrize("change", ["target", "login"])
+def test_visible_story_join_does_not_resume_another_scope_post_cursor(change):
+    state = pending_post_state()
+    author = "other-target" if change == "target" else AUTHOR
+    cookie = "sessionid=other" if change == "login" else "sessionid=test"
+    with patch.object(media, "fetch_stories_via_mobile_story_feed", return_value=
+            media.MobileStoryFeedResult([story("visible", author=author)], "author", complete=True)), patch.object(
+            media, "fetch_stories_via_mobile_post_api") as post:
+        result = fetch_all(state, author=author, cookie=cookie)
+    assert result.complete
+    post.assert_not_called()
+    assert "post_cursor" not in state["story_scan"]
