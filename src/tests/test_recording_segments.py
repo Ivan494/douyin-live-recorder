@@ -14,9 +14,11 @@ import pytest
 
 from recording_segments import (
     _write_tag,
-    concat_list_line,
+    concat_manifest,
     expand_recording_parts,
     ffmpeg_concat_copy_command,
+    ffmpeg_live_capture_output_args,
+    flv_playback_span_ms,
     split_flv_on_parameter_sets,
 )
 
@@ -107,6 +109,30 @@ def test_sequence_header_change_splits_and_keeps_audio_config(tmp_path):
     assert b"onMetaData" not in pieces[0].read_bytes()
 
 
+def test_playback_span_ignores_a_single_boundary_gap(tmp_path):
+    audio = [(8, timestamp, bytes((0xAF, 1, 1))) for timestamp in (0, 23, 46, 112)]
+    video = [(9, timestamp, _video_nalu(b"v")) for timestamp in (0, 66)]
+    path = tmp_path / "span.flv"
+    path.write_bytes(_flv([(9, 0, _video_seq(b"sps")), *audio, *video]))
+
+    # Usual audio step is 23 ms, so the packet at 112 ms ends at 135 ms,
+    # not 178 ms from the one-off 66 ms jump.
+    assert flv_playback_span_ms(path) == 135
+
+
+def test_single_track_maps_live_in_the_capture_helper():
+    """Map flags moved out of the app into the shared capture command."""
+    source = Path(__file__).resolve().parents[1].joinpath("recording_segments.py").read_text(encoding="utf-8")
+    capture = source.split("def ffmpeg_live_capture_output_args", 1)[1].split("def ffmpeg_concat_copy_command", 1)[0]
+    publish = source.split("def ffmpeg_concat_copy_command", 1)[1].split("def concat_list_line", 1)[0]
+    for block in (capture, publish):
+        assert '"-map"' in block
+        assert '"0:v:0?"' in block
+        assert '"0:a:0?"' in block
+        assert '"0:v?"' not in block
+        assert '"copy"' in block
+
+
 def test_enhanced_flv_sequence_start_also_splits(tmp_path):
     def enhanced(payload):
         # Keyframe + extended header + packet type 0 (sequence start) + fourcc.
@@ -135,6 +161,41 @@ def _tool(name):
     if bundled.is_file():
         return str(bundled)
     return shutil.which(name)
+
+
+def _packet_dts(ffprobe, path, stream):
+    result = subprocess.run(
+        [
+            ffprobe, "-v", "error", "-select_streams", stream,
+            "-show_entries", "packet=dts_time", "-of", "csv=p=0", str(path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    values = []
+    for line in result.stdout.splitlines():
+        token = line.split(",", 1)[0].strip()
+        if token and token != "N/A":
+            values.append(round(float(token), 6))
+    return values
+
+
+def _assert_silent_full_decode(ffmpeg, path):
+    """The deploy gate: every stream, not only video, must decode with no errors."""
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-v", "error", "-i", str(path), "-f", "null", "-"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
 
 
 def _decode_sizes(ffmpeg, path):
@@ -198,8 +259,16 @@ def _splice_flv(first, second, output):
 
     header, first_tags = parse(first)
     _header, second_tags = parse(second)
-    last = max(timestamp for _tag_type, timestamp, _body in first_tags)
-    shift = last + 66 - min(timestamp for tag_type, timestamp, _body in second_tags if tag_type in (8, 9))
+    audio_ts = [
+        timestamp for tag_type, timestamp, body in first_tags
+        if tag_type == 8 and not (len(body) > 1 and body[1] == 0)
+    ]
+    steps = [later - earlier for earlier, later in zip(audio_ts, audio_ts[1:]) if later > earlier]
+    frame_ms = max(set(steps), key=steps.count) if steps else 23
+    last_audio = max(audio_ts) if audio_ts else max(timestamp for _tag, timestamp, _body in first_tags)
+    second_origin = min(timestamp for tag_type, timestamp, _body in second_tags if tag_type in (8, 9))
+    # Continue on the next audio frame so the fixture itself has no hole or overlap.
+    shift = last_audio + frame_ms - second_origin
     buffer = bytearray(header + b"\x00\x00\x00\x00")
 
     class _Sink:
@@ -220,7 +289,7 @@ def _publish_mkv(ffmpeg, parts, output, work_dir):
     stable = expand_recording_parts(parts, work_dir)
     concat_path = Path(work_dir) / "parts.txt"
     concat_path.parent.mkdir(parents=True, exist_ok=True)
-    concat_path.write_text("".join(concat_list_line(path) + "\n" for path in stable), encoding="utf-8")
+    concat_path.write_text(concat_manifest(stable), encoding="utf-8")
     command = ffmpeg_concat_copy_command(ffmpeg, concat_path, output)
     result = subprocess.run(
         command,
@@ -292,6 +361,7 @@ def test_midstream_sps_change_publishes_a_fully_decodeable_mkv(tmp_path):
     assert not published_errors
     assert published_sizes["320x240"] == first_sizes["320x240"]
     assert published_sizes["640x360"] == second_sizes["640x360"]
+    _assert_silent_full_decode(ffmpeg, published)
 
     # A later lossless remux must keep both parameter sets.
     recopy = tmp_path / "recopy.mkv"
@@ -363,6 +433,7 @@ def test_app_finalizer_publishes_decodeable_mkv_after_sps_change(tmp_path):
     assert not errors
     assert sizes["320x240"] == first_sizes["320x240"]
     assert sizes["640x360"] == second_sizes["640x360"]
+    _assert_silent_full_decode(ffmpeg, final_output)
 
 
 def test_app_finalizer_still_joins_legacy_mkv_parts(tmp_path):
@@ -454,6 +525,58 @@ def test_watcher_records_a_capture_flv_before_publishing_mkv(tmp_path, monkeypat
     assert "-c" in command and command[command.index("-c") + 1] == "copy"
 
 
+def test_two_header_changes_decode_every_stream_without_errors(tmp_path):
+    """Two SPS changes (three parameter sets) must not overlap or drop audio."""
+    ffmpeg = _tool("ffmpeg")
+    ffprobe = _tool("ffprobe")
+    if not ffmpeg or not ffprobe:
+        pytest.skip("ffmpeg and ffprobe are required")
+    pieces = [
+        (tmp_path / "baseline.flv", "320x240", "baseline"),
+        (tmp_path / "high.flv", "640x360", "high"),
+        (tmp_path / "main.flv", "480x270", "main"),
+    ]
+    for path, size, profile in pieces:
+        _generate_flv(ffmpeg, path, size, profile)
+    spliced = tmp_path / "spliced.flv"
+    _splice_flv(pieces[0][0], pieces[1][0], tmp_path / "ab.flv")
+    _splice_flv(tmp_path / "ab.flv", pieces[2][0], spliced)
+    capture = tmp_path / "part-0001.flv"
+    copied = subprocess.run(
+        [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-fflags", "+discardcorrupt+genpts", "-i", str(spliced),
+            *ffmpeg_live_capture_output_args(capture),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert copied.returncode == 0, copied.stderr
+    published = tmp_path / "two-switches.mkv"
+    stable = _publish_mkv(ffmpeg, [capture], published, tmp_path / "parameter_sets")
+    assert len(stable) >= 3
+    _assert_silent_full_decode(ffmpeg, published)
+    for stream in ("a", "v"):
+        assert _packet_dts(ffprobe, published, stream) == _packet_dts(ffprobe, capture, stream)
+    sizes, errors = _decode_sizes(ffmpeg, published)
+    assert not errors
+    assert sizes["320x240"] > 0
+    assert sizes["640x360"] > 0
+    assert sizes["480x270"] > 0
+    # The joined timeline keeps each AAC frame's own spacing: no shared DTS
+    # and no hole larger than one extra frame beyond the source.
+    audio_dts = _packet_dts(ffprobe, published, "a")
+    deltas = [round(later - earlier, 6) for earlier, later in zip(audio_dts, audio_dts[1:])]
+    assert deltas
+    # One AAC frame is 1024/44100 s (~23 ms). A shared DTS is an overlap;
+    # anything above one frame is a hole at a parameter-set boundary.
+    assert min(deltas) > 0
+    assert max(deltas) <= 0.024
+
+
 def test_stable_flv_capture_still_publishes_every_frame(tmp_path):
     ffmpeg = _tool("ffmpeg")
     if not ffmpeg:
@@ -469,3 +592,4 @@ def test_stable_flv_capture_still_publishes_every_frame(tmp_path):
     after, after_errors = _decode_sizes(ffmpeg, published)
     assert not after_errors
     assert after["160x120"] == before["160x120"]
+    _assert_silent_full_decode(ffmpeg, published)

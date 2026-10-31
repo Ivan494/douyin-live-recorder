@@ -15,7 +15,7 @@ from pathlib import Path
 from streamget.platforms.douyin.live_stream import DouyinLiveStream
 
 from recording_segments import (
-    concat_list_line,
+    concat_manifest,
     expand_recording_parts,
     ffmpeg_concat_copy_command,
     ffmpeg_live_capture_output_args,
@@ -175,7 +175,7 @@ def _remux_capture(ffmpeg_path, capture_file, output_file, logger, stderr_file):
     parts = expand_recording_parts([capture_file], work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     concat_path = work_dir / "parts.txt"
-    concat_path.write_text("".join(concat_list_line(path) + "\n" for path in parts), encoding="utf-8")
+    concat_path.write_text(concat_manifest(parts), encoding="utf-8")
     temporary = output_file.with_name(output_file.stem + ".finalizing.mkv")
     command = ffmpeg_concat_copy_command(ffmpeg_path, concat_path, temporary)
     stderr_file.write(f"\n=== remux {capture_file.name} -> {output_file.name} ===\n")

@@ -34,9 +34,9 @@ def ffmpeg_live_capture_output_args(output_path):
     """
     return [
         "-map",
-        "0:v?",
+        "0:v:0?",
         "-map",
-        "0:a?",
+        "0:a:0?",
         "-c",
         "copy",
         "-avoid_negative_ts",
@@ -65,9 +65,9 @@ def ffmpeg_concat_copy_command(ffmpeg_executable, concat_path, output_path):
         "-i",
         str(concat_path),
         "-map",
-        "0:v?",
+        "0:v:0?",
         "-map",
-        "0:a?",
+        "0:a:0?",
         "-c",
         "copy",
         "-fflags",
@@ -81,6 +81,74 @@ def ffmpeg_concat_copy_command(ffmpeg_executable, concat_path, output_path):
 def concat_list_line(path):
     normalized = Path(path).resolve().as_posix().replace("'", "'\\''")
     return "file '" + normalized + "'"
+
+
+def concat_manifest(parts):
+    """ffconcat script for the finished recording.
+
+    FFmpeg estimates an FLV's duration as its last timestamp and starts the
+    next piece there. That lands on the previous piece's last audio packet
+    (one AAC frame, about 23 ms, and a non-monotonic DTS). Each FLV that is
+    followed by another piece gets an explicit duration: the end of its last
+    media packet, using the stream's usual frame spacing rather than a
+    one-off gap at the boundary.
+    """
+    paths = [Path(part) for part in parts]
+    lines = ["ffconcat version 1.0"]
+    last_index = len(paths) - 1
+    for index, path in enumerate(paths):
+        lines.append(concat_list_line(path))
+        if index == last_index:
+            continue
+        span_ms = flv_playback_span_ms(path)
+        if span_ms is None:
+            continue
+        lines.append(f"duration {span_ms // 1000}.{span_ms % 1000:03d}")
+    return "\n".join(lines) + "\n"
+
+
+def flv_playback_span_ms(path):
+    """Milliseconds from the first media packet to the end of the last one.
+
+    Returns None when ``path`` is not an FLV or has no media packets.
+    """
+    try:
+        handle = Path(path).open("rb")
+    except OSError:
+        return None
+    audio = []
+    video = []
+    with handle:
+        if _read_flv_header(handle) is None:
+            return None
+        for tag_type, timestamp, body in _iter_tags(handle):
+            if tag_type == 8 and not _is_audio_sequence_header(body):
+                audio.append(timestamp)
+            elif tag_type == 9 and _video_sequence_header(body) is None and not _is_sequence_end(body):
+                video.append(timestamp)
+    ends = []
+    starts = []
+    for timestamps in (audio, video):
+        if not timestamps:
+            continue
+        starts.append(min(timestamps))
+        ends.append(max(timestamps) + _frame_delta_ms(timestamps))
+    if not ends:
+        return None
+    span = max(ends) - min(starts)
+    return span if span > 0 else 1
+
+
+def _frame_delta_ms(timestamps):
+    """Most common positive step, in milliseconds. Ties prefer the shorter step."""
+    counts = {}
+    for earlier, later in zip(timestamps, timestamps[1:]):
+        step = later - earlier
+        if step > 0:
+            counts[step] = counts.get(step, 0) + 1
+    if not counts:
+        return 1
+    return max(counts, key=lambda step: (counts[step], -step))
 
 
 def expand_recording_parts(parts, work_dir):

@@ -46,6 +46,7 @@ from douyin_media_downloader import (
 )
 from recording_segments import (
     concat_list_line,
+    concat_manifest,
     expand_recording_parts,
     ffmpeg_concat_copy_command,
     ffmpeg_live_capture_output_args,
@@ -1966,7 +1967,7 @@ class MonitorEngine:
             if not parts:
                 raise RuntimeError("no usable recording parts after splitting sequence headers")
             with open(concat_path, "w", encoding="utf-8") as fh:
-                fh.write("\n".join(self._concat_file_line(path) for path in parts) + "\n")
+                fh.write(concat_manifest(parts))
             recording["status"] = "finalizing"
             recording["stop_reason"] = reason
             self._save_recording_manifest(recording)
