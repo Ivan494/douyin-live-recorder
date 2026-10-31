@@ -27,7 +27,7 @@ Cookie），因此不会把你已经打开的抖音网页挤下线。
 
 ## 功能
 
-- 直播流复制为 FLV 分段再封装成 MKV，自动重连、卡顿检测；PK / 连麦中途更换 H.264 序列头时整段仍可解码
+- 直播流复制为 FLV 分段再封装成 MKV，自动重连、卡顿检测；PK / 连麦中途更换 H.264 / HEVC 序列头时保留画面和音视频时间线
 - 每个资料可单独关闭直播录制，只自动下载作品和日常
 - 多账号并行，每个资料有独立的轮询间隔、清晰度和保存目录
 - 作品和日常走移动端接口（X-Gorgon 签名）
@@ -165,7 +165,7 @@ The interface defaults to Simplified Chinese; switch to English in Settings.
 
 ## Features
 
-- Live recording copied to FLV parts and published as MKV, with auto-reconnect, stall detection, and full playback when an H.264 sequence header changes mid-live (PK / co-stream)
+- Live recording copied to FLV parts and published as MKV, with auto-reconnect, stall detection, and preserved video and audio timing when H.264 / HEVC sequence headers change mid-live (PK / co-stream)
 - Optional per-profile live recording so works/stories can download without monitoring live streams
 - Multiple profiles, each with its own interval, quality, and output folder
 - Posted works and stories via the mobile API (X-Gorgon signed)

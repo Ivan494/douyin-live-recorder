@@ -44,13 +44,28 @@ the chosen checkpoint with `git restore --source <checkpoint> -- .`, inspect
 the diff, and commit the rollback. Ignored personal data remains in place.
 Restart the app. This is a source rollback, not a dependency rollback.
 
-## H.264 sequence headers (PK / co-stream)
+## H.264 / HEVC sequence headers (PK / co-stream)
 
 New captures are stream-copied to FLV (`part-NNNN.flv` under
 `.recording_sessions`, or `*.capture.flv` for the headless watcher) so FFmpeg
 stores a new AVC/HEVC sequence header instead of dropping it. Finalization
 splits a part where that header changes and concatenates the pieces into the
 same finished `.mkv` as before. Non-PK lives still publish one `.mkv`.
+H.264 uses FFmpeg concat's per-input bitstream filter. HEVC configuration
+NALs are also copied into the first coded packet of each piece; splitting
+alone does not preserve HEVC parameter changes. This remains a stream copy.
+
+Pieces within one capture keep their original timestamps. Concat offsets
+come from actual presentation starts, including B-frame composition offsets;
+only separate reconnect captures use an estimated final packet duration.
+Unsupported codec/HEVC length-size changes fail finalization and retain the
+raw capture. A partial trailing FLV tag is ignored; complete packets survive.
+
+Release tests generate H.264 and HEVC transitions and compare every decoded
+frame's size and pixel checksum, plus presentation/audio timestamps. The
+packaged EXE offline self-test runs the actual finalizer for both codecs.
+The media tests honor `DOUYIN_TEST_TOOLS_DIR` so the release's pinned tools
+are actually exercised rather than silently skipped.
 
 Finished recordings already on disk are left untouched. Do not delete or
 remux user archives as part of this update. If a watcher pull is killed

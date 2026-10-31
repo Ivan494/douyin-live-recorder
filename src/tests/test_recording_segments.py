@@ -2,6 +2,7 @@
 
 import collections
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -14,8 +15,7 @@ import pytest
 
 from recording_segments import (
     _write_tag,
-    concat_manifest,
-    expand_recording_parts,
+    prepare_recording_parts,
     ffmpeg_concat_copy_command,
     ffmpeg_live_capture_output_args,
     flv_playback_span_ms,
@@ -96,7 +96,7 @@ def test_sequence_header_change_splits_and_keeps_audio_config(tmp_path):
     legacy = tmp_path / "already.mkv"
     legacy.write_bytes(b"mkv")
 
-    pieces = expand_recording_parts([source, legacy], tmp_path / "work")
+    pieces, _manifest = prepare_recording_parts([source, legacy], tmp_path / "work")
 
     assert len(pieces) == 3
     assert pieces[0] != source
@@ -136,7 +136,12 @@ def test_single_track_maps_live_in_the_capture_helper():
 def test_enhanced_flv_sequence_start_also_splits(tmp_path):
     def enhanced(payload):
         # Keyframe + extended header + packet type 0 (sequence start) + fourcc.
-        return bytes((0x90,)) + b"hvc1" + payload
+        config = bytearray(23)
+        config[0], config[21], config[22] = 1, 3, 3
+        for kind in (32, 33, 34):
+            nal = bytes((kind << 1, 1)) + payload
+            config.extend(bytes((kind, 0, 1)) + len(nal).to_bytes(2, "big") + nal)
+        return bytes((0x90,)) + b"hvc1" + config
 
     source = tmp_path / "hevc.flv"
     first = enhanced(b"vps-a")
@@ -157,6 +162,11 @@ def test_enhanced_flv_sequence_start_also_splits(tmp_path):
 
 
 def _tool(name):
+    configured = os.environ.get("DOUYIN_TEST_TOOLS_DIR")
+    if configured:
+        path = Path(configured) / (name + (".exe" if os.name == "nt" else ""))
+        assert path.is_file(), f"Configured media test tool is missing: {path}"
+        return str(path)
     bundled = Path(__file__).resolve().parents[1] / "tools" / f"{name}.exe"
     if bundled.is_file():
         return str(bundled)
@@ -286,10 +296,10 @@ def _splice_flv(first, second, output):
 
 
 def _publish_mkv(ffmpeg, parts, output, work_dir):
-    stable = expand_recording_parts(parts, work_dir)
+    stable, manifest = prepare_recording_parts(parts, work_dir)
     concat_path = Path(work_dir) / "parts.txt"
     concat_path.parent.mkdir(parents=True, exist_ok=True)
-    concat_path.write_text(concat_manifest(stable), encoding="utf-8")
+    concat_path.write_text(manifest, encoding="utf-8")
     command = ffmpeg_concat_copy_command(ffmpeg, concat_path, output)
     result = subprocess.run(
         command,
@@ -593,3 +603,164 @@ def test_stable_flv_capture_still_publishes_every_frame(tmp_path):
     assert not after_errors
     assert after["160x120"] == before["160x120"]
     _assert_silent_full_decode(ffmpeg, published)
+
+
+def _frame_fingerprints(ffmpeg, path):
+    result = subprocess.run(
+        [ffmpeg, '-hide_banner', '-v', 'info', '-i', str(path),
+         '-map', '0:v:0', '-vf', 'showinfo', '-f', 'null', '-'],
+        capture_output=True, text=True, timeout=60, check=True,
+    )
+    return re.findall(r'Parsed_showinfo.*?s:(\d+x\d+).*?checksum:([0-9A-F]+)', result.stderr)
+
+
+def _packet_pts(ffprobe, path, stream):
+    import json
+    result = subprocess.run(
+        [ffprobe, '-v', 'error', '-select_streams', stream, '-show_packets',
+         '-show_entries', 'packet=pts_time', '-of', 'json', str(path)],
+        capture_output=True, text=True, timeout=60, check=True,
+    )
+    return [p['pts_time'] for p in json.loads(result.stdout)['packets']]
+
+
+@pytest.mark.parametrize('codec', ['libx264', 'libx265'])
+@pytest.mark.parametrize('bframes', [0, 2])
+def test_parameter_changes_preserve_pixels_and_timeline(tmp_path, codec, bframes):
+    from recording_segments import _read_flv_header, _iter_tags, _video_sequence_header
+    ffmpeg, ffprobe = _tool('ffmpeg'), _tool('ffprobe')
+    if not ffmpeg or not ffprobe:
+        pytest.skip('ffmpeg and ffprobe are required')
+    originals = []
+    for index, size in enumerate(('320x240', '640x360')):
+        path = tmp_path / f'original-{index}.flv'
+        subprocess.run(
+            [ffmpeg, '-v', 'error', '-y', '-f', 'lavfi', '-i', f'testsrc2=size={size}:rate=25',
+             '-f', 'lavfi', '-i', 'sine=sample_rate=48000', '-t', '1',
+             '-c:v', codec, '-preset', 'ultrafast', '-g', '25', '-bf', str(bframes),
+             *(['-x265-params', 'log-level=error'] if codec == 'libx265' else []),
+             '-c:a', 'aac', '-f', 'flv', str(path)],
+            capture_output=True, check=True, timeout=60,
+        )
+        originals.append(path)
+    spliced = tmp_path / 'spliced.flv'
+    _splice_flv(*originals, spliced)
+    # Real timestamp gaps must survive splitting, including with reordered video.
+    with spliced.open('rb') as handle:
+        header = _read_flv_header(handle)
+        tags = list(_iter_tags(handle))
+    previous, changed = None, False
+    with spliced.open('wb') as handle:
+        handle.write(header + b'\0' * 4)
+        for kind, timestamp, body in tags:
+            seq = _video_sequence_header(body) if kind == 9 else None
+            if seq is not None:
+                changed |= previous is not None and seq != previous
+                previous = seq
+            _write_tag(handle, kind, timestamp + (47 if changed else 0), body)
+    capture = tmp_path / 'capture.flv'
+    subprocess.run(
+        [ffmpeg, '-v', 'error', '-y', '-i', str(spliced), *ffmpeg_live_capture_output_args(capture)],
+        capture_output=True, check=True, timeout=60,
+    )
+    published = tmp_path / 'published.mkv'
+    _publish_mkv(ffmpeg, [capture], published, tmp_path / 'work')
+    expected = [frame for path in originals for frame in _frame_fingerprints(ffmpeg, path)]
+    assert len(expected) == 50
+    assert _frame_fingerprints(ffmpeg, capture) == expected
+    assert _frame_fingerprints(ffmpeg, published) == expected
+    for stream in ('v', 'a'):
+        assert _packet_pts(ffprobe, published, stream) == _packet_pts(ffprobe, capture, stream)
+    assert _packet_dts(ffprobe, published, 'a') == _packet_dts(ffprobe, capture, 'a')
+    _assert_silent_full_decode(ffmpeg, published)
+
+
+@pytest.mark.parametrize('failure', ['malformed_hevc', 'remux_failure'])
+def test_failed_finalization_preserves_original_capture(tmp_path, monkeypatch, failure):
+    import douyin_recorder_app as app
+    ffmpeg = _tool('ffmpeg')
+    if not ffmpeg:
+        pytest.skip('ffmpeg is required')
+    session = tmp_path / 'session'
+    session.mkdir()
+    capture = session / 'part.flv'
+    if failure == 'malformed_hevc':
+        capture.write_bytes(_flv([(9, 0, b'\x90hvc1bad-configuration')]))
+    else:
+        _generate_flv(ffmpeg, capture, '160x120', 'baseline')
+        monkeypatch.setattr(app.subprocess, 'run', lambda *_a, **_kw: SimpleNamespace(returncode=1))
+    original = capture.read_bytes()
+    output = tmp_path / 'out.mkv'
+    engine = app.MonitorEngine(SimpleNamespace(settings={'ffmpeg_path': ffmpeg}), app.queue.Queue())
+    monkeypatch.setattr(app, 'resolve_ffmpeg_executable', lambda _path: ffmpeg)
+    recording = {'profile_id': 'failure', 'session_dir': str(session), 'parts': [str(capture)],
+                 'final_output': str(output), 'manifest_path': str(session / 'session.json')}
+    engine._finalize_recording_worker(recording, 'failure fixture')
+    assert recording['status'] == 'failed'
+    assert capture.read_bytes() == original
+    assert not output.exists()
+
+
+def test_header_only_tail_does_not_discard_finished_media(tmp_path):
+    ffmpeg = _tool('ffmpeg')
+    if not ffmpeg:
+        pytest.skip('ffmpeg is required')
+    source = tmp_path / 'capture.flv'
+    _generate_flv(ffmpeg, source, '160x120', 'baseline')
+    expected = _frame_fingerprints(ffmpeg, source)
+    with source.open('ab') as handle:
+        _write_tag(handle, 9, 1500, _video_seq(b'new-but-no-media'))
+        handle.write(b'\x09\0')  # Interrupted FLV tag at EOF.
+    output = tmp_path / 'out.mkv'
+    _publish_mkv(ffmpeg, [source], output, tmp_path / 'work')
+    assert _frame_fingerprints(ffmpeg, output) == expected
+    _assert_silent_full_decode(ffmpeg, output)
+
+
+def test_watcher_remux_preserves_frames_and_removes_only_work_files(tmp_path):
+    import douyin_live_watcher as watcher
+    ffmpeg = _tool('ffmpeg')
+    if not ffmpeg:
+        pytest.skip('ffmpeg is required')
+    inputs = [tmp_path / 'a.flv', tmp_path / 'b.flv']
+    for path, size in zip(inputs, ('160x120', '320x240')):
+        _generate_flv(ffmpeg, path, size, 'baseline')
+    expected = [frame for path in inputs for frame in _frame_fingerprints(ffmpeg, path)]
+    capture = tmp_path / 'fixture.capture.flv'
+    _splice_flv(*inputs, capture)
+    output = tmp_path / 'fixture.mkv'
+    with (tmp_path / 'remux.log').open('w', encoding='utf-8') as log:
+        watcher._remux_capture(ffmpeg, capture, output, logging.getLogger('fixture'), log)
+    assert _frame_fingerprints(ffmpeg, output) == expected
+    _assert_silent_full_decode(ffmpeg, output)
+    assert not capture.exists()
+    assert not (tmp_path / 'fixture.capture.segments').exists()
+    assert all(path.exists() for path in inputs)
+
+
+def test_real_multi_track_input_publishes_one_video_and_audio(tmp_path):
+    import json
+    ffmpeg, ffprobe = _tool('ffmpeg'), _tool('ffprobe')
+    if not ffmpeg or not ffprobe:
+        pytest.skip('ffmpeg and ffprobe are required')
+    source = tmp_path / 'multiple.mkv'
+    subprocess.run(
+        [ffmpeg, '-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=160x120:rate=10',
+         '-f', 'lavfi', '-i', 'sine=sample_rate=48000', '-t', '0.5',
+         '-map', '0:v', '-map', '1:a', '-map', '0:v', '-map', '1:a',
+         '-c:v', 'libx264', '-bf', '0', '-c:a', 'aac', str(source)],
+        capture_output=True, check=True, timeout=60,
+    )
+    capture = tmp_path / 'capture.flv'
+    subprocess.run([ffmpeg, '-v', 'error', '-y', '-i', str(source),
+                    *ffmpeg_live_capture_output_args(capture)],
+                   capture_output=True, check=True, timeout=60)
+    for name, inputs in [('new', [capture]), ('legacy', [source])]:
+        output = tmp_path / f'{name}.mkv'
+        _publish_mkv(ffmpeg, inputs, output, tmp_path / name)
+        result = subprocess.run([ffprobe, '-v', 'error', '-show_entries', 'stream=codec_type',
+                                 '-of', 'json', str(output)],
+                                capture_output=True, text=True, check=True, timeout=30)
+        assert sorted(s['codec_type'] for s in json.loads(result.stdout)['streams']) == ['audio', 'video']
+        assert len(_frame_fingerprints(ffmpeg, output)) == 5
+        _assert_silent_full_decode(ffmpeg, output)

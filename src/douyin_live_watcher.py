@@ -15,8 +15,7 @@ from pathlib import Path
 from streamget.platforms.douyin.live_stream import DouyinLiveStream
 
 from recording_segments import (
-    concat_manifest,
-    expand_recording_parts,
+    prepare_recording_parts,
     ffmpeg_concat_copy_command,
     ffmpeg_live_capture_output_args,
 )
@@ -172,10 +171,10 @@ def _hidden_process_kwargs():
 def _remux_capture(ffmpeg_path, capture_file, output_file, logger, stderr_file):
     """Publish a finished MKV from an FLV capture, splitting on sequence headers."""
     work_dir = capture_file.with_name(capture_file.stem + ".segments")
-    parts = expand_recording_parts([capture_file], work_dir)
+    _parts, manifest = prepare_recording_parts([capture_file], work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     concat_path = work_dir / "parts.txt"
-    concat_path.write_text(concat_manifest(parts), encoding="utf-8")
+    concat_path.write_text(manifest, encoding="utf-8")
     temporary = output_file.with_name(output_file.stem + ".finalizing.mkv")
     command = ffmpeg_concat_copy_command(ffmpeg_path, concat_path, temporary)
     stderr_file.write(f"\n=== remux {capture_file.name} -> {output_file.name} ===\n")

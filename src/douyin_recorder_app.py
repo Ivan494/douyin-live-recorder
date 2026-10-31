@@ -46,8 +46,7 @@ from douyin_media_downloader import (
 )
 from recording_segments import (
     concat_list_line,
-    concat_manifest,
-    expand_recording_parts,
+    prepare_recording_parts,
     ffmpeg_concat_copy_command,
     ffmpeg_live_capture_output_args,
 )
@@ -1953,10 +1952,7 @@ class MonitorEngine:
         finalize_log = session_dir / "finalize.log"
         try:
             source_count = len(parts)
-            parts = [
-                path for path in expand_recording_parts(parts, session_dir / "parameter_sets")
-                if path.exists() and path.stat().st_size
-            ]
+            parts, manifest = prepare_recording_parts(parts, session_dir / "parameter_sets")
             if len(parts) != source_count:
                 logging.info(
                     "Expanded %s capture file(s) into %s parameter-stable segment(s) for %s.",
@@ -1967,7 +1963,7 @@ class MonitorEngine:
             if not parts:
                 raise RuntimeError("no usable recording parts after splitting sequence headers")
             with open(concat_path, "w", encoding="utf-8") as fh:
-                fh.write(concat_manifest(parts))
+                fh.write(manifest)
             recording["status"] = "finalizing"
             recording["stop_reason"] = reason
             self._save_recording_manifest(recording)
