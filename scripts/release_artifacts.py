@@ -107,11 +107,11 @@ def smoke_zip(path):
         report = directory / "自检 report.json"
         process = subprocess.run([str(directory / "DouyinLiveRecorder.exe"), "--self-test-report", str(report)],
                                  cwd=directory, timeout=100, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        if process.returncode != 0 or not report.is_file():
-            raise RuntimeError("Extracted EXE failed its offline self-test")
+        if not report.is_file():
+            raise RuntimeError(f"Extracted EXE produced no self-test report (exit {process.returncode})")
         result = json.loads(report.read_text(encoding="utf-8"))
-        if not result.get("ok"):
-            raise RuntimeError(f"EXE self-test failed: {result}")
+        if process.returncode != 0 or not result.get("ok"):
+            raise RuntimeError("EXE self-test failed: " + json.dumps(result, ensure_ascii=True))
         print(json.dumps(result, ensure_ascii=False))
 
 
