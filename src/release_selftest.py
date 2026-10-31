@@ -25,7 +25,7 @@ def recording_self_test(app_dir):
 
     def run(*args):
         result = subprocess.run([str(ffmpeg), "-hide_banner", *map(str, args)],
-                                capture_output=True, text=True, timeout=30,
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if result.returncode:
             raise RuntimeError("Recording self-test FFmpeg failed: " + result.stderr[-2000:])

@@ -764,3 +764,23 @@ def test_real_multi_track_input_publishes_one_video_and_audio(tmp_path):
         assert sorted(s['codec_type'] for s in json.loads(result.stdout)['streams']) == ['audio', 'video']
         assert len(_frame_fingerprints(ffmpeg, output)) == 5
         _assert_silent_full_decode(ffmpeg, output)
+
+
+def test_packaged_media_check_with_windows_legacy_encoding(tmp_path, monkeypatch):
+    import douyin_recorder_app as app
+    from release_selftest import recording_self_test
+    ffmpeg, ffprobe = _tool('ffmpeg'), _tool('ffprobe')
+    if not ffmpeg or not ffprobe:
+        pytest.skip('ffmpeg and ffprobe are required')
+    tools = tmp_path / 'youtube-dl'
+    tools.mkdir()
+    for name, source in [('ffmpeg', ffmpeg), ('ffprobe', ffprobe)]:
+        shutil.copyfile(source, tools / (name + '.exe'))
+    original_roots = app._trusted_tool_roots
+    monkeypatch.setattr(app, '_trusted_tool_roots', lambda: (*original_roots(), tools))
+    # GitHub Windows uses cp1252. FFmpeg emits UTF-8, including the Chinese
+    # self-test path. Implicit text decoding used to crash the reader thread.
+    monkeypatch.setattr(subprocess, '_text_encoding', lambda: 'cp1252')
+    assert recording_self_test(tmp_path / 'douyindownload' / '_automation') == {
+        'libx264': 16, 'libx265': 16,
+    }
