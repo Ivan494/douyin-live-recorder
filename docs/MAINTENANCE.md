@@ -18,6 +18,9 @@ rollback history. Do not develop the two copies independently.
 
 5. Restart the installed recorder after its current recordings can safely stop.
    Copying code does not reload an already-running Python application.
+   Stop between lives before deploying the parameter-set capture change below;
+   a live still on the old Matroska parts is finalized the old way and is not
+   rewritten.
 6. Push the tested source branch and merge it when ready. Build/tag a public
    release separately; local deployment does not publish anything.
 
@@ -40,6 +43,25 @@ directory inspect `git tag --list 'checkpoint-*'`. Restore tracked source from
 the chosen checkpoint with `git restore --source <checkpoint> -- .`, inspect
 the diff, and commit the rollback. Ignored personal data remains in place.
 Restart the app. This is a source rollback, not a dependency rollback.
+
+## H.264 sequence headers (PK / co-stream)
+
+New captures are stream-copied to FLV (`part-NNNN.flv` under
+`.recording_sessions`, or `*.capture.flv` for the headless watcher) so FFmpeg
+stores a new AVC/HEVC sequence header instead of dropping it. Finalization
+splits a part where that header changes and concatenates the pieces into the
+same finished `.mkv` as before. Non-PK lives still publish one `.mkv`.
+
+Finished recordings already on disk are left untouched. Do not delete or
+remux user archives as part of this update. If a watcher pull is killed
+before remux, keep the `.capture.flv`: it is the playable copy. The Drive
+uploader should keep watching the finished `.mkv` in the output folder, not
+the session parts.
+
+Local patches that edit `_start_recording`, `_finalize_recording_worker`, or
+`douyin_live_watcher.run_ffmpeg` need a rebase onto this change.
+`scripts/deploy_personal.ps1` copies `recording_segments.py` with the other
+application modules.
 
 ## On-demand video/story browser
 
