@@ -341,6 +341,7 @@ def author_replay_response(path, extra, _host):
 def test_author_variants_complete_every_two_polls_within_baseline_request_budget(reload_state):
     state = {}
     media._story_scan_state(state, AUTHOR, "sessionid=test")["author_offsets"][media.STORY_FEED_PATH] = "300"
+    state["story_scan"]["history_mode_version"] = 1  # This fixture seeds the archive mode.
     complete_polls = 0
     with mobile_requests(author_replay_response) as calls:
         for poll in range(100):
