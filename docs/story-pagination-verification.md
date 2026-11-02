@@ -27,8 +27,9 @@ an empty unfinished response without a continuation. Adding the app's refresh
 parameters `source=9`, `pull_type=1`, and `level=1` returned a completed refresh
 response. This is account-dependent: issue #19 later showed that using those
 parameters for every account hides archived stories. Archive requests now keep
-the original parameters, with refresh as a separately scoped compatibility
-fallback only for the verified empty/unfinished/no-cursor response shape.
+the original parameters. Both archive and refresh views are now queried and
+merged, with separately scoped progress under one bounded history budget;
+either view can contain stories missing from the other.
 
 The Windows app normally starts with only a profile URL. Its web identity
 lookup intermittently returned empty responses, so the signed mobile

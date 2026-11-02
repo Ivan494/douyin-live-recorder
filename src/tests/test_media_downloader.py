@@ -404,7 +404,7 @@ class MediaDownloaderTest(unittest.TestCase):
         self.assertEqual([], items)
         self.assertIn(media.STORY_PROFILE_LIST_PATH, source)
         self.assertIn("empty pack", source)
-        self.assertEqual([media.STORY_PROFILE_LIST_PATH, media.STORY_FEED_PATH], seen)
+        self.assertEqual([media.STORY_PROFILE_LIST_PATH, media.STORY_FEED_PATH, media.STORY_FEED_PATH], seen)
 
     def test_profile_list_and_story_feed_results_are_merged(self):
         # 主页挂 3 条日常时：profile/list 回 TTL 内的那条，story/feed 回更早的
@@ -437,7 +437,7 @@ class MediaDownloaderTest(unittest.TestCase):
             )
 
         self.assertEqual(["active-story", "history-story"], [i["aweme_id"] for i in items])
-        self.assertEqual([media.STORY_PROFILE_LIST_PATH, media.STORY_FEED_PATH], seen)
+        self.assertEqual([media.STORY_PROFILE_LIST_PATH, media.STORY_FEED_PATH, media.STORY_FEED_PATH], seen)
 
     def test_story_feed_uses_to_uid_not_tray_params(self):
         # 历史日常只认作者维度（to_uid）；关注页托盘参数一条都拿不到，

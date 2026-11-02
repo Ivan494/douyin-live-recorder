@@ -124,7 +124,7 @@ def test_both_author_endpoints_must_finish_before_empty_is_authoritative():
     assert items == []
     assert "author endpoints complete" in source
     assert "empty pack" in source
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert result.complete
 
 
@@ -163,7 +163,7 @@ def test_unverified_history_timestamp_does_not_get_guessed_as_offset():
     assert "partial author results" in source
     assert "pagination cursor" in source
     assert len([call for call in calls if "to_uid" in call[1]
-                and call[0] == media.STORY_FEED_PATH]) == 1
+                and call[0] == media.STORY_FEED_PATH]) == 2
 
 
 def test_author_cursor_cycle_stops_without_declaring_empty():
