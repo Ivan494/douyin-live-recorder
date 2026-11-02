@@ -63,7 +63,8 @@ def test_refresh_cursor_cannot_be_reused_as_archive_cursor(legacy_state):
     def response(path, extra, _host):
         if path == media.STORY_PROFILE_LIST_PATH:
             return head()
-        assert not refresh(extra)
+        if refresh(extra):
+            return {'status_code': 0, 'data': [], 'has_more': False}
         if extra['offset'] == '0':
             return {'status_code': 0, 'data': [], 'has_more': True, 'next_offset': 20}
         assert extra['offset'] == '20', 'refresh cursor leaked into archive mode'
@@ -106,13 +107,14 @@ def test_partial_nonempty_archive_cannot_be_replaced_by_complete_refresh():
         if path == media.STORY_PROFILE_LIST_PATH:
             return head()
         if 'to_uid' in extra:
-            assert not refresh(extra), 'a nonempty archive response must retain its incomplete status'
+            if refresh(extra):
+                return {'status_code': 0, 'data': [story('refresh-only')], 'has_more': False}
             return {'status_code': 0, 'data': [archive('old')], 'has_more': True}
         return {'status_code': 0, 'data': [], 'has_more': False}
     with mobile_requests(response):
         result = fetch(scan_state={})
     assert not result.complete and result.scan_reason == 'pagination'
-    assert {x['aweme_id'] for x in result[0]} == {'active', 'old'}
+    assert {x['aweme_id'] for x in result[0]} == {'active', 'old', 'refresh-only'}
 
 
 @pytest.mark.parametrize('error', [media.LoginRequiredError, InterruptedError])
@@ -127,7 +129,7 @@ def test_archive_login_and_cancellation_propagate(error):
 
 def test_packaged_story_history_self_test():
     from release_selftest import story_history_self_test
-    assert story_history_self_test() == {'archive': 3, 'refresh': 1}
+    assert story_history_self_test() == {'archive': 4, 'refresh': 2}
 
 
 def test_incomplete_archive_evidence_cannot_disappear_after_restart():
@@ -138,7 +140,8 @@ def test_incomplete_archive_evidence_cannot_disappear_after_restart():
             return head()
         if 'to_uid' not in extra:
             return {'status_code': 0, 'data': [], 'has_more': False}
-        assert not refresh(extra), 'unfinished real archive must not become a completed refresh'
+        if refresh(extra):
+            return {'status_code': 0, 'data': [story('refresh-only')], 'has_more': False}
         return {'status_code': 0, 'data': [archive('old')] if first else [], 'has_more': True}
     with mobile_requests(response):
         assert not fetch(scan_state=state).complete
@@ -156,7 +159,8 @@ def test_saved_archive_cursor_survives_empty_unfinished_head():
     def response(path, extra, _host):
         if path == media.STORY_PROFILE_LIST_PATH:
             return head()
-        assert not refresh(extra)
+        if refresh(extra):
+            return {'status_code': 0, 'data': [], 'has_more': False}
         if extra['offset'] == '0':
             return {'status_code': 0, 'data': [], 'has_more': True}
         assert extra['offset'] == '300'

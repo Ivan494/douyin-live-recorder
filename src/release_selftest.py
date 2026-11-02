@@ -30,7 +30,7 @@ def story_history_self_test():
                 data = {"status_code": 0, "active_data": {"data": [active], "has_more": False},
                         "has_more": False, "next_offset": 0}
             elif extra.get("source") == "9":
-                data = {"status_code": 0, "data": [active], "has_more": False}
+                data = {"status_code": 0, "data": [active, story("refresh-only")], "has_more": False}
             elif mode == "archive":
                 data = {"status_code": 0, "data": archived, "has_more": False}
             else:
@@ -44,7 +44,7 @@ def story_history_self_test():
             stack.enter_context(patch.object(media, "_mobile_signed_request", side_effect=request))
             result = media.fetch_stories(object(), {"cookies": "sessionid=offline-fixture"},
                                          author, user_id=uid, scan_state={})
-        expected = {"active", "old-a", "old-b"} if mode == "archive" else {"active"}
+        expected = {"active", "old-a", "old-b", "refresh-only"} if mode == "archive" else {"active", "refresh-only"}
         if not result.complete or {x["aweme_id"] for x in result[0]} != expected:
             raise RuntimeError(f"Offline story {mode} mode failed")
         counts[mode] = len(expected)

@@ -35,24 +35,30 @@ a development-only commit absent from the repository. Migration coverage now
 uses explicit serialized checkpoint data and exercises fresh and resumed scans;
 it does not require Git history or an external deployment checkout.
 
-## Archive and refresh modes (issue #19)
+## Archive and refresh modes (issues #19 and regression audit)
 
-The original `story/feed` author-history request uses `to_uid`, `offset`,
-`count`, `story_ttl=0` and empty insert/delete IDs. Refresh parameters select
-a different view and can return only the current story while omitting archived
-ones. Query the original archive mode first. If its head is empty, unfinished,
-and has no usable offset or unresolved active bucket, try the refresh mode
-within the same 15-request history budget. A nonempty/failed/pending archive
-scan remains partial rather than being replaced by a completed refresh.
+The original author-history query and the `source=9/pull_type=1/level=1`
+refresh query are independent views. Either can contain target stories absent
+from the profile response or the other view. Query both and merge by item ID
+with author validation; a completed archive must not suppress refresh items.
 
-Both modes validate their current heads and merge by item ID with author
-checks. Archive state uses the original endpoint key; refresh state uses the
-`#refresh` key. Old path-only refresh checkpoints migrate to that key once,
-so an old cursor or completed head cannot short-circuit archive retrieval.
-A complete archive traversal supersedes optional refresh progress. Target and
-login changes still reset the entire scope.
+Both history views share a 15-request budget. A round-robin scheduler advances
+each pending view on every poll and revalidates completed heads. Separate
+`story/feed` and `story/feed#refresh` checkpoints keep cursors and completion
+independent. A verified empty/unfinished/no-cursor response is classified as an
+unavailable view, not proof of exhaustion: at least one history view must
+complete, and any failed or known unfinished view keeps the result partial.
+Missing or cyclic cursors preserve unresolved evidence across restarts.
 
-Parameter-sensitive tests cover one active plus two old archived stories,
-refresh-only accounts, JSON reloads, old checkpoint migration, cursor separation,
-partial nonempty archives, cancellation and login errors. The previous live
-40-story catalog regression remains in the suite.
+Pre-v1.2.13 path-only checkpoints could refer to either archives or refresh.
+Their ambiguous history progress is revalidated once. For v1.2.13 checkpoints,
+known archive progress is retained while potentially misclassified refresh
+progress is revalidated. Version-2 checkpoints retain both modes. Saved media
+IDs, profile catalog progress and post cursors are not part of this migration.
+
+Independent tests cover 24 response combinations from the released v1.2.9,
+v1.2.12 and v1.2.13 implementations, disjoint paginated cursor namespaces,
+JSON reloads, three checkpoint formats, missing/cyclic cursors and API failures.
+Long scans of both views need more polls than a single view under the same
+request cap. The 100-poll fixtures assert fixed completion bounds and per-poll
+budgets, including author/post joins, rather than skipping either view.
