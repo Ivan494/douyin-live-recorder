@@ -689,6 +689,19 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
             # Revalidate their archive completion before trusting it.
             continuation.pop("profile_archive_complete", None)
 
+    # Before #19, the path-only checkpoint belonged to the refresh query.
+    # The original archive query now owns the plain key; never feed it an old
+    # refresh cursor or completed head. Retain that state under its own mode.
+    refresh_scan_key = STORY_FEED_PATH + "#refresh"
+    if continuation is not None and continuation.get("history_mode_version") != 1:
+        old_offset = continuation["author_offsets"].pop(STORY_FEED_PATH, None)
+        if old_offset is not None:
+            continuation["author_offsets"][refresh_scan_key] = old_offset
+        old_scan = author_scans.pop(STORY_FEED_PATH, None)
+        if isinstance(old_scan, dict):
+            author_scans[refresh_scan_key] = old_scan
+        continuation["history_mode_version"] = 1
+
     # Author requests and the viewer's following tray have different scopes.
     # Merge the author endpoints; a failed/unfinished endpoint must leave the
     # tray fallback available, with strict author verification on tray items.
@@ -712,12 +725,8 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
             "to_uid": numeric_uid,
             "offset": "0",
             "count": "20",
-            # StoryOuterFeedReq refresh parameters from the official app.
-            # Omitting source/pull_type/level can return an empty, unfinished
-            # response with no continuation even for a fully visible profile.
-            "source": "9",
-            "pull_type": "1",
-            "level": "1",
+            # Keep the original author archive semantics. The refresh mode
+            # (source=9/pull_type=1/level=1) can omit old stories entirely.
             "story_ttl": "0",
             "insert_ids": "",
             "delete_ids": "",
@@ -900,9 +909,10 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
     # returned next_offset; timestamp-to-offset mappings are not assumed.
     for path, extra in profile_variants:
         try_hosts = hosts if path == STORY_PROFILE_LIST_PATH else (MOBILE_API_HOST,)
+        scan_key = path
         page_extra = dict(extra)
         seen_offsets = {page_extra["offset"]}
-        resume_offset = _story_cursor(continuation["author_offsets"].get(path)) if continuation is not None else ""
+        resume_offset = _story_cursor(continuation["author_offsets"].get(scan_key)) if continuation is not None else ""
         if resume_offset == "0":
             resume_offset = ""
         complete = False
@@ -950,6 +960,33 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                 data, page_extra = active_archive_page
                 active_blocked = True
                 active_retry = False
+            if (path == STORY_FEED_PATH and page_extra["offset"] == "0" and resume_offset
+                    and not _story_items_from_feed_payload(data)
+                    and _story_has_more(data.get("has_more"))
+                    and _story_cursor(data.get("next_offset")) in ("", "0")):
+                # A head with no new cursor must not erase a previously
+                # verified continuation for this exact request mode.
+                data = {**data, "next_offset": resume_offset}
+            if (path == STORY_FEED_PATH and scan_key == path
+                    and page_extra["offset"] == "0" and not resume_offset
+                    and not (continuation and continuation.get("archive_unresolved"))
+                    and not _story_items_from_feed_payload(data)
+                    and _story_has_more(data.get("has_more"))
+                    and _story_cursor(data.get("next_offset")) in ("", "0")
+                    and not (isinstance(data.get("active_data"), dict)
+                             and _story_has_more(data["active_data"].get("has_more")))):
+                # Verified compatibility shape: this account's archive mode
+                # returns an empty unfinished pack with no usable cursor. Only
+                # then try the refresh mode; it must not replace a valid archive
+                # response or mask a failed/partially traversed archive scan.
+                scan_key = refresh_scan_key
+                page_extra = {**extra, "source": "9", "pull_type": "1", "level": "1"}
+                resume_offset = (_story_cursor(continuation["author_offsets"].get(scan_key))
+                                 if continuation is not None else "")
+                if resume_offset == "0":
+                    resume_offset = ""
+                seen_offsets = {"0"}
+                continue
             append_items(_story_items_from_feed_payload(data))
             active_data = data.get("active_data")
             missing_active_page = (active_retry and page_extra["offset"] == "0"
@@ -968,7 +1005,7 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                     active_blocked = not catalog_complete
                     if continuation is not None:
                         # Catalog/head changes invalidate the saved offset too.
-                        resume_offset = _story_cursor(continuation["author_offsets"].get(path))
+                        resume_offset = _story_cursor(continuation["author_offsets"].get(scan_key))
             if missing_active_page and catalog_result is None:
                 author_error(f"{path}: missing active pagination result", "pagination")
                 active_blocked = True
@@ -1001,7 +1038,7 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                     pending_offset = _story_cursor(data.get("next_offset"))
                     if (continuation is not None and _story_has_more(data.get("has_more"))
                             and pending_offset and pending_offset not in seen_offsets):
-                        continuation["author_offsets"][path] = resume_offset or pending_offset
+                        continuation["author_offsets"][scan_key] = resume_offset or pending_offset
                     page_extra["active_data_size"] = str(min(size * 2, MAX_ACTIVE_STORY_WINDOW))
                     _cancel_wait(0.3)
                     continue
@@ -1010,7 +1047,7 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                 # A catalog may first appear during enlargement, so only
                 # discard old catalog progress after those retries settle.
                 if "profile_scan_key" in continuation:
-                    continuation["author_offsets"].pop(path, None)
+                    continuation["author_offsets"].pop(scan_key, None)
                     resume_offset = ""
                 for key in ("profile_scan_key", "active_story_ids", "profile_archive_complete"):
                     continuation.pop(key, None)
@@ -1020,14 +1057,14 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                 head_key = (continuation["profile_scan_key"]
                             if catalog_result is not None and continuation is not None
                             else author_head_key(data, active_data))
-                previous = author_scans.get(path)
+                previous = author_scans.get(scan_key)
                 if not isinstance(previous, dict) or previous.get("head_key") != head_key:
                     variant_scan = {"head_key": head_key}
                     # Refreshing a head must not starve a pending explicit
                     # archive offset. Carry its unresolved evidence as well.
                     if resume_offset and isinstance(previous, dict) and previous.get("active_unresolved"):
                         variant_scan["active_unresolved"] = True
-                    author_scans[path] = variant_scan
+                    author_scans[scan_key] = variant_scan
                 else:
                     variant_scan = previous
                 if not resume_offset:
@@ -1047,7 +1084,7 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
                     or variant_scan.get("complete") is True):
                 complete = not active_blocked and not variant_scan.get("active_unresolved")
                 if continuation is not None:
-                    continuation["author_offsets"].pop(path, None)
+                    continuation["author_offsets"].pop(scan_key, None)
                     if (path == STORY_PROFILE_LIST_PATH and "profile_scan_key" in continuation
                             and not variant_scan.get("active_unresolved")):
                         # Archive exhaustion cannot erase an unresolved active
@@ -1058,23 +1095,32 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
             if isinstance(next_offset, bool) or not isinstance(next_offset, (int, str)):
                 author_error(f"{path}: no verified pagination cursor", "pagination")
                 if continuation is not None:
-                    continuation["author_offsets"].pop(path, None)
+                    if path != STORY_FEED_PATH:
+                        continuation["author_offsets"].pop(scan_key, None)
+                    elif scan_key == path:
+                        continuation["archive_unresolved"] = True
                 break
             next_offset = _story_cursor(next_offset)
             if not next_offset:
                 author_error(f"{path}: invalid pagination cursor", "pagination")
                 if continuation is not None:
-                    continuation["author_offsets"].pop(path, None)
+                    if path != STORY_FEED_PATH:
+                        continuation["author_offsets"].pop(scan_key, None)
+                    elif scan_key == path:
+                        continuation["archive_unresolved"] = True
                 break
             if page_extra["offset"] == "0" and resume_offset:
                 next_offset = resume_offset
             if next_offset in seen_offsets:
                 author_error(f"{path}: repeated pagination cursor", "pagination")
                 if continuation is not None:
-                    continuation["author_offsets"].pop(path, None)
+                    if path != STORY_FEED_PATH:
+                        continuation["author_offsets"].pop(scan_key, None)
+                    elif scan_key == path:
+                        continuation["archive_unresolved"] = True
                 break
             if continuation is not None:
-                continuation["author_offsets"][path] = next_offset
+                continuation["author_offsets"][scan_key] = next_offset
             if pages_fetched >= 15:
                 author_error(f"{path}: page limit (15) reached", "page_limit")
                 break
@@ -1086,6 +1132,12 @@ def fetch_stories_via_mobile_story_feed(client, sec_user_id, user_id="", cookie_
         variant_scan["complete"] = bool(complete)
         if complete:
             completed_author_variants += 1
+            if path == STORY_FEED_PATH and scan_key == path and continuation is not None:
+                # A complete real archive traversal supersedes optional refresh
+                # progress, including checkpoints migrated from older releases.
+                continuation["author_offsets"].pop(refresh_scan_key, None)
+                author_scans.pop(refresh_scan_key, None)
+                continuation.pop("archive_unresolved", None)
 
     author_source = f"{MOBILE_API_HOST}{STORY_PROFILE_LIST_PATH} + {STORY_FEED_PATH}"
     author_complete = len(profile_variants) == 2 and completed_author_variants == 2

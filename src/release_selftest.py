@@ -9,6 +9,48 @@ import tempfile
 from types import SimpleNamespace
 
 
+def story_history_self_test():
+    """Run both story request modes against offline, parameter-sensitive packs."""
+    from contextlib import ExitStack
+    from unittest.mock import patch
+    import httpx
+    import douyin_media_downloader as media
+
+    author, uid = "offline-self-test", "1234567890"
+    def story(item_id):
+        return {"aweme_id": item_id, "is_24_story": 1, "story_ttl": 0,
+                "author": {"sec_uid": author, "uid": uid}}
+    active, archived = story("active"), [story("old-a"), story("old-b")]
+    counts = {}
+    for mode in ("archive", "refresh"):
+        def request(_client, method, path, extra, *_args, **_kwargs):
+            if method != "GET" or extra.get("to_uid") != uid or extra.get("insert_ids") or extra.get("delete_ids"):
+                raise RuntimeError("Unexpected request in offline story check")
+            if path == media.STORY_PROFILE_LIST_PATH:
+                data = {"status_code": 0, "active_data": {"data": [active], "has_more": False},
+                        "has_more": False, "next_offset": 0}
+            elif extra.get("source") == "9":
+                data = {"status_code": 0, "data": [active], "has_more": False}
+            elif mode == "archive":
+                data = {"status_code": 0, "data": archived, "has_more": False}
+            else:
+                data = {"status_code": 0, "data": [], "has_more": True}
+            return httpx.Response(200, json=data)
+        with ExitStack() as stack:
+            for name, value in (("_check_mobile_signer", True),
+                                ("_persistent_mobile_device", ("1", "2")),
+                                ("_mobile_device_profile", {})):
+                stack.enter_context(patch.object(media, name, return_value=value))
+            stack.enter_context(patch.object(media, "_mobile_signed_request", side_effect=request))
+            result = media.fetch_stories(object(), {"cookies": "sessionid=offline-fixture"},
+                                         author, user_id=uid, scan_state={})
+        expected = {"active", "old-a", "old-b"} if mode == "archive" else {"active"}
+        if not result.complete or {x["aweme_id"] for x in result[0]} != expected:
+            raise RuntimeError(f"Offline story {mode} mode failed")
+        counts[mode] = len(expected)
+    return counts
+
+
 def recording_self_test(app_dir):
     """Exercise the packaged finalizer with tiny synthetic PK captures.
 
@@ -121,6 +163,8 @@ def run_self_test(report_path, app_dir):
             result["checks"].append(name)
         result["recording_frames"] = recording_self_test(app_dir)
         result["checks"].append("recording-h264-hevc")
+        result["story_items"] = story_history_self_test()
+        result["checks"].append("story-archive-refresh")
         result["ok"] = True
     except Exception as exc:
         result["error"] = type(exc).__name__ + ": " + str(exc)

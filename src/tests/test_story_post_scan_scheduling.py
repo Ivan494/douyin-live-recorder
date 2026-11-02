@@ -99,6 +99,9 @@ def test_empty_author_and_retained_post_scans_complete_within_four_polls(
 
 def pending_post_state():
     state = legacy_checkpoint()
+    # Join tests seed a current archive checkpoint; the legacy migration is
+    # covered separately by the parent-seed replay and history-mode tests.
+    state["story_scan"]["history_mode_version"] = 1
     with retained_post_requests():
         for _ in range(2):
             assert not fetch_all(state).complete

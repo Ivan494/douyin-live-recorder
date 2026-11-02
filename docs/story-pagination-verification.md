@@ -22,10 +22,13 @@ Live verification recovered all 40 cataloged IDs in four extra requests:
 beyond the initial 20 downloaded successfully. The production listing then
 returned 40 unique stories with `complete=true` and an empty `scan_reason`.
 
-The outer author-feed request also needs the app's refresh parameters
-`source=9`, `pull_type=1`, and `level=1`. Without them, this account returned
-an empty unfinished response without a continuation. With them, it returned
-the target author's feed and an explicit completed response.
+For this particular account, the original outer author-feed request returned
+an empty unfinished response without a continuation. Adding the app's refresh
+parameters `source=9`, `pull_type=1`, and `level=1` returned a completed refresh
+response. This is account-dependent: issue #19 later showed that using those
+parameters for every account hides archived stories. Archive requests now keep
+the original parameters, with refresh as a separately scoped compatibility
+fallback only for the verified empty/unfinished/no-cursor response shape.
 
 The Windows app normally starts with only a profile URL. Its web identity
 lookup intermittently returned empty responses, so the signed mobile
