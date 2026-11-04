@@ -31,7 +31,7 @@ def test_manifest_keeps_attempt_counter():
     assert app.MonitorEngine._manifest_payload({"finalize_attempts": 2})["finalize_attempts"] == 2
 
 
-def test_disk_guard_reserves_preparation_normalization_and_output(tmp_path):
+def test_disk_guard_preserves_baseline_preparation_and_output_reservation(tmp_path):
     flv = tmp_path / 'part.flv'
     legacy = tmp_path / 'part.mkv'
     flv.write_bytes(b'x' * 100)
@@ -39,4 +39,4 @@ def test_disk_guard_reserves_preparation_normalization_and_output(tmp_path):
     engine = object.__new__(h.HeadlessMonitorEngine)
     engine.disk = SimpleNamespace(critical=1000)
     needed = engine._finalize_space_needed({'parts': [str(flv), str(legacy)]})
-    assert needed == int((2 * 150 + 100) * 1.2) + 1000
+    assert needed == 150 + 100 + 1000

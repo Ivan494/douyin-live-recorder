@@ -242,7 +242,8 @@ def test_transient_strict_timeout_escalates_in_same_call(session, monkeypatch):
 
 
 @pytest.mark.parametrize('crash', [False, True])
-def test_interrupted_batch_is_gated_and_restart_finishes_same_plan(session, monkeypatch, crash):
+@pytest.mark.parametrize('corruption', ['none', 'manifest', 'manifest-and-gate'])
+def test_interrupted_batch_is_gated_and_restart_finishes_same_plan(session, monkeypatch, crash, corruption):
     import importlib.util
     spec = importlib.util.spec_from_file_location('batch_uploader',
         Path(__file__).resolve().parents[1] / 'uploader' / 'drive_uploader.py')
@@ -270,6 +271,8 @@ def test_interrupted_batch_is_gated_and_restart_finishes_same_plan(session, monk
             saved = json.loads((session.root / 'session.json').read_text())
             assert saved['publication_plan']['state'] == 'pending'
             assert len(saved['publication_plan']['members']) == 2
+            gate = json.loads((session.final.parent / '.capture.publication.json').read_text())
+            assert gate['destinations'] == [member['destination'] for member in saved['publication_plan']['members']]
         return replace(source, destination)
     with monkeypatch.context() as patch:
         patch.setattr(Path, 'replace', interrupt)
@@ -284,21 +287,30 @@ def test_interrupted_batch_is_gated_and_restart_finishes_same_plan(session, monk
     assert stages[1].exists() and all(p.exists() for p in session.parts)
     saved = json.loads((session.root / 'session.json').read_text())
     assert saved['publication_plan']['state'] == 'pending'
+    if corruption != 'none':
+        (session.root / 'session.json').write_text('{torn')
+    if corruption == 'manifest-and-gate':
+        (session.final.parent / '.capture.publication.json').write_text('{torn')
+    unrelated = session.final.parent / 'normal.mkv'
+    unrelated.write_bytes(b'ordinary finished recording')
     # Actual uploader, with unrelated eligibility guards removed. The batch
     # prefix remains ineligible after the failed worker has stopped.
     monkeypatch.setattr(uploader, 'ROOT', session.root.parent.parent.parent)
     monkeypatch.setattr(uploader, 'MIN_AGE', -1)
     monkeypatch.setattr(uploader, 'open_files', lambda: set())
     monkeypatch.setattr(uploader, 'busy_profiles', lambda: set())
-    assert uploader.candidates() == []
+    assert {p for p, _, _ in uploader.candidates()} == {unrelated}
     assert not uploader.upload_one(first, first.relative_to(uploader.ROOT), first.stat().st_size, False)
-    # Reload the durable manifest as the orphan sweep does, not the old dict.
+    # Repair deliberately corrupted recovery state before resuming its plan.
+    if corruption != 'none':
+        session.engine._save_recording_manifest(saved)
     session.engine._finalize_recording_worker(saved, 'restart')
     assert saved['status'] == 'complete' and saved['publication_plan']['state'] == 'committed'
     assert saved['final_outputs'] == [str(first), str(second)]
     assert first.read_bytes() == b'verified media 0' and second.read_bytes() == b'verified media 1'
     assert not session.final.exists() and not session.root.exists()
-    assert {p for p, _, _ in uploader.candidates()} == {first, second}
+    assert {p for p, _, _ in uploader.candidates()} == {first, second, unrelated}
+    assert not (session.final.parent / '.capture.publication.json').exists()
 
 
 def test_deadline_during_preparation_fails_once_with_raw_intact(session, monkeypatch):
@@ -501,3 +513,150 @@ def test_desktop_without_plan_recovers_capture_in_same_session(session, monkeypa
     finally:
         for handle in session.engine.stderr_files.values():
             handle.close()
+
+
+@pytest.mark.parametrize('entry', ['worker', 'startup', 'deferred'])
+def test_headless_normal_flv_finalizes_at_baseline_disk_threshold(session, monkeypatch, entry):
+    import douyin_headless as headless
+    import recording_segments as segments
+    parts = [path.with_suffix('.flv') for path in session.parts]
+    for old, new in zip(session.parts, parts):
+        old.replace(new)
+    session.parts[:] = parts
+    session.recording.update(parts=[str(p) for p in parts], status='finalizing')
+    profile = {'id': 'fixture', 'output_dir': str(session.final.parent)}
+    session.engine.store.profiles = [profile]
+    size = sum(path.stat().st_size for path in parts)
+    free = [2 * size + 999 if entry == 'deferred' else 2 * size + 1000]
+    disk = SimpleNamespace(critical=1000, free=lambda _path: free[0])
+    engine = headless.HeadlessMonitorEngine(session.engine.store, app.RecorderEventQueue(), disk)
+    monkeypatch.setattr(app, 'HEADLESS', True)
+    monkeypatch.setattr(app, 'flv_playback_span_ms', lambda _path: 1000)
+    monkeypatch.setattr(app, 'prepare_recording_parts', lambda *_args: (
+        parts, 'ffconcat version 1.0\n' + '\n'.join(segments.concat_list_line(p) for p in parts)))
+    monkeypatch.setattr(engine, '_check_finalize_normalization_space', Mock(side_effect=AssertionError('normalization forbidden')))
+    engine._save_recording_manifest(session.recording)
+    assert engine._finalize_space_needed(session.recording) == 2 * size + 1000
+    if entry == 'worker':
+        engine._finalize_recording_worker(session.recording, 'ordinary stop')
+        assert session.recording['status'] == 'complete'
+    else:
+        engine.recover_pending_recording_sessions()
+        engine.retry_deferred_finalizers()
+        if entry == 'deferred':
+            assert not engine.finalizer_threads and len(engine.deferred_finalizers) == 1
+            free[0] += 1
+            engine.retry_deferred_finalizers()
+        for thread in engine.finalizer_threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+    remuxes = [args for args in session.calls if args[0] == 'fixture-ffmpeg']
+    probes = [args for args in session.calls if args[0] == 'fixture-ffprobe']
+    assert len(remuxes) == len(probes) == 1 and '-xerror' in remuxes[0]
+    assert session.final.read_bytes() == b'remuxed media'
+    assert not session.root.exists() and not any(p.exists() for p in parts)
+    assert not engine.deferred_finalizers
+    engine._check_finalize_normalization_space.assert_not_called()
+
+
+@pytest.mark.parametrize('enough_space', [False, True])
+def test_headless_checks_extra_copies_only_at_normalization_under_lock(session, monkeypatch, enough_space):
+    import douyin_headless as headless
+    size = sum(p.stat().st_size for p in session.parts)
+    normalization_needed = int(2 * size * 1.2) + 1000
+    free = [normalization_needed if enough_space else normalization_needed - 1]
+    disk = SimpleNamespace(critical=1000, free=lambda _path: free[0])
+    engine = headless.HeadlessMonitorEngine(session.engine.store, app.RecorderEventQueue(), disk)
+    assert free[0] >= engine._finalize_space_needed(session.recording)
+    checked = []
+    check = engine._check_finalize_normalization_space
+    def tracked(recording, inputs):
+        assert engine.finalize_lock.locked()
+        assert len([c for c in session.calls if c[0] == 'fixture-ffmpeg']) == 2
+        assert not session.temporary.exists()
+        assert not (session.root / 'finalize_remux').exists()
+        checked.append(True)
+        return check(recording, inputs)
+    monkeypatch.setattr(engine, '_check_finalize_normalization_space', tracked)
+    def run(command, **kwargs):
+        if command[0] == 'fixture-ffmpeg' and Path(command[command.index('-i') + 1]).name == 'parts.txt':
+            session.calls.append(command)
+            session.temporary.write_bytes(b'failed concat')
+            return subprocess.CompletedProcess(command, 234)
+        return session.run(command, **kwargs)
+    monkeypatch.setattr(app.subprocess, 'run', run)
+    engine._finalize_recording_worker(session.recording, 'extra space')
+    assert checked == [True]
+    if enough_space:
+        assert session.recording['status'] == 'complete'
+        assert session.final.exists() and not session.root.exists()
+        assert len([c for c in session.calls if c[0] == 'fixture-ffmpeg']) == 5
+    else:
+        assert_preserved(session)
+        assert session.recording['finalize_attempts'] == 1
+        assert 'Insufficient disk space for normalization' in session.recording['stop_reason']
+        assert all(p.read_bytes() == b'raw media' for p in session.parts)
+        assert len(session.calls) == 2
+        assert not session.temporary.exists() and not (session.root / 'finalize_remux').exists()
+        # A later retry may escalate after space recovers.
+        free[0] += 1
+        monkeypatch.setattr(engine, '_check_finalize_normalization_space', check)
+        engine._finalize_recording_worker(session.recording, 'disk recovered')
+        assert session.recording['status'] == 'complete' and not session.root.exists()
+
+
+@pytest.mark.parametrize('boundary', ['gate-rename', 'gate-fsync', 'commit', 'gate-removal'])
+def test_publication_gate_survives_interruption_at_durability_boundaries(session, monkeypatch, boundary):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('durability_uploader',
+        Path(__file__).resolve().parents[1] / 'uploader' / 'drive_uploader.py')
+    uploader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(uploader)
+    gate = session.final.parent / '.capture.publication.json'
+    replace, unlink = Path.replace, Path.unlink
+    save = session.engine._save_recording_manifest
+    sync = session.engine._sync_recording_directory
+    sync_calls = []
+    def interrupt_replace(source, destination):
+        if boundary == 'gate-rename' and Path(destination) == gate:
+            raise OSError('gate rename failed')
+        return replace(source, destination)
+    def interrupt_sync(path):
+        sync_calls.append(path)
+        if boundary == 'gate-fsync' and len(sync_calls) == 1:
+            raise OSError('gate directory fsync failed')
+        return sync(path)
+    def interrupt_save(recording):
+        if boundary == 'commit' and recording.get('status') == 'complete':
+            raise OSError('manifest commit failed')
+        return save(recording)
+    def interrupt_unlink(path, *args, **kwargs):
+        if boundary == 'gate-removal' and path == gate:
+            raise KeyboardInterrupt('exit after durable commit')
+        return unlink(path, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, 'replace', interrupt_replace)
+        patch.setattr(Path, 'unlink', interrupt_unlink)
+        patch.setattr(session.engine, '_save_recording_manifest', interrupt_save)
+        patch.setattr(session.engine, '_sync_recording_directory', interrupt_sync)
+        if boundary == 'gate-removal':
+            with pytest.raises(KeyboardInterrupt):
+                session.engine._finalize_recording_worker(session.recording, boundary)
+        else:
+            session.engine._finalize_recording_worker(session.recording, boundary)
+    assert all(p.read_bytes() == b'raw media' for p in session.parts)
+    saved = json.loads((session.root / 'session.json').read_text())
+    if boundary in {'gate-rename', 'gate-fsync'}:
+        assert not session.final.exists() and session.temporary.exists()
+    else:
+        assert session.final.exists() and gate.exists()
+    assert uploader.publication_pending(session.final) == (boundary != 'gate-removal')
+    if boundary == 'gate-removal':
+        assert saved['publication_plan']['state'] == 'committed'
+    else:
+        assert saved['publication_plan']['state'] == 'pending'
+        # Recover the exact saved plan, without invoking the media ladder again.
+        monkeypatch.setattr(app, 'finalize_prepared_recording', Mock(side_effect=AssertionError('ladder forbidden')))
+        session.engine._finalize_recording_worker(saved, 'retry durability boundary')
+        assert saved['status'] == 'complete' and not session.root.exists()
+        assert not gate.exists() and not uploader.publication_pending(session.final)

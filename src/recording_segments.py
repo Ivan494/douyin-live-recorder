@@ -186,7 +186,7 @@ def probe_recording(path, ffprobe_executable, expected=None, process_kwargs=None
 
 def finalize_prepared_recording(ffmpeg_executable, inputs, concat_path, temporary,
                                 work_dir, log, validate, duration_for, expected_duration,
-                                timeout=240, process_kwargs=None):
+                                timeout=240, process_kwargs=None, before_normalize=None):
     """Bounded stream-copy ladder; return verified staging files, never raw files.
 
     The caller checks raw-part stamps and atomically publishes the returned
@@ -198,7 +198,7 @@ def finalize_prepared_recording(ffmpeg_executable, inputs, concat_path, temporar
         with finalize_budget(timeout):
             return finalize_prepared_recording(
                 ffmpeg_executable, inputs, concat_path, temporary, work_dir, log,
-                validate, duration_for, expected_duration, timeout, process_kwargs)
+                validate, duration_for, expected_duration, timeout, process_kwargs, before_normalize)
     temporary, work_dir = Path(temporary), Path(work_dir)
     failures = []
 
@@ -243,6 +243,8 @@ def finalize_prepared_recording(ffmpeg_executable, inputs, concat_path, temporar
         if attempt(label, concat_path, temporary, expected_duration, inputs) is not None:
             return [temporary]
 
+    if before_normalize is not None:
+        before_normalize()
     work_dir.mkdir(parents=True, exist_ok=True)
     normalized, durations = [], []
     for index, source in enumerate(inputs, 1):

@@ -1985,12 +1985,34 @@ class MonitorEngine:
         with finalize_budget(self._finalize_timeout(parts), base):
             self._finalize_recording_with_budget(recording, reason)
 
+    def _check_finalize_normalization_space(self, recording, inputs):
+        """Headless overrides this to reserve extra copies under its lock."""
+
+    @staticmethod
+    def _sync_recording_directory(path):
+        if os.name != "nt":
+            descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
     def _resume_recording_publication(self, recording):
         """Roll forward exactly the verified batch saved before its first rename."""
         plan = recording["publication_plan"]
         parts = [Path(value) for value in recording.get("parts") or []]
         if [list(self._recording_part_stamp(path)) for path in parts] != plan["part_stamps"]:
             raise RuntimeError("MKV parts changed since publication plan; raw parts preserved")
+        final_output = Path(recording["final_output"])
+        gate = final_output.with_name(f".{final_output.stem}.publication.json")
+        temporary_gate = gate.with_suffix(".json.tmp")
+        with temporary_gate.open("w", encoding="utf-8") as handle:
+            json.dump({"destinations": [member["destination"] for member in plan["members"]],
+                       "manifest": str(Path(recording["manifest_path"]).resolve())}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_gate.replace(gate)
+        self._sync_recording_directory(gate.parent)
         outputs = []
         for member in plan["members"]:
             check_finalize_deadline()
@@ -2006,14 +2028,18 @@ class MonitorEngine:
         check_finalize_deadline()
         if [list(self._recording_part_stamp(path)) for path in parts] != plan["part_stamps"]:
             raise RuntimeError("MKV parts changed during publication; raw parts preserved")
+        self._sync_recording_directory(gate.parent)
         recording["final_outputs"] = [str(path) for path in outputs]
         recording["status"] = "complete"
         recording["publication_plan"] = dict(plan, state="committed")
         try:
             self._save_recording_manifest(recording)
+            self._sync_recording_directory(Path(recording["manifest_path"]).parent)
         except Exception:
             recording["publication_plan"] = plan
             raise
+        gate.unlink()
+        self._sync_recording_directory(gate.parent)
         return outputs
 
     def _finalize_recording_with_budget(self, recording, reason):
@@ -2083,6 +2109,7 @@ class MonitorEngine:
                     lambda: sum(duration_for(path) for path in usable_parts),
                     timeout=self._finalize_timeout(usable_parts),
                     process_kwargs=hidden_subprocess_kwargs(),
+                    before_normalize=lambda: self._check_finalize_normalization_space(recording, concat_inputs),
                 )
             if [self._recording_part_stamp(path) for path in parts] != stamps:
                 raise RuntimeError("MKV parts changed during finalization; raw parts preserved")
@@ -2100,8 +2127,8 @@ class MonitorEngine:
                              "stamp": list(self._recording_part_stamp(source)[:4])}
                             for source, destination in zip(staged, outputs)],
             }
-            # Durable gate: uploader reads this plan until the entire batch is
-            # committed. Staging files survive any later failure or process exit.
+            # Save the recovery plan; publication also persists an independent
+            # uploader gate before any rename. Keep stages until batch commit.
             self._save_recording_manifest(recording)
             outputs = self._resume_recording_publication(recording)
             # FIX-H5: Move rmtree outside the critical path. If cleanup fails

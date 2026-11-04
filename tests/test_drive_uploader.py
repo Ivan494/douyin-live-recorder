@@ -407,9 +407,35 @@ def test_publication_plan_gates_split_members_after_worker_exit(sandbox, drive, 
     manifest.write_text('{torn' if state == 'unreadable' else json.dumps({
         'publication_plan': {'state': state, 'members': [
             {'destination': str(first)}, {'destination': str(second)}]}}))
+    if state == 'unreadable':
+        (first.parent / '.capture.publication.json').write_text(json.dumps({
+            'destinations': [str(first), str(second)]}))
     found = {p for p, _, _ in uploader.candidates()}
-    assert found == ({first, second, unrelated} if state == 'committed' else
-                     {unrelated} if state == 'pending' else set())
+    assert found == ({first, second, unrelated} if state == 'committed' else {unrelated})
     if state != 'committed':
         assert upload(first, sandbox) is False
         assert not drive.calls and first.exists()
+
+
+@pytest.mark.parametrize('contents', ['{torn', '[]', '{"publication_plan": null}'])
+def test_unrelated_broken_or_no_plan_manifest_keeps_finished_upload_eligible(sandbox, drive, contents):
+    final = sandbox.make_file('acct/normal.mkv')
+    sandbox.make_file('acct/normal.finalizing.mkv')
+    manifest = final.parent / '.recording_sessions' / 'old' / 'session.json'
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(contents)
+    assert {p for p, _, _ in uploader.candidates()} == {final}
+    assert upload(final, sandbox) is True
+
+
+@pytest.mark.parametrize('contents', ['{torn', '[]', '{"destinations": null}', '{"destinations": []}'])
+def test_unreadable_publication_gate_blocks_only_its_batch(sandbox, drive, contents):
+    first = sandbox.make_file('acct/capture.part01.mkv')
+    second = sandbox.make_file('acct/capture.part02.mkv')
+    unrelated = sandbox.make_file('acct/other.mkv')
+    (first.parent / '.capture.publication.json').write_text(contents)
+    assert {p for p, _, _ in uploader.candidates()} == {unrelated}
+    assert upload(first, sandbox) is False
+    assert upload(second, sandbox) is False
+    assert not drive.calls
+    assert upload(unrelated, sandbox) is True

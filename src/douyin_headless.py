@@ -204,9 +204,7 @@ class HeadlessMonitorEngine(app.MonitorEngine):
             # Verified media is already on disk. Resume identity checks and
             # renames under finalize_lock, retaining room for manifest writes.
             return self.disk.critical
-        # Peak additional space: prepared FLVs + normalized MKVs + one concat
-        # (or the sequential outputs). Failed concat candidates are unlinked
-        # before escalating. Reserve 20% for container overhead as well.
+        # Preserve the baseline reservation for preparation and one concat.
         flv = 0
         for value in recording.get("parts") or []:
             try:
@@ -214,7 +212,15 @@ class HeadlessMonitorEngine(app.MonitorEngine):
                     flv += Path(value).stat().st_size
             except OSError:
                 continue
-        return int((2 * self._parts_size(recording) + flv) * 1.2) + self.disk.critical
+        return self._parts_size(recording) + flv + self.disk.critical
+
+    def _check_finalize_normalization_space(self, recording, inputs):
+        # Called under finalize_lock only after both initial concats failed.
+        # Preparation is already on disk and failed candidates are gone. The
+        # remaining peak is normalized inputs plus another concatenated copy.
+        needed = int(2 * sum(Path(path).stat().st_size for path in inputs) * 1.2) + self.disk.critical
+        if self.disk.free(recording["session_dir"]) < needed:
+            raise RuntimeError("Insufficient disk space for normalization; raw parts preserved")
 
     @classmethod
     def _should_retry_finalize(cls, manifest):

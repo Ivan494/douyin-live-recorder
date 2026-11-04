@@ -111,7 +111,31 @@ def is_busy_live(path, rel, busy):
 
 
 def publication_pending(path):
-    """A renamed batch prefix remains private until its session commits."""
+    """A batch's durable gate keeps its destinations private until commit."""
+    for gate in path.parent.glob(".*.publication.json"):
+        try:
+            payload = json.loads(gate.read_text(encoding="utf-8"))
+            destinations = payload["destinations"]
+            if (not isinstance(destinations, list) or not destinations
+                    or not all(isinstance(p, str) and p for p in destinations)):
+                raise ValueError("Invalid publication destinations")
+            if any(Path(destination) == path.resolve() for destination in destinations):
+                # A crash after durable commit can leave the gate behind.
+                # Only this batch's matching committed plan can release it.
+                try:
+                    plan = json.loads(Path(payload["manifest"]).read_text(encoding="utf-8-sig"))["publication_plan"]
+                    if (plan["state"] == "committed"
+                            and [member["destination"] for member in plan["members"]] == destinations):
+                        continue
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass
+                return True
+        except (OSError, ValueError, KeyError, TypeError):
+            # The filename identifies this batch even if its contents are torn.
+            stem = gate.name[1:-len(".publication.json")]
+            if path.name == stem + ".mkv" or path.name.startswith(stem + ".part"):
+                return True
+    # Compatibility with saved plans from before independent gates existed.
     for manifest in (path.parent / ".recording_sessions").glob("*/session.json"):
         try:
             payload = json.loads(manifest.read_text(encoding="utf-8-sig"))
@@ -120,8 +144,7 @@ def publication_pending(path):
                 if any(Path(member["destination"]) == path.resolve() for member in plan["members"]):
                     return True
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            # Unreadable state cannot establish safe batch completion.
-            return True
+            continue
     return False
 
 
