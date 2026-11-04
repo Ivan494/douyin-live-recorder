@@ -5,6 +5,7 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -75,6 +76,8 @@ def test_success_publishes_validated_output_then_cleans_raw_parts(session):
     command = session.calls[0]
     maps = [command[i + 1] for i, arg in enumerate(command) if arg == "-map"]
     assert maps == ["0:v:0?", "0:a:0?"]
+    assert "-xerror" in command
+    assert len([args for args in session.calls if args[0] == "fixture-ffmpeg"]) == 1
 
 
 def test_recorder_command_selects_first_video_and_audio(session, monkeypatch):
@@ -313,3 +316,188 @@ def test_deadline_during_preparation_fails_once_with_raw_intact(session, monkeyp
     assert all(p.read_bytes() == b'raw media' for p in session.parts)
     log = (session.root / 'finalize.log').read_text()
     assert log.count('FINALIZE_FAILED') == 1 and 'deadline exhausted' in log
+
+
+@pytest.fixture
+def pending_batch(session, monkeypatch):
+    """Actual caught publication failure, with the first member renamed."""
+    profile = {"id": "fixture", "name": "fixture", "url": "https://live.douyin.com/fixture",
+               "output_dir": str(session.final.parent)}
+    session.engine.store.profiles = [profile]
+    session.engine.store.settings.update(app.default_settings())
+
+    def split(_ffmpeg, _inputs, _manifest, _temp, remux, *_args, **_kwargs):
+        remux.mkdir()
+        outputs = [remux / f"part{i}.finalizing.mkv" for i in (1, 2)]
+        for output in outputs:
+            output.write_bytes(b"verified media")
+        return outputs
+
+    monkeypatch.setattr(app, "finalize_prepared_recording", split)
+    outputs = [session.final.with_name(f"capture.part{i:02d}.mkv") for i in (1, 2)]
+    replace = Path.replace
+
+    def interrupt(source, destination):
+        if Path(destination) == outputs[1]:
+            raise PermissionError("second destination locked")
+        return replace(source, destination)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "replace", interrupt)
+        session.engine._finalize_recording_worker(session.recording, "publication interrupted")
+    saved = json.loads((session.root / "session.json").read_text())
+    assert saved["status"] == "failed" and saved["publication_plan"]["state"] == "pending"
+    assert outputs[0].exists() and not outputs[1].exists()
+    monkeypatch.setattr(app, "finalize_prepared_recording", Mock(side_effect=AssertionError("ladder forbidden")))
+    session.profile, session.saved, session.outputs = profile, saved, outputs
+    return session
+
+
+def assert_batch_published(batch, monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("recovery_uploader",
+        Path(__file__).resolve().parents[1] / "uploader" / "drive_uploader.py")
+    uploader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(uploader)
+    monkeypatch.setattr(uploader, "ROOT", batch.final.parent.parent)
+    monkeypatch.setattr(uploader, "MIN_AGE", -1)
+    monkeypatch.setattr(uploader, "open_files", lambda: set())
+    monkeypatch.setattr(uploader, "busy_profiles", lambda: set())
+    assert all(p.read_bytes() == b"verified media" for p in batch.outputs)
+    assert not batch.root.exists() and not any(p.exists() for p in batch.parts)
+    assert not batch.final.exists()
+    assert {p for p, _, _ in uploader.candidates()} == set(batch.outputs)
+    app.finalize_prepared_recording.assert_not_called()
+
+
+@pytest.mark.parametrize("entry", ["startup", "deferred", "worker"])
+def test_headless_saved_batch_needs_only_critical_reserve(pending_batch, monkeypatch, entry):
+    import douyin_headless as headless
+    batch = pending_batch
+    # Free space is below a full media reservation, but above critical.
+    free = [999 if entry == "deferred" else 1001]
+    disk = SimpleNamespace(critical=1000, free=lambda _path: free[0])
+    engine = headless.HeadlessMonitorEngine(batch.engine.store, app.RecorderEventQueue(), disk)
+    monkeypatch.setattr(app, "HEADLESS", True)
+    assert engine._finalize_space_needed(dict(batch.saved, publication_plan=None)) > 1001
+    assert engine._finalize_space_needed(batch.saved) == 1000
+    completed = []
+    resume = engine._resume_recording_publication
+
+    def tracked(recording):
+        assert engine.finalize_lock.locked()
+        result = resume(recording)
+        persisted = json.loads((batch.root / "session.json").read_text())
+        assert persisted["publication_plan"]["state"] == "committed"
+        assert persisted["status"] == "complete"
+        completed.append(recording)
+        return result
+
+    monkeypatch.setattr(engine, "_resume_recording_publication", tracked)
+    if entry == "worker":
+        engine._finalize_recording_worker(batch.saved, "resume")
+    else:
+        engine.recover_pending_recording_sessions()
+        assert not engine.recordings
+        assert len(engine.deferred_finalizers) == 1
+        engine.retry_deferred_finalizers()
+        if entry == "deferred":
+            assert not engine.finalizer_threads and len(engine.deferred_finalizers) == 1
+            free[0] = 1001
+            engine.retry_deferred_finalizers()
+        for thread in engine.finalizer_threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        assert not engine.deferred_finalizers
+    assert len(completed) == 1
+    assert_batch_published(batch, monkeypatch)
+
+
+@pytest.mark.parametrize("status", ["finalizing", "failed"])
+def test_desktop_startup_publishes_saved_batch_and_next_live_uses_fresh_session(pending_batch, monkeypatch, status):
+    batch = pending_batch
+    batch.saved["status"] = status
+    batch.engine._save_recording_manifest(batch.saved)
+    engine = app.MonitorEngine(batch.engine.store, app.RecorderEventQueue())
+    monkeypatch.setattr(app, "HEADLESS", False)
+    entered, release = threading.Event(), threading.Event()
+    resume = engine._resume_recording_publication
+    completed = []
+
+    def blocked_resume(recording):
+        entered.set()
+        assert release.wait(timeout=5)
+        result = resume(recording)
+        completed.append(recording)
+        return result
+
+    monkeypatch.setattr(engine, "_resume_recording_publication", blocked_resume)
+    stream = SimpleNamespace(is_live=True, flv_url="https://example.test/live.flv",
+                             anchor_name="fixture", title="fixture")
+
+    async def resolve(_profile):
+        return {}, stream
+
+    monkeypatch.setattr(engine, "_resolve", resolve)
+
+    def capture(command, **_kwargs):
+        Path(command[-1]).write_bytes(b"new broadcast")
+        return Mock(pid=42)
+
+    monkeypatch.setattr(app.subprocess, "Popen", capture)
+    try:
+        engine.recover_pending_recording_sessions()
+        assert entered.wait(timeout=5)
+        assert not engine.recordings
+        # Repeated startup must not queue a concurrent copy of this batch.
+        engine.recover_pending_recording_sessions()
+        assert len(engine.finalizer_threads) == 1
+        engine._check_profile(batch.profile)
+        fresh = engine.recordings["fixture"]
+        assert fresh["session_dir"] != str(batch.root)
+        assert "publication_plan" not in fresh
+        assert len(fresh["parts"]) == 1
+        assert Path(fresh["parts"][0]).read_bytes() == b"new broadcast"
+        assert all(p.read_bytes() == b"raw media" for p in batch.parts)
+        assert json.loads((batch.root / "session.json").read_text())["parts"] == batch.saved["parts"]
+    finally:
+        release.set()
+        for thread in engine.finalizer_threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        for handle in engine.stderr_files.values():
+            handle.close()
+    assert len(completed) == 1
+    assert completed[0]["status"] == "complete"
+    assert completed[0]["publication_plan"]["state"] == "committed"
+    assert_batch_published(batch, monkeypatch)
+
+
+def test_desktop_without_plan_recovers_capture_in_same_session(session, monkeypatch):
+    profile = {"id": "fixture", "name": "fixture", "url": "https://live.douyin.com/fixture",
+               "output_dir": str(session.final.parent)}
+    session.engine.store.profiles = [profile]
+    session.engine.store.settings.update(app.default_settings())
+    session.recording.update(status="recording", part_index=2, stderr_path=str(session.final.parent / "capture.log"))
+    session.engine._save_recording_manifest(session.recording)
+    monkeypatch.setattr(app, "HEADLESS", False)
+    stream = SimpleNamespace(is_live=True, flv_url="https://example.test/live.flv",
+                             anchor_name="fixture", title="fixture")
+
+    async def resolve(_profile):
+        return {}, stream
+
+    monkeypatch.setattr(session.engine, "_resolve", resolve)
+    monkeypatch.setattr(app.subprocess, "Popen", Mock(return_value=Mock(pid=42)))
+    try:
+        session.engine.recover_pending_recording_sessions()
+        recovered = session.engine.recordings["fixture"]
+        assert recovered["status"] == "recovering" and not session.engine.finalizer_threads
+        session.engine._check_profile(profile)
+        assert recovered["session_dir"] == str(session.root)
+        assert recovered["parts"][:2] == session.recording["parts"]
+        assert recovered["parts"][2] == str(session.root / "part-0003.flv")
+        assert recovered["status"] == "recording" and not recovered.get("publication_plan")
+    finally:
+        for handle in session.engine.stderr_files.values():
+            handle.close()

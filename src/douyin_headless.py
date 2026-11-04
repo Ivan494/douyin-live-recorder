@@ -200,6 +200,10 @@ class HeadlessMonitorEngine(app.MonitorEngine):
     MAX_FINALIZE_ATTEMPTS = 3
 
     def _finalize_space_needed(self, recording):
+        if recording.get("publication_plan"):
+            # Verified media is already on disk. Resume identity checks and
+            # renames under finalize_lock, retaining room for manifest writes.
+            return self.disk.critical
         # Peak additional space: prepared FLVs + normalized MKVs + one concat
         # (or the sequential outputs). Failed concat candidates are unlinked
         # before escalating. Reserve 20% for container overhead as well.

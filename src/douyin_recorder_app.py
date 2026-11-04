@@ -1581,8 +1581,6 @@ class MonitorEngine:
         recovered = 0
         for profile in self.store.profiles:
             profile_id = profile["id"]
-            if profile_id in self.recordings:
-                continue
             sessions_root = Path(profile.get("output_dir") or "") / ".recording_sessions"
             if not sessions_root.exists():
                 continue
@@ -1596,9 +1594,33 @@ class MonitorEngine:
                 key=_safe_mtime,
                 reverse=True,
             )
+            if not HEADLESS:
+                # Saved batches are immutable, including after a caught rename
+                # failure. Publish independently of any current/new capture.
+                # Headless queues these through its disk-guarded sweep instead.
+                for manifest_path in manifests:
+                    manifest = self._read_recording_manifest(manifest_path)
+                    if (not manifest or manifest.get("profile_id") != profile_id
+                            or not manifest.get("publication_plan") or manifest.get("status") == "complete"):
+                        continue
+                    name = f"publication-finalizer-{manifest_path.parent}"
+                    if any(t.name == name and t.is_alive() for t in self.finalizer_threads):
+                        continue
+                    manifest["manifest_path"] = str(manifest_path)
+                    manifest["session_dir"] = str(manifest_path.parent)
+                    thread = threading.Thread(
+                        target=self._finalize_recording_worker,
+                        args=(manifest, "Resume saved publication"), name=name, daemon=False,
+                    )
+                    self.finalizer_threads.append(thread)
+                    thread.start()
+            if profile_id in self.recordings:
+                continue
             for manifest_path in manifests:
                 manifest = self._read_recording_manifest(manifest_path)
                 if not manifest or manifest.get("profile_id") != profile_id:
+                    continue
+                if manifest.get("publication_plan"):
                     continue
                 if manifest.get("status") in {"complete", "failed"} or (HEADLESS and manifest.get("status") in {"waiting_for_disk", "finalizing"}):
                     continue
