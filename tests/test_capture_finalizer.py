@@ -1,7 +1,9 @@
 """Fault injection around finalizer publication and raw-part cleanup, offline."""
+import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
@@ -14,6 +16,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 os.environ.setdefault("DOUYIN_HEADLESS", "1")
 import douyin_recorder_app as app
+
+
+def publication_gate(final):
+    key = hashlib.sha256(final.stem.encode('utf-8')).hexdigest()
+    return final.with_name(f'.publication-{key}.publication.json')
 
 
 @pytest.fixture(autouse=True)
@@ -271,7 +278,7 @@ def test_interrupted_batch_is_gated_and_restart_finishes_same_plan(session, monk
             saved = json.loads((session.root / 'session.json').read_text())
             assert saved['publication_plan']['state'] == 'pending'
             assert len(saved['publication_plan']['members']) == 2
-            gate = json.loads((session.final.parent / '.capture.publication.json').read_text())
+            gate = json.loads(publication_gate(session.final).read_text())
             assert gate['destinations'] == [member['destination'] for member in saved['publication_plan']['members']]
         return replace(source, destination)
     with monkeypatch.context() as patch:
@@ -290,7 +297,7 @@ def test_interrupted_batch_is_gated_and_restart_finishes_same_plan(session, monk
     if corruption != 'none':
         (session.root / 'session.json').write_text('{torn')
     if corruption == 'manifest-and-gate':
-        (session.final.parent / '.capture.publication.json').write_text('{torn')
+        publication_gate(session.final).write_text('{torn')
     unrelated = session.final.parent / 'normal.mkv'
     unrelated.write_bytes(b'ordinary finished recording')
     # Actual uploader, with unrelated eligibility guards removed. The batch
@@ -310,7 +317,7 @@ def test_interrupted_batch_is_gated_and_restart_finishes_same_plan(session, monk
     assert first.read_bytes() == b'verified media 0' and second.read_bytes() == b'verified media 1'
     assert not session.final.exists() and not session.root.exists()
     assert {p for p, _, _ in uploader.candidates()} == {first, second, unrelated}
-    assert not (session.final.parent / '.capture.publication.json').exists()
+    assert not publication_gate(session.final).exists()
 
 
 def test_deadline_during_preparation_fails_once_with_raw_intact(session, monkeypatch):
@@ -363,6 +370,19 @@ def pending_batch(session, monkeypatch):
     monkeypatch.setattr(app, "finalize_prepared_recording", Mock(side_effect=AssertionError("ladder forbidden")))
     session.profile, session.saved, session.outputs = profile, saved, outputs
     return session
+
+
+@pytest.mark.parametrize('contents', ['valid', 'torn'])
+def test_saved_batch_replaces_legacy_gate_and_cleans_both_names(pending_batch, monkeypatch, contents):
+    batch = pending_batch
+    gate = publication_gate(batch.final)
+    legacy = batch.final.with_name(f'.{batch.final.stem}.publication.json')
+    gate.replace(legacy)
+    if contents == 'torn':
+        legacy.write_text('{torn')
+    batch.engine._finalize_recording_worker(batch.saved, 'resume earlier gate')
+    assert_batch_published(batch, monkeypatch)
+    assert not gate.exists() and not legacy.exists()
 
 
 def assert_batch_published(batch, monkeypatch):
@@ -612,7 +632,7 @@ def test_publication_gate_survives_interruption_at_durability_boundaries(session
         Path(__file__).resolve().parents[1] / 'uploader' / 'drive_uploader.py')
     uploader = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(uploader)
-    gate = session.final.parent / '.capture.publication.json'
+    gate = publication_gate(session.final)
     replace, unlink = Path.replace, Path.unlink
     save = session.engine._save_recording_manifest
     sync = session.engine._sync_recording_directory
@@ -660,3 +680,141 @@ def test_publication_gate_survives_interruption_at_durability_boundaries(session
         session.engine._finalize_recording_worker(saved, 'retry durability boundary')
         assert saved['status'] == 'complete' and not session.root.exists()
         assert not gate.exists() and not uploader.publication_pending(session.final)
+
+
+@pytest.fixture(scope='module')
+def normal_flv(tmp_path_factory):
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg or not shutil.which('ffprobe'):
+        pytest.skip('FFmpeg and FFprobe required')
+    path = tmp_path_factory.mktemp('normal-flv') / 'seed.flv'
+    subprocess.run([ffmpeg, '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                    'testsrc2=s=160x120:r=25', '-t', '2', '-c:v', 'libx264',
+                    '-preset', 'ultrafast', '-bf', '0', str(path)], check=True, timeout=30)
+    return path
+
+
+@pytest.mark.parametrize('engine_kind', ['headless', 'desktop'])
+@pytest.mark.parametrize('name', ['234-bytes', '240-bytes', 'real-incident'])
+def test_normal_long_capture_publishes_once_and_is_uploadable(tmp_path, monkeypatch, normal_flv, engine_kind, name):
+    import importlib.util
+    import douyin_headless as headless
+    spec = importlib.util.spec_from_file_location('long_name_uploader',
+        Path(__file__).resolve().parents[1] / 'uploader' / 'drive_uploader.py')
+    uploader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(uploader)
+    profile = {'id': 'fixture', 'name': '主播', 'output_dir': str(tmp_path / 'acct')}
+    settings = app.default_settings()
+    settings.update(ffmpeg_path=shutil.which('ffmpeg'), ffprobe_path=shutil.which('ffprobe'))
+    store = SimpleNamespace(settings=settings, profiles=[profile])
+    engine = (headless.HeadlessMonitorEngine(store, app.RecorderEventQueue(),
+              SimpleNamespace(critical=1000, free=lambda _path: 10**9))
+              if engine_kind == 'headless' else app.MonitorEngine(store, app.RecorderEventQueue()))
+    class CaptureTime(app.datetime):
+        @classmethod
+        def now(cls):
+            return cls(2026, 11, 3, 21, 31, 55)
+    monkeypatch.setattr(app, 'datetime', CaptureTime)
+    if name == 'real-incident':
+        # Exact basename from the incident's read-only session.json.
+        stream = SimpleNamespace(anchor_name='@虎牙釘（10.28生日版）', title='35级以上小心心猜星座wlw')
+    else:
+        stream = SimpleNamespace(anchor_name='主播', title='测' * (69 if name == '234-bytes' else 71))
+    record = engine._new_recording_session(profile, stream)
+    final = Path(record['final_output'])
+    if name == 'real-incident':
+        assert final.name == '2026-11-03_21-31-55_@虎牙釘（10.28生日版）_35级以上小心心猜星座wlw.mkv'
+    else:
+        assert len(final.stem.encode('utf-8')) == int(name.split('-')[0])
+    raw = Path(record['session_dir']) / 'part-0001.flv'
+    shutil.copyfile(normal_flv, raw)
+    record.update(parts=[str(raw)], part_index=1, status='finalizing')
+    calls = []
+    run, replace = subprocess.run, Path.replace
+    gate = publication_gate(final)
+    def tracked(command, **kwargs):
+        calls.append(command)
+        return run(command, **kwargs)
+    def checked_replace(source, destination):
+        if Path(destination) == final:
+            assert len(gate.name.encode()) < 255 and len(gate.with_suffix('.json.tmp').name.encode()) < 255
+            assert json.loads(gate.read_text())['destinations'] == [str(final.resolve())]
+        return replace(source, destination)
+    monkeypatch.setattr(subprocess, 'run', tracked)
+    monkeypatch.setattr(Path, 'replace', checked_replace)
+    engine._finalize_recording_worker(record, 'normal stop')
+    remuxes = [c for c in calls if Path(c[0]).name == 'ffmpeg']
+    probes = [c for c in calls if Path(c[0]).name == 'ffprobe']
+    assert len(remuxes) == len(probes) == 1 and '-xerror' in remuxes[0]
+    assert record['status'] == 'complete' and final.stat().st_size > 0
+    assert not raw.exists() and not Path(record['session_dir']).exists()
+    assert not list(final.parent.glob('.*.publication.json*'))
+    monkeypatch.setattr(uploader, 'ROOT', tmp_path)
+    monkeypatch.setattr(uploader, 'MIN_AGE', -1)
+    monkeypatch.setattr(uploader, 'open_files', lambda: set())
+    monkeypatch.setattr(uploader, 'busy_profiles', lambda: set())
+    assert {p for p, _, _ in uploader.candidates()} == {final}
+
+
+@pytest.mark.parametrize('stem_bytes', [234, 240, 244])
+@pytest.mark.parametrize('unreadable', ['torn', 'permission'])
+def test_long_split_batch_unreadable_gate_is_private_and_resumable(session, monkeypatch, stem_bytes, unreadable):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('long_split_uploader',
+        Path(__file__).resolve().parents[1] / 'uploader' / 'drive_uploader.py')
+    uploader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(uploader)
+    stem = '测' * (stem_bytes // 3) + 'x' * (stem_bytes % 3)
+    final = session.final.with_name(stem + '.mkv')
+    session.recording['final_output'] = str(final)
+    destinations = [final.with_name(f'{stem}.part{i:02d}.mkv') for i in (1, 2)]
+    assert max(len(p.name.encode()) for p in destinations) == stem_bytes + 11
+    ladder = Mock()
+    def split(_ffmpeg, _inputs, _manifest, _temp, remux, *_args, **_kwargs):
+        ladder()
+        remux.mkdir()
+        stages = [remux / f'part{i}.finalizing.mkv' for i in (1, 2)]
+        for stage in stages:
+            stage.write_bytes(b'verified media')
+        return stages
+    monkeypatch.setattr(app, 'finalize_prepared_recording', split)
+    replace = Path.replace
+    gate = publication_gate(final)
+    def interrupt(source, destination):
+        if Path(destination) == destinations[0]:
+            assert json.loads(gate.read_text())['destinations'] == [str(p.resolve()) for p in destinations]
+        if Path(destination) == destinations[1]:
+            raise PermissionError('second destination locked')
+        return replace(source, destination)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, 'replace', interrupt)
+        session.engine._finalize_recording_worker(session.recording, 'long split')
+    assert destinations[0].exists() and not destinations[1].exists()
+    saved = json.loads((session.root / 'session.json').read_text())
+    (session.root / 'session.json').write_text('{torn')
+    unrelated = final.with_name('normal.mkv')
+    unrelated.write_bytes(b'finished capture')
+    read_text = Path.read_text
+    def blocked_read(path, *args, **kwargs):
+        if path == gate:
+            raise PermissionError('unreadable gate')
+        return read_text(path, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        if unreadable == 'torn':
+            gate.write_text('{torn')
+        else:
+            patch.setattr(Path, 'read_text', blocked_read)
+        patch.setattr(uploader, 'ROOT', final.parent.parent)
+        patch.setattr(uploader, 'MIN_AGE', -1)
+        patch.setattr(uploader, 'open_files', lambda: set())
+        patch.setattr(uploader, 'busy_profiles', lambda: set())
+        assert {p for p, _, _ in uploader.candidates()} == {unrelated}
+        assert not uploader.upload_one(destinations[0], destinations[0].relative_to(uploader.ROOT),
+                                       destinations[0].stat().st_size, False)
+    assert all(p.exists() for p in session.parts)
+    session.engine._save_recording_manifest(saved)
+    session.engine._finalize_recording_worker(saved, 'resume long split')
+    assert saved['status'] == 'complete' and saved['final_outputs'] == [str(p) for p in destinations]
+    assert all(p.exists() and not uploader.publication_pending(p) for p in destinations)
+    assert not session.root.exists() and not list(final.parent.glob('.*.publication.json*'))
+    ladder.assert_called_once()

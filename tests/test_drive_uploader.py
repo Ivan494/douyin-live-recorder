@@ -428,14 +428,37 @@ def test_unrelated_broken_or_no_plan_manifest_keeps_finished_upload_eligible(san
     assert upload(final, sandbox) is True
 
 
-@pytest.mark.parametrize('contents', ['{torn', '[]', '{"destinations": null}', '{"destinations": []}'])
-def test_unreadable_publication_gate_blocks_only_its_batch(sandbox, drive, contents):
+@pytest.mark.parametrize('scheme', ['hashed', 'legacy'])
+@pytest.mark.parametrize('contents', ['{torn', '[]', '{"destinations": null}', '{"destinations": []}', 'permission'])
+def test_unreadable_publication_gate_blocks_only_its_batch(sandbox, drive, monkeypatch, contents, scheme):
+    single = sandbox.make_file('acct/capture.mkv')
     first = sandbox.make_file('acct/capture.part01.mkv')
     second = sandbox.make_file('acct/capture.part02.mkv')
+    hundredth = sandbox.make_file('acct/capture.part100.mkv')
     unrelated = sandbox.make_file('acct/other.mkv')
-    (first.parent / '.capture.publication.json').write_text(contents)
+    key = hashlib.sha256(b'capture').hexdigest()
+    gate = first.parent / (f'.publication-{key}.publication.json' if scheme == 'hashed'
+                           else '.capture.publication.json')
+    gate.write_text(contents)
+    if contents == 'permission':
+        read_text = Path.read_text
+        def unreadable(path, *args, **kwargs):
+            if path == gate:
+                raise PermissionError('gate is unreadable')
+            return read_text(path, *args, **kwargs)
+        monkeypatch.setattr(Path, 'read_text', unreadable)
     assert {p for p, _, _ in uploader.candidates()} == {unrelated}
+    assert upload(single, sandbox) is False
     assert upload(first, sandbox) is False
     assert upload(second, sandbox) is False
+    assert upload(hundredth, sandbox) is False
     assert not drive.calls
+    assert upload(unrelated, sandbox) is True
+
+
+def test_hashed_gate_does_not_gate_its_digest_as_a_capture_name(sandbox, drive):
+    key = hashlib.sha256(b'capture').hexdigest()
+    unrelated = sandbox.make_file(f'acct/publication-{key}.mkv')
+    (unrelated.parent / f'.publication-{key}.publication.json').write_text('{torn')
+    assert {p for p, _, _ in uploader.candidates()} == {unrelated}
     assert upload(unrelated, sandbox) is True

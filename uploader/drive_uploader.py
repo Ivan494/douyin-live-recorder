@@ -112,6 +112,12 @@ def is_busy_live(path, rel, busy):
 
 def publication_pending(path):
     """A batch's durable gate keeps its destinations private until commit."""
+    # A split member belongs to the gate for its original, unsuffixed stem.
+    stems = {path.stem}
+    if path.suffix == ".mkv":
+        stems.add(re.sub(r"\.part[0-9]{2,}$", "", path.stem))
+    gate_names = {f".publication-{hashlib.sha256(stem.encode('utf-8')).hexdigest()}.publication.json"
+                  for stem in stems}
     for gate in path.parent.glob(".*.publication.json"):
         try:
             payload = json.loads(gate.read_text(encoding="utf-8"))
@@ -132,6 +138,11 @@ def publication_pending(path):
                 return True
         except (OSError, ValueError, KeyError, TypeError):
             # The filename identifies this batch even if its contents are torn.
+            if gate.name in gate_names:
+                return True
+            if re.fullmatch(r"\.publication-[0-9a-f]{64}\.publication\.json", gate.name):
+                continue
+            # Retain compatibility with the earlier stem-based gate names.
             stem = gate.name[1:-len(".publication.json")]
             if path.name == stem + ".mkv" or path.name.startswith(stem + ".part"):
                 return True

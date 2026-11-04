@@ -3,6 +3,7 @@ import asyncio
 import base64
 import ctypes
 import copy
+import hashlib
 from collections import OrderedDict
 from contextlib import nullcontext
 import json
@@ -2004,7 +2005,10 @@ class MonitorEngine:
         if [list(self._recording_part_stamp(path)) for path in parts] != plan["part_stamps"]:
             raise RuntimeError("MKV parts changed since publication plan; raw parts preserved")
         final_output = Path(recording["final_output"])
-        gate = final_output.with_name(f".{final_output.stem}.publication.json")
+        # Capture stems can already fill NAME_MAX with the staging suffix.
+        # Keep the gate (including its temporary suffix) independent of length.
+        key = hashlib.sha256(final_output.stem.encode("utf-8")).hexdigest()
+        gate = final_output.with_name(f".publication-{key}.publication.json")
         temporary_gate = gate.with_suffix(".json.tmp")
         with temporary_gate.open("w", encoding="utf-8") as handle:
             json.dump({"destinations": [member["destination"] for member in plan["members"]],
@@ -2038,6 +2042,10 @@ class MonitorEngine:
         except Exception:
             recording["publication_plan"] = plan
             raise
+        # A saved batch may have started with the earlier stem-based gate.
+        for legacy_gate in gate.parent.glob(".*.publication.json"):
+            if legacy_gate.name == f".{final_output.stem}.publication.json":
+                legacy_gate.unlink()
         gate.unlink()
         self._sync_recording_directory(gate.parent)
         return outputs
