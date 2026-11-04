@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -13,7 +14,17 @@ from pathlib import Path
 
 from streamget.platforms.douyin.live_stream import DouyinLiveStream
 
-from recording_urls import has_recording_url, recording_extension, recording_input_url
+from recording_segments import (
+    prepare_recording_parts,
+    ffmpeg_concat_copy_command,
+    ffmpeg_live_capture_output_args,
+)
+from recording_urls import (
+    ffmpeg_live_input_options,
+    has_recording_url,
+    recording_extension,
+    recording_input_url,
+)
 from security_utils import default_trusted_tool_roots, resolve_trusted_executable
 
 
@@ -151,6 +162,42 @@ async def resolve_stream(config, logger):
     return room, stream
 
 
+def _hidden_process_kwargs():
+    if os.name != "nt":
+        return {}
+    return {"creationflags": subprocess.CREATE_NO_WINDOW}
+
+
+def _remux_capture(ffmpeg_path, capture_file, output_file, logger, stderr_file):
+    """Publish a finished MKV from an FLV capture, splitting on sequence headers."""
+    work_dir = capture_file.with_name(capture_file.stem + ".segments")
+    _parts, manifest = prepare_recording_parts([capture_file], work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    concat_path = work_dir / "parts.txt"
+    concat_path.write_text(manifest, encoding="utf-8")
+    temporary = output_file.with_name(output_file.stem + ".finalizing.mkv")
+    command = ffmpeg_concat_copy_command(ffmpeg_path, concat_path, temporary)
+    stderr_file.write(f"\n=== remux {capture_file.name} -> {output_file.name} ===\n")
+    stderr_file.flush()
+    result = subprocess.run(
+        command,
+        cwd=str(output_file.parent),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=stderr_file,
+        text=True,
+        check=False,
+        **_hidden_process_kwargs(),
+    )
+    if result.returncode != 0 or not temporary.exists() or temporary.stat().st_size <= 0:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(f"FFmpeg remux exited with code {result.returncode}")
+    temporary.replace(output_file)
+    shutil.rmtree(work_dir, ignore_errors=True)
+    capture_file.unlink(missing_ok=True)
+    logger.info("Recording remuxed: %s", output_file)
+
+
 def run_ffmpeg(config, stream, logger):
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -163,8 +210,20 @@ def run_ffmpeg(config, stream, logger):
         raise RuntimeError("Live stream did not include a recording URL")
     extension = recording_extension(input_url, config["container"])
     output_file = output_dir / f"{timestamp}_{anchor}_{title}.{extension}"
-
-    from recording_urls import ffmpeg_live_input_options
+    # FLV keeps a mid-stream sequence header. Publish that file directly when
+    # the configured container is FLV. Otherwise capture to FLV and remux to
+    # MKV; a direct copy into Matroska would keep only the first header.
+    if extension == "flv":
+        capture_file = output_file
+    else:
+        if extension != "mkv":
+            logger.info(
+                "Container %s cannot preserve a mid-live sequence header; publishing MKV.",
+                extension,
+            )
+            output_file = output_file.with_suffix(".mkv")
+            extension = "mkv"
+        capture_file = output_file.with_name(output_file.stem + ".capture.flv")
 
     ffmpeg_path = resolve_trusted_executable(
         config["ffmpeg_path"],
@@ -181,12 +240,10 @@ def run_ffmpeg(config, stream, logger):
         *ffmpeg_live_input_options(input_url),
         "-i",
         input_url,
-        "-c",
-        "copy",
-        str(output_file),
+        *ffmpeg_live_capture_output_args(capture_file),
     ]
 
-    logger.info("Recording started: %s source=%s", output_file, stream_kind)
+    logger.info("Recording started: %s source=%s", capture_file, stream_kind)
     logs_dir = output_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     stderr_path = logs_dir / f"{output_file.stem}.ffmpeg.log"
@@ -197,7 +254,7 @@ def run_ffmpeg(config, stream, logger):
             stdout=subprocess.DEVNULL,
             stderr=stderr_file,
             text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            **_hidden_process_kwargs(),
         )
         while process.poll() is None:
             if STOP:
@@ -210,7 +267,22 @@ def run_ffmpeg(config, stream, logger):
                     process.wait(timeout=5)
                 break
             time.sleep(0.5)
-    logger.info("Recording ended: returncode=%s file=%s log=%s", process.returncode, output_file, stderr_path)
+        logger.info(
+            "Recording ended: returncode=%s file=%s log=%s",
+            process.returncode,
+            capture_file,
+            stderr_path,
+        )
+        if extension == "flv" or not capture_file.exists() or capture_file.stat().st_size <= 0:
+            return
+        try:
+            _remux_capture(ffmpeg_path, capture_file, output_file, logger, stderr_file)
+        except Exception:
+            logger.exception(
+                "Could not remux %s; playable FLV capture kept at %s",
+                output_file,
+                capture_file,
+            )
 
 
 async def watch(config, logger):

@@ -199,6 +199,18 @@ class HeadlessMonitorEngine(app.MonitorEngine):
 
     MAX_FINALIZE_ATTEMPTS = 3
 
+    def _finalize_space_needed(self, recording):
+        # FLV parts whose sequence header changes (PK) are split into a second
+        # copy before the MKV concat, so peak use can be 2x those parts + MKV.
+        flv = 0
+        for value in recording.get("parts") or []:
+            try:
+                if str(value).lower().endswith(".flv"):
+                    flv += Path(value).stat().st_size
+            except OSError:
+                continue
+        return self._parts_size(recording) + flv + self.disk.critical
+
     @classmethod
     def _should_retry_finalize(cls, manifest):
         status = manifest.get("status")
@@ -229,14 +241,14 @@ class HeadlessMonitorEngine(app.MonitorEngine):
             return self._finalize_with_disk_guard(recording, reason)
 
     def _finalize_with_disk_guard(self, recording, reason):
-        needed = self._parts_size(recording) + self.disk.critical
+        needed = self._finalize_space_needed(recording)
         if self.disk.free(recording["session_dir"]) < needed:
             recording["status"] = "waiting_for_disk"
             recording["stop_reason"] = reason
             self._save_recording_manifest(recording)
             with self.deferred_lock:
                 self.deferred_finalizers[recording["session_dir"]] = (recording, reason)
-            self.emit(recording["profile_id"], "Finalization deferred until disk space recovers; raw MKV parts preserved.",
+            self.emit(recording["profile_id"], "Finalization deferred until disk space recovers; raw recording parts preserved.",
                       status="Waiting for disk", recording=False, current_file=recording["session_dir"])
             return
         return super()._finalize_recording_worker(recording, reason)
@@ -246,7 +258,7 @@ class HeadlessMonitorEngine(app.MonitorEngine):
             return
         with self.deferred_lock:
             ready = [(key, item) for key, item in self.deferred_finalizers.items()
-                     if self.disk.free(item[0]["session_dir"]) >= self._parts_size(item[0]) + self.disk.critical]
+                     if self.disk.free(item[0]["session_dir"]) >= self._finalize_space_needed(item[0])]
             for key, (recording, reason) in ready[:1]:
                 del self.deferred_finalizers[key]
                 thread = threading.Thread(target=self._finalize_recording_worker, args=(recording, reason),

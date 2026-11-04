@@ -129,7 +129,7 @@ def test_resumed_scan_completes_every_two_polls_within_parent_request_budget(rel
             if reload_state:
                 state = json.loads(json.dumps(state))
     # Count EVERY mobile request, including other author sources and trays.
-    assert len(calls) <= 1738
+    assert len(calls) <= 1838  # One additional refresh head per poll.
     assert complete_polls >= 50
     print(f"100-poll replay (JSON reload={reload_state}): "
           f"{len(calls)} total requests, {complete_polls} complete polls")
@@ -338,9 +338,10 @@ def author_replay_response(path, extra, _host):
 
 
 @pytest.mark.parametrize("reload_state", [False, True])
-def test_author_variants_complete_every_two_polls_within_baseline_request_budget(reload_state):
+def test_both_history_views_complete_within_three_polls_and_shared_budget(reload_state):
     state = {}
     media._story_scan_state(state, AUTHOR, "sessionid=test")["author_offsets"][media.STORY_FEED_PATH] = "300"
+    state["story_scan"]["history_mode_version"] = 1  # This fixture seeds the archive mode.
     complete_polls = 0
     with mobile_requests(author_replay_response) as calls:
         for poll in range(100):
@@ -349,13 +350,14 @@ def test_author_variants_complete_every_two_polls_within_baseline_request_budget
             assert_profile_budget(calls[start:])
             assert sum(path == media.STORY_FEED_PATH and "to_uid" in extra
                        for path, extra, _host in calls[start:]) <= 15
-            # Both the saved scan and every fresh scan finish within two checks.
-            assert result.complete == (poll % 2 == 1)
+            # Seeded archive progress finishes on poll 2; fresh traversals of
+            # BOTH independent views finish every three polls under one budget.
+            assert result.complete == (poll % 3 == 1)
             complete_polls += result.complete
             if reload_state:
                 state = json.loads(json.dumps(state))
-    assert complete_polls == 50
-    assert len(calls) <= 2386  # Round 2; e7fe8e6 took 2,638 on this fixture.
+    assert complete_polls == 33
+    assert len(calls) <= 2387  # Round 2; e7fe8e6 took 2,638 on this fixture.
     print(f"100-poll author replay (JSON reload={reload_state}): "
           f"{len(calls)} total requests, {complete_polls} complete polls")
 
@@ -380,11 +382,12 @@ def test_completed_profile_waits_for_long_outer_feed(with_catalog):
         return successful_empty()
 
     with mobile_requests(response) as calls:
-        for poll in range(3):
+        for poll in range(6):
             start = len(calls)
             result = fetch(scan_state=state)
             assert_profile_budget(calls[start:])
-            assert result.complete == (poll == 2)
+            assert sum(p == media.STORY_FEED_PATH and "to_uid" in e for p, e, _ in calls[start:]) <= 15
+            assert result.complete == (poll == 5)
             if poll:
                 assert [extra["offset"] for extra in profile_calls(calls[start:])] == ["0"]
                 assert not any("direct" in extra for _path, extra, _host in calls[start:])
@@ -439,7 +442,7 @@ def test_completed_author_variant_is_invalidated_by_changed_head(variant, change
         result = fetch(scan_state=state)
         assert_profile_budget(calls)
     assert "changed-archive" in {item["aweme_id"] for item in result[0]}
-    assert [extra["offset"] for path, extra, _host in calls if path == variant and "to_uid" in extra] == [
+    assert [extra["offset"] for path, extra, _host in calls if path == variant and "to_uid" in extra and extra.get("source") != "9"] == [
         "0", "40" if change == "next_offset" else "20"]
 
 

@@ -140,9 +140,11 @@ class ReliabilityTest(unittest.TestCase):
         self.assertNotIn("-reconnect_at_eof", command)
         self.assertIn("+discardcorrupt+genpts", command)
         self.assertEqual("5", command[command.index("-reconnect_delay_max") + 1])
-        self.assertEqual("0:v?", command[command.index("-map") + 1])
-        self.assertIn("0:a?", command)
-        self.assertTrue(command[-1].endswith(".mkv"))
+        self.assertEqual("0:v:0?", command[command.index("-map") + 1])
+        self.assertIn("0:a:0?", command)
+        self.assertTrue(command[-1].endswith(".flv"))
+        self.assertGreater(command.index("-f"), command.index("-i"))
+        self.assertEqual("flv", command[command.index("-f") + 1])
         self.assertEqual(
             command.index("-reconnect"),
             command.index("-i") - len(["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]),

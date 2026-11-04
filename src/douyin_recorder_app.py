@@ -54,6 +54,12 @@ from douyin_media_downloader import (
     saved_session_info,
 )
 from lookup_resilience import LOOKUP_DEFAULTS, LookupDeferred
+from recording_segments import (
+    concat_list_line,
+    prepare_recording_parts,
+    ffmpeg_concat_copy_command,
+    ffmpeg_live_capture_output_args,
+)
 from recording_urls import (
     ffmpeg_live_input_options,
     has_recording_url,
@@ -1756,14 +1762,14 @@ class MonitorEngine:
                     recording["stop_reason"] = "Scheduled signed-URL refresh"
                     self.emit(
                         profile_id,
-                        "Refreshing the signed live URL into a new MKV part.",
+                        "Refreshing the signed live URL into a new recording part.",
                         status="Refreshing URL",
                         recording=True,
                         next_check="Now",
                         cooldown="Scheduled URL refresh",
                         **self.recording_snapshot(profile_id),
                     )
-                    logging.info("Refreshing signed live URL for %s; terminating current MKV part.", profile_id)
+                    logging.info("Refreshing signed live URL for %s; terminating current recording part.", profile_id)
                     try:
                         process.terminate()
                     except Exception:
@@ -1797,7 +1803,7 @@ class MonitorEngine:
                 stderr_file.close()
             snapshot = self.recording_snapshot(profile_id)
             last_warning = snapshot.get("last_warning") or ""
-            if last_warning.startswith("=== MKV part "):
+            if last_warning.startswith(("=== capture part ", "=== MKV part ")):
                 last_warning = ""
                 snapshot["last_warning"] = ""
             if last_warning:
@@ -1859,7 +1865,7 @@ class MonitorEngine:
                 continue
             self.emit(
                 profile_id,
-                f"MKV part ended with code {process.returncode}; refreshing the live URL.",
+                f"Recording part ended with code {process.returncode}; refreshing the live URL.",
                 status="Rechecking",
                 recording=False,
                 next_check="Now",
@@ -1907,8 +1913,7 @@ class MonitorEngine:
 
     @staticmethod
     def _concat_file_line(path):
-        normalized = Path(path).resolve().as_posix().replace("'", "'\\''")
-        return "file '" + normalized + "'"
+        return concat_list_line(path)
 
     def _validate_final_recording(self, path):
         probe_setting = self.store.settings.get("ffprobe_path") or str(DEFAULT_FFPROBE_PATH)
@@ -1986,36 +1991,28 @@ class MonitorEngine:
             usable_parts = [path for path, stamp in zip(parts, stamps) if stamp[2] > 0]
             if not usable_parts:
                 raise RuntimeError("No usable MKV parts")
+            # Split any FLV capture whose H.264/HEVC sequence header changes
+            # (PK / co-stream) so every piece carries one parameter set.
+            concat_inputs, manifest = prepare_recording_parts(usable_parts, session_dir / "parameter_sets")
+            if len(concat_inputs) != len(usable_parts):
+                logging.info(
+                    "Expanded %s capture file(s) into %s parameter-stable segment(s) for %s.",
+                    len(usable_parts),
+                    len(concat_inputs),
+                    profile_id,
+                )
+            if not concat_inputs:
+                raise RuntimeError("no usable recording parts after splitting sequence headers")
             with open(concat_path, "w", encoding="utf-8") as fh:
-                fh.write("\n".join(self._concat_file_line(path) for path in usable_parts) + "\n")
+                fh.write(manifest)
             recording["status"] = "finalizing"
             recording["stop_reason"] = reason
             self._save_recording_manifest(recording)
-            command = [
+            command = ffmpeg_concat_copy_command(
                 resolve_ffmpeg_executable(self.store.settings["ffmpeg_path"]),
-                "-hide_banner",
-                "-nostdin",
-                "-loglevel",
-                "warning",
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(concat_path),
-                "-map",
-                "0:v:0?",
-                "-map",
-                "0:a:0?",
-                "-c",
-                "copy",
-                "-fflags",
-                "+genpts",
-                "-avoid_negative_ts",
-                "make_zero",
-                str(temporary_output),
-            ]
+                concat_path,
+                temporary_output,
+            )
             with open(finalize_log, "w", encoding="utf-8") as log_handle:
                 result = subprocess.run(
                     command,
@@ -2043,14 +2040,14 @@ class MonitorEngine:
                 logging.warning("Could not clean up session dir %s (non-fatal)", session_dir)
             self.emit(
                 profile_id,
-                f"Recording finalized: {final_output.name} ({len(usable_parts)} MKV part{'s' if len(usable_parts) != 1 else ''}).",
+                f"Recording finalized: {final_output.name} ({len(usable_parts)} part{'s' if len(usable_parts) != 1 else ''}).",
                 status="Offline",
                 recording=False,
                 current_file=str(final_output),
                 file_size=file_size_text(final_output),
                 cooldown="Complete",
             )
-            logging.info("Finalized %s from %s MKV part(s): %s", profile_id, len(usable_parts), final_output)
+            logging.info("Finalized %s from %s part(s) (%s concat input(s)): %s", profile_id, len(usable_parts), len(concat_inputs), final_output)
         except Exception as exc:
             # A killed/failed concat leaves a partial temp file the uploader
             # skips forever; it is never the only copy (raw parts remain).
@@ -2059,6 +2056,9 @@ class MonitorEngine:
                     temporary_output.unlink()
             except OSError:
                 logging.warning("Could not remove partial %s", temporary_output)
+            # Split pieces are rebuilt from the raw parts on retry; do not let
+            # them double the session's disk use while it waits.
+            shutil.rmtree(session_dir / "parameter_sets", ignore_errors=True)
             recording["status"] = "failed"
             recording["finalize_attempts"] = int(recording.get("finalize_attempts") or 0) + 1
             recording["stop_reason"] = f"{reason}: {exc}"
@@ -2069,7 +2069,7 @@ class MonitorEngine:
             logging.exception("Could not finalize MKV session for %s", profile_id)
             self.emit(
                 profile_id,
-                f"Recording finalization failed; raw MKV parts were preserved: {exc}",
+                f"Recording finalization failed; raw recording parts were preserved: {exc}",
                 status="Finalization failed",
                 recording=False,
                 current_file=str(session_dir),
@@ -2085,7 +2085,7 @@ class MonitorEngine:
         self._save_recording_manifest(recording)
         self.emit(
             profile_id,
-            f"Finalizing {len(recording.get('parts') or [])} MKV part(s) into one recording.",
+            f"Finalizing {len(recording.get('parts') or [])} recording part(s) into one MKV.",
             status="Finalizing",
             recording=False,
             current_file=recording.get("final_output", ""),
@@ -2397,16 +2397,16 @@ class MonitorEngine:
         if not is_resume:
             recording = self._new_recording_session(profile, stream)
         recording["part_index"] = int(recording.get("part_index") or 0) + 1
-        part_path = Path(recording["session_dir"]) / f"part-{recording['part_index']:04d}.mkv"
+        part_path = Path(recording["session_dir"]) / f"part-{recording['part_index']:04d}.flv"
         stderr_path = Path(recording["stderr_path"])
         stderr_file = open(stderr_path, "a", encoding="utf-8")
         stderr_file.write(
-            f"\n=== MKV part {recording['part_index']} started {datetime.now().isoformat(timespec='seconds')} "
+            f"\n=== capture part {recording['part_index']} started {datetime.now().isoformat(timespec='seconds')} "
             f"using {stream_kind} ===\n"
         )
         stderr_file.flush()
         logging.info(
-            "%s: Starting MKV part %s from refreshed %s stream URL.",
+            "%s: Starting capture part %s from refreshed %s stream URL.",
             profile.get("name"),
             recording["part_index"],
             stream_kind,
@@ -2425,17 +2425,7 @@ class MonitorEngine:
             ),
             "-i",
             input_url,
-            "-map",
-            "0:v:0?",
-            "-map",
-            "0:a:0?",
-            "-c",
-            "copy",
-            "-avoid_negative_ts",
-            "make_zero",
-            "-flush_packets",
-            "1",
-            str(part_path),
+            *ffmpeg_live_capture_output_args(part_path),
         ]
 
         try:
@@ -2482,7 +2472,7 @@ class MonitorEngine:
         self.emit(
             profile["id"],
             (
-                f"Recording resumed in MKV part {recording['part_index']}: {Path(recording['final_output']).name}"
+                f"Recording resumed in part {recording['part_index']}: {Path(recording['final_output']).name}"
                 if is_resume
                 else f"Recording started: {Path(recording['final_output']).name}"
             ),
