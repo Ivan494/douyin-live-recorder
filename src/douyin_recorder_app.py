@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import asyncio
 import base64
 import ctypes
@@ -46,6 +46,11 @@ from douyin_media_downloader import (
 )
 from recording_segments import (
     concat_list_line,
+    finalize_prepared_recording,
+    flv_playback_span_ms,
+    probe_recording,
+    finalize_budget,
+    check_finalize_deadline,
     prepare_recording_parts,
     ffmpeg_concat_copy_command,
     ffmpeg_live_capture_output_args,
@@ -1399,8 +1404,12 @@ class MonitorEngine:
             "rotate_at",
             "segment_started_at",
             "profile_url",
+            "finalize_attempts",
+            "final_outputs",
+            "publication_plan",
         )
         return {key: recording.get(key) for key in keys}
+
 
     def _save_recording_manifest(self, recording):
         manifest_path = recording.get("manifest_path")
@@ -1555,8 +1564,6 @@ class MonitorEngine:
         recovered = 0
         for profile in self.store.profiles:
             profile_id = profile["id"]
-            if profile_id in self.recordings:
-                continue
             sessions_root = Path(profile.get("output_dir") or "") / ".recording_sessions"
             if not sessions_root.exists():
                 continue
@@ -1570,9 +1577,31 @@ class MonitorEngine:
                 key=_safe_mtime,
                 reverse=True,
             )
+            # Saved batches are immutable, including after a caught rename
+            # failure. Publish independently of any current/new capture.
+            for manifest_path in manifests:
+                manifest = self._read_recording_manifest(manifest_path)
+                if (not manifest or manifest.get("profile_id") != profile_id
+                        or not manifest.get("publication_plan") or manifest.get("status") == "complete"):
+                    continue
+                name = f"publication-finalizer-{manifest_path.parent}"
+                if any(t.name == name and t.is_alive() for t in self.finalizer_threads):
+                    continue
+                manifest["manifest_path"] = str(manifest_path)
+                manifest["session_dir"] = str(manifest_path.parent)
+                thread = threading.Thread(
+                    target=self._finalize_recording_worker,
+                    args=(manifest, "Resume saved publication"), name=name, daemon=False,
+                )
+                self.finalizer_threads.append(thread)
+                thread.start()
+            if profile_id in self.recordings:
+                continue
             for manifest_path in manifests:
                 manifest = self._read_recording_manifest(manifest_path)
                 if not manifest or manifest.get("profile_id") != profile_id:
+                    continue
+                if manifest.get("publication_plan"):
                     continue
                 if manifest.get("status") in {"complete", "failed"}:
                     continue
@@ -1607,6 +1636,7 @@ class MonitorEngine:
                 break
         if recovered:
             self.emit("engine", f"Recovered {recovered} unfinished MKV recording session(s).")
+
 
     @staticmethod
     def classify_error(exc):
@@ -1897,98 +1927,200 @@ class MonitorEngine:
     def _concat_file_line(path):
         return concat_list_line(path)
 
-    def _validate_final_recording(self, path):
+    def _validate_final_recording(self, path, expected=None):
         probe_setting = self.store.settings.get("ffprobe_path") or str(DEFAULT_FFPROBE_PATH)
         try:
             probe_path = resolve_trusted_executable(
                 probe_setting,
-                allowed_basenames={"ffprobe.exe"},
+                allowed_basenames={"ffprobe.exe"} if os.name == "nt" else {"ffprobe"},
                 trusted_roots=_trusted_tool_roots(),
             )
-        except ValueError:
-            probe_path = ""
-        if not path.exists() or path.stat().st_size <= 0:
-            raise RuntimeError("Final MKV was not created or is empty")
-        if not probe_path:
-            return
-        result = subprocess.run(
-            [
-                probe_path,
-                "-v",
-                "error",
-                "-show_entries",
-                "stream=codec_type",
-                "-of",
-                "json",
-                str(path),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            timeout=60,
-            **hidden_subprocess_kwargs(),
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "ffprobe could not validate the final MKV")
-        payload = json.loads(result.stdout or "{}")
-        stream_types = {item.get("codec_type") for item in payload.get("streams") or []}
-        if not stream_types.intersection({"audio", "video"}):
-            raise RuntimeError("Final MKV contains no audio or video streams")
+        except ValueError as exc:
+            raise RuntimeError("FFprobe is unavailable; raw parts cannot be safely removed") from exc
+        return probe_recording(path, probe_path, expected, hidden_subprocess_kwargs())
 
-    def _finalize_recording_worker(self, recording, reason):
+
+    @staticmethod
+    def _recording_part_stamp(path):
+        st = path.stat()
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"Missing MKV part: {path}")
+        return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
+    def _finalize_timeout(self, parts):
+        # Stream-copy concat scales with size: a fixed 240 s killed a 10 GB
+        # session at 8 GB. Allow base + 120 s per GiB.
+        base = max(30, int(self.store.settings.get("recording_finalize_timeout_seconds", 240)))
+        size = 0
+        for path in parts:
+            try:
+                size += Path(path).stat().st_size
+            except OSError:
+                pass
+        return base + int(size / (1 << 30) * 120)
+
+
+    def _check_finalize_normalization_space(self, recording, inputs):
+        required = sum(Path(path).stat().st_size for path in inputs) * 2
+        if shutil.disk_usage(recording["session_dir"]).free < required:
+            raise RuntimeError("Insufficient space for normalized recording copies; raw parts preserved")
+
+    @staticmethod
+    def _sync_recording_directory(path):
+        if os.name != "nt":
+            descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+
+    def _resume_recording_publication(self, recording):
+        """Roll forward exactly the verified batch saved before publication."""
+        plan = recording["publication_plan"]
+        parts = [Path(value) for value in recording.get("parts") or []]
+        if [list(self._recording_part_stamp(path)) for path in parts] != plan["part_stamps"]:
+            raise RuntimeError("MKV parts changed since publication plan; raw parts preserved")
+        manifest = Path(recording["manifest_path"])
+        with manifest.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        self._sync_recording_directory(manifest.parent)
+        outputs = []
+        for member in plan["members"]:
+            check_finalize_deadline()
+            source, destination = Path(member["staging"]), Path(member["destination"])
+            current = source if source.exists() else destination
+            if list(self._recording_part_stamp(current)[:4]) != member["stamp"]:
+                raise RuntimeError(f"Verified publication member changed or missing: {current}")
+            # Flush media contents before committing the name or deleting raw.
+            with current.open("r+b") as handle:
+                os.fsync(handle.fileno())
+            if current == source:
+                if os.name == "nt":
+                    # Windows rename refuses an existing destination and also
+                    # works on removable drives without hard-link support.
+                    source.rename(destination)
+                else:
+                    # A restart can encounter both links after interruption.
+                    if destination.exists():
+                        if not source.samefile(destination):
+                            raise FileExistsError(f"Final recording already exists: {destination}")
+                    else:
+                        os.link(source, destination)
+                    source.unlink()
+            outputs.append(destination)
+        check_finalize_deadline()
+        if [list(self._recording_part_stamp(path)) for path in parts] != plan["part_stamps"]:
+            raise RuntimeError("MKV parts changed during publication; raw parts preserved")
+        for directory in {path.parent for path in outputs}:
+            self._sync_recording_directory(directory)
+        recording["final_outputs"] = [str(path) for path in outputs]
+        recording["status"] = "complete"
+        recording["publication_plan"] = dict(plan, state="committed")
+        try:
+            self._save_recording_manifest(recording)
+            with manifest.open("r+b") as handle:
+                os.fsync(handle.fileno())
+            self._sync_recording_directory(manifest.parent)
+        except Exception:
+            recording["publication_plan"] = plan
+            raise
+        return outputs
+
+
+    def _finalize_recording_with_budget(self, recording, reason):
         final_output = Path(recording["final_output"])
         session_dir = Path(recording["session_dir"])
-        parts = [Path(value) for value in recording.get("parts") or [] if Path(value).exists() and Path(value).stat().st_size]
+        parts = [Path(value) for value in recording.get("parts") or []]
         profile_id = recording["profile_id"]
-        if not parts:
-            recording["status"] = "failed"
-            recording["stop_reason"] = f"{reason}: no usable recording parts"
-            self._save_recording_manifest(recording)
-            self.emit(profile_id, "Recording finalization failed: no usable recording parts.", status="Finalization failed", recording=False)
-            return
         concat_path = session_dir / "parts.txt"
         temporary_output = final_output.with_name(final_output.stem + ".finalizing.mkv")
         finalize_log = session_dir / "finalize.log"
+        remux_dir = session_dir / "finalize_remux"
         try:
-            source_count = len(parts)
-            parts, manifest = prepare_recording_parts(parts, session_dir / "parameter_sets")
-            if len(parts) != source_count:
+            with finalize_log.open("a", encoding="utf-8") as log:
+                log.write(f"\n=== finalize call {int(recording.get('finalize_attempts') or 0) + 1}: {reason} ===\n")
+            check_finalize_deadline()
+            if recording.get("publication_plan"):
+                # Never select a new strategy while a saved batch exists.
+                outputs = self._resume_recording_publication(recording)
+                try:
+                    shutil.rmtree(session_dir)
+                except OSError:
+                    logging.warning("Could not clean up session dir %s (non-fatal)", session_dir)
+                self.emit(profile_id, f"Recording publication resumed: {len(outputs)} output(s).",
+                          status="Offline", recording=False, current_file=str(outputs[0]), cooldown="Complete")
+                return
+            if not parts:
+                raise RuntimeError("No usable MKV parts")
+            # Missing parts must not silently shorten the capture. A failed
+            # connection may leave a zero-byte part; track it too so growth
+            # during the remux cannot be lost, but omit it from the concat.
+            required = sum(path.stat().st_size for path in parts)
+            required += sum(path.stat().st_size for path in parts if path.suffix.lower() == ".flv")
+            if shutil.disk_usage(session_dir).free < required:
+                raise RuntimeError("Insufficient space for recording preparation and output; raw parts preserved")
+            stamps = [self._recording_part_stamp(path) for path in parts]
+            usable_parts = [path for path, stamp in zip(parts, stamps) if stamp[2] > 0]
+            if not usable_parts:
+                raise RuntimeError("No usable MKV parts")
+            # Split any FLV capture whose H.264/HEVC sequence header changes
+            # (PK / co-stream) so every piece carries one parameter set.
+            concat_inputs, manifest = prepare_recording_parts(usable_parts, session_dir / "parameter_sets")
+            if len(concat_inputs) != len(usable_parts):
                 logging.info(
                     "Expanded %s capture file(s) into %s parameter-stable segment(s) for %s.",
-                    source_count,
-                    len(parts),
+                    len(usable_parts),
+                    len(concat_inputs),
                     profile_id,
                 )
-            if not parts:
+            if not concat_inputs:
                 raise RuntimeError("no usable recording parts after splitting sequence headers")
             with open(concat_path, "w", encoding="utf-8") as fh:
                 fh.write(manifest)
+            check_finalize_deadline()
             recording["status"] = "finalizing"
             recording["stop_reason"] = reason
             self._save_recording_manifest(recording)
-            command = ffmpeg_concat_copy_command(
-                resolve_ffmpeg_executable(self.store.settings["ffmpeg_path"]),
-                concat_path,
-                temporary_output,
-            )
-            with open(finalize_log, "w", encoding="utf-8") as log_handle:
-                result = subprocess.run(
-                    command,
-                    cwd=str(session_dir),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=log_handle,
-                    timeout=None,
-                    **hidden_subprocess_kwargs(),
+            durations = {}
+
+            def duration_for(path):
+                check_finalize_deadline()
+                if path not in durations:
+                    span = flv_playback_span_ms(path)
+                    durations[path] = span / 1000 if span is not None else self._validate_final_recording(path)
+                return durations[path]
+
+            with finalize_log.open("a", encoding="utf-8") as log_handle:
+                staged = finalize_prepared_recording(
+                    resolve_ffmpeg_executable(self.store.settings["ffmpeg_path"]),
+                    concat_inputs, concat_path, temporary_output, remux_dir, log_handle,
+                    self._validate_final_recording, duration_for,
+                    lambda: sum(duration_for(path) for path in usable_parts),
+                    timeout=self._finalize_timeout(usable_parts),
+                    process_kwargs=hidden_subprocess_kwargs(),
+                    before_normalize=lambda: self._check_finalize_normalization_space(recording, concat_inputs),
                 )
-            if result.returncode != 0:
-                raise RuntimeError(f"FFmpeg concat exited with code {result.returncode}")
-            self._validate_final_recording(temporary_output)
+            if [self._recording_part_stamp(path) for path in parts] != stamps:
+                raise RuntimeError("MKV parts changed during finalization; raw parts preserved")
             final_output.parent.mkdir(parents=True, exist_ok=True)
-            temporary_output.replace(final_output)
-            recording["status"] = "complete"
+            outputs = ([final_output] if staged == [temporary_output] else [
+                final_output.with_name(f"{final_output.stem}.part{index:02d}.mkv")
+                for index in range(1, len(staged) + 1)
+            ])
+            check_finalize_deadline()
+            recording["publication_plan"] = {
+                "state": "pending",
+                "part_stamps": [list(stamp) for stamp in stamps],
+                "members": [{"staging": str(source.resolve()),
+                             "destination": str(destination.resolve()),
+                             "stamp": list(self._recording_part_stamp(source)[:4])}
+                            for source, destination in zip(staged, outputs)],
+            }
+            # Persist the recovery plan before publishing any verified output.
             self._save_recording_manifest(recording)
+            outputs = self._resume_recording_publication(recording)
             # FIX-H5: Move rmtree outside the critical path. If cleanup fails
             # (locked file, antivirus), the recording is still successful.
             try:
@@ -1997,30 +2129,61 @@ class MonitorEngine:
                 logging.warning("Could not clean up session dir %s (non-fatal)", session_dir)
             self.emit(
                 profile_id,
-                f"Recording finalized: {final_output.name} ({len(parts)} part{'s' if len(parts) != 1 else ''}).",
+                f"Recording finalized: {len(outputs)} output(s), {outputs[0].name} ({len(usable_parts)} capture part(s)).",
                 status="Offline",
                 recording=False,
-                current_file=str(final_output),
-                file_size=file_size_text(final_output),
+                current_file=str(outputs[0]),
+                file_size=file_size_text(outputs[0]),
                 cooldown="Complete",
             )
-            logging.info("Finalized %s from %s part(s): %s", profile_id, len(parts), final_output)
+            logging.info("Finalized %s from %s part(s) (%s concat input(s)): %s", profile_id, len(usable_parts), len(concat_inputs), outputs)
         except Exception as exc:
+            # A killed/failed concat leaves a partial temp file external consumers
+            # must ignore; it is never the only copy (raw parts remain).
+            pending_plan = recording.get("publication_plan")
+            if not pending_plan:
+                try:
+                    if temporary_output.exists():
+                        temporary_output.unlink()
+                except OSError:
+                    logging.warning("Could not remove partial %s", temporary_output)
+            # Split pieces are rebuilt from the raw parts on retry; do not let
+            # them double the session's disk use while it waits.
+            shutil.rmtree(session_dir / "parameter_sets", ignore_errors=True)
+            if not pending_plan:
+                shutil.rmtree(remux_dir, ignore_errors=True)
             recording["status"] = "failed"
+            recording["finalize_attempts"] = int(recording.get("finalize_attempts") or 0) + 1
             recording["stop_reason"] = f"{reason}: {exc}"
             try:
                 self._save_recording_manifest(recording)
             except Exception:
                 logging.exception("Could not update failed recording manifest for %s", profile_id)
-            logging.exception("Could not finalize MKV session for %s", profile_id)
+            logging.exception("FINALIZE_FAILED session=%s profile=%s reason=%s", session_dir, profile_id, exc)
+            try:
+                with finalize_log.open("a", encoding="utf-8") as log:
+                    log.write(f"FINALIZE_FAILED session={session_dir} reason={exc}\n")
+            except OSError:
+                logging.warning("Could not append failure to %s", finalize_log)
             self.emit(
                 profile_id,
-                f"Recording finalization failed; raw recording parts were preserved: {exc}",
+                f"FINALIZE_FAILED session={session_dir}; raw recording parts preserved: {exc}",
                 status="Finalization failed",
                 recording=False,
                 current_file=str(session_dir),
                 cooldown="Raw parts preserved",
             )
+
+
+    def _finalize_recording_worker(self, recording, reason):
+        # A complete retained session must never produce a second publication.
+        if recording.get("status") == "complete":
+            return
+        parts = [Path(value) for value in recording.get("parts") or []]
+        base = max(30, int(self.store.settings.get("recording_finalize_timeout_seconds", 240)))
+        with finalize_budget(self._finalize_timeout(parts), base):
+            self._finalize_recording_with_budget(recording, reason)
+
 
     def _finalize_recording_session(self, profile_id, reason):
         recording = self.recordings.pop(profile_id, None)
