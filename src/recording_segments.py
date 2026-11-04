@@ -19,6 +19,9 @@ import logging
 import json
 import math
 import subprocess
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 
@@ -26,6 +29,51 @@ logger = logging.getLogger(__name__)
 
 # Classic FLV AVC codec id. Packet type 0 is the AVCDecoderConfigurationRecord.
 _AVC_CODEC_ID = 7
+
+
+class FinalizeDeadlineExceeded(RuntimeError):
+    pass
+
+
+class TimestampDiscontinuity(RuntimeError):
+    pass
+
+
+_finalize_budget = ContextVar("finalize_budget", default=None)
+
+
+class FinalizeBudget:
+    def __init__(self, seconds, base=240):
+        self.deadline = time.monotonic() + seconds
+        self.base = base
+        self.flv_analysis = {}
+
+    def remaining(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise FinalizeDeadlineExceeded("Finalize deadline exhausted; raw parts preserved")
+        return remaining
+
+    def allowance(self, paths, cap=None):
+        size = sum(Path(path).stat().st_size for path in paths)
+        allowance = self.base + size / (1 << 30) * 120
+        return min(allowance, self.remaining(), cap if cap is not None else math.inf)
+
+
+@contextmanager
+def finalize_budget(seconds, base=240):
+    budget = FinalizeBudget(seconds, base)
+    token = _finalize_budget.set(budget)
+    try:
+        yield budget
+    finally:
+        _finalize_budget.reset(token)
+
+
+def check_finalize_deadline():
+    budget = _finalize_budget.get()
+    if budget is not None:
+        budget.remaining()
 
 
 def ffmpeg_live_capture_output_args(output_path):
@@ -114,12 +162,16 @@ def probe_recording(path, ffprobe_executable, expected=None, process_kwargs=None
     path = Path(path)
     if not path.is_file() or path.stat().st_size <= 0:
         raise RuntimeError(f"Recording was not created or is empty: {path}")
+    budget = _finalize_budget.get()
     result = subprocess.run(
         [str(ffprobe_executable), "-v", "error", "-show_entries",
          "stream=codec_type:format=duration", "-of", "json", str(path)],
         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL, timeout=60, **(process_kwargs or {}),
+        stdin=subprocess.DEVNULL,
+        timeout=budget.allowance([path], cap=60) if budget else 60,
+        **(process_kwargs or {}),
     )
+    check_finalize_deadline()
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"ffprobe could not validate {path}")
     payload = json.loads(result.stdout or "{}")
@@ -141,10 +193,19 @@ def finalize_prepared_recording(ffmpeg_executable, inputs, concat_path, temporar
     file(s). All staging names end in .finalizing.mkv, including split fallback.
     Callbacks keep trusted executable resolution and platform flags in callers.
     """
+    # Standalone callers get the same total bound as the session worker.
+    if _finalize_budget.get() is None:
+        with finalize_budget(timeout):
+            return finalize_prepared_recording(
+                ffmpeg_executable, inputs, concat_path, temporary, work_dir, log,
+                validate, duration_for, expected_duration, timeout, process_kwargs)
     temporary, work_dir = Path(temporary), Path(work_dir)
     failures = []
 
-    def attempt(label, manifest, output, expected):
+    budget = _finalize_budget.get()
+
+    def attempt(label, manifest, output, expected, sources):
+        check_finalize_deadline()
         command_builder = (ffmpeg_concat_copy_command if label == "strict concat"
                            else ffmpeg_tolerant_concat_command)
         command = command_builder(ffmpeg_executable, manifest, output)
@@ -154,15 +215,22 @@ def finalize_prepared_recording(ffmpeg_executable, inputs, concat_path, temporar
             output.unlink(missing_ok=True)
             result = subprocess.run(
                 command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=log, timeout=timeout, **(process_kwargs or {}),
+                stderr=log, timeout=budget.allowance(sources), **(process_kwargs or {}),
             )
+            check_finalize_deadline()
             if result.returncode != 0:
                 raise RuntimeError(f"FFmpeg exited with code {result.returncode}")
             duration = validate(output, expected())
+            check_finalize_deadline()
             log.write(f"Verified {output.name}: {duration:.3f}s\n")
             log.flush()
             return duration
+        except (FinalizeDeadlineExceeded, TimestampDiscontinuity):
+            raise
         except Exception as exc:
+            # An OS timeout can consume all remaining time. Do not escalate
+            # after the total deadline, even if this strategy was retryable.
+            check_finalize_deadline()
             message = f"{label}: {exc}"
             failures.append(message)
             log.write(f"FAILED {message}\n")
@@ -172,17 +240,18 @@ def finalize_prepared_recording(ffmpeg_executable, inputs, concat_path, temporar
             return None
 
     for label in ("strict concat", "timestamp-tolerant concat"):
-        if attempt(label, concat_path, temporary, expected_duration) is not None:
+        if attempt(label, concat_path, temporary, expected_duration, inputs) is not None:
             return [temporary]
 
     work_dir.mkdir(parents=True, exist_ok=True)
     normalized, durations = [], []
     for index, source in enumerate(inputs, 1):
+        check_finalize_deadline()
         manifest = work_dir / "single.txt"
         manifest.write_text("ffconcat version 1.0\n" + concat_list_line(source) + "\n", encoding="utf-8")
         output = work_dir / f"part{index:04d}.finalizing.mkv"
         duration = attempt(f"normalize segment {index}/{len(inputs)}", manifest, output,
-                           lambda source=source: duration_for(source))
+                           lambda source=source: duration_for(source), [source])
         if duration is None:
             # Publishing a subset would silently lose part of the recording.
             raise RuntimeError("; ".join(failures))
@@ -193,12 +262,13 @@ def finalize_prepared_recording(ffmpeg_executable, inputs, concat_path, temporar
     manifest.write_text("ffconcat version 1.0\n" + "".join(
         concat_list_line(path) + f"\nduration {duration:.6f}\n"
         for path, duration in zip(normalized, durations)), encoding="utf-8")
-    if attempt("normalized concat", manifest, temporary, expected_duration) is not None:
+    if attempt("normalized concat", manifest, temporary, expected_duration, normalized) is not None:
         return [temporary]
 
     # Every piece was probed above. Also require collective coverage of the
     # original capture, so gaps or failed segments cannot produce false success.
     validate_recording_duration(sum(durations), expected_duration())
+    check_finalize_deadline()
     log.write(f"\n=== split fallback: {len(normalized)} verified sequential outputs ===\n")
     log.flush()
     return normalized
@@ -214,43 +284,79 @@ def flv_playback_span_ms(path):
 
 
 def _flv_media_bounds_ms(path):
+    return _analyze_flv(path)[0]
+
+
+def _analyze_flv(path):
+    """One streaming pass for preparation and duration, cached for this call.
+
+    Compare DTS per stream, not PTS (B-frame presentation order can vary).
+    Permit 250 ms of reorder jitter, unwrap a clock crossing the uint32 edge,
+    and reject other backwards epochs rather than trusting compressed min/max.
+    """
+    check_finalize_deadline()
+    path = Path(path)
+    budget = _finalize_budget.get()
     try:
-        handle = Path(path).open("rb")
+        stat = path.stat()
+        key = (path.resolve(), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        if budget and key in budget.flv_analysis:
+            return budget.flv_analysis[key]
+        handle = path.open("rb")
     except OSError:
-        return None, None
-    # Keep a histogram instead of millions of timestamps for long recordings.
+        return (None, None), False
     streams = {}
+    first_seq, needs_preparation = None, False
     with handle:
         if _read_flv_header(handle) is None:
-            return None, None
+            return (None, None), False
         for tag_type, timestamp, body in _iter_tags(handle):
+            if tag_type == 9 and (seq := _video_sequence_header(body)) is not None:
+                needs_preparation |= (_video_codec(seq) == b"hvc1" or
+                                      (first_seq is not None and seq != first_seq))
+                if first_seq is None:
+                    first_seq = seq
             if tag_type == 8 and not _is_audio_sequence_header(body):
-                pts = timestamp
+                composition = 0
             elif tag_type == 9 and _is_video_media_packet(body):
-                pts = timestamp
+                composition = 0
                 if len(body) >= 5 and not body[0] & 0x80 and body[0] & 15 == 7:
-                    pts += int.from_bytes(body[2:5], "big", signed=True)
+                    composition = int.from_bytes(body[2:5], "big", signed=True)
                 elif len(body) >= 8 and body[0] & 0x80 and body[0] & 15 == 1:
-                    pts += int.from_bytes(body[5:8], "big", signed=True)
+                    composition = int.from_bytes(body[5:8], "big", signed=True)
             else:
                 continue
-            state = streams.setdefault(tag_type, {"start": pts, "end": pts, "last": timestamp, "steps": {}})
-            step = timestamp - state["last"]
+            state = streams.get(tag_type)
+            if state is None:
+                state = streams[tag_type] = {"start": timestamp + composition,
+                    "end": timestamp + composition, "last": timestamp,
+                    "high": timestamp, "offset": 0, "steps": {}}
+            previous_raw = state["last"] - state["offset"]
+            if previous_raw >= 0xFFFF0000 and timestamp <= 0xFFFF:
+                state["offset"] += 1 << 32
+            dts = timestamp + state["offset"]
+            if dts < state["high"] - 250:
+                raise TimestampDiscontinuity(
+                    f"FLV timestamp reset in stream {tag_type}: {state['last']} -> {dts}; "
+                    f"duration is not authoritative, raw capture must be preserved: {path}")
+            pts = dts + composition
+            step = dts - state["last"]
             if step > 0:
                 state["steps"][step] = state["steps"].get(step, 0) + 1
-            state["last"] = timestamp
+            state["last"] = dts
+            state["high"] = max(state["high"], dts)
             state["start"] = min(state["start"], pts)
             state["end"] = max(state["end"], pts)
-    ends = []
-    starts = []
+    ends, starts = [], []
     for state in streams.values():
         counts = state["steps"]
         step = max(counts, key=lambda value: (counts[value], -value)) if counts else 1
         starts.append(state["start"])
         ends.append(state["end"] + step)
-    if not ends:
-        return None, None
-    return min(starts), max(ends)
+    result = ((min(starts), max(ends)) if ends else (None, None)), needs_preparation
+    if budget:
+        budget.flv_analysis[key] = result
+    return result
 
 
 def prepare_recording_parts(parts, work_dir):
@@ -268,6 +374,7 @@ def prepare_recording_parts(parts, work_dir):
     lines = ["ffconcat version 1.0"]
     root = Path(work_dir)
     for source_index, part in enumerate(sources):
+        check_finalize_deadline()
         pieces = split_flv_on_parameter_sets(part, root / f"{source_index:04d}-{part.stem}")
         if pieces == [part]:
             expanded.extend(pieces)
@@ -398,27 +505,7 @@ def split_flv_on_parameter_sets(source, directory):
 
 
 def _flv_needs_preparation(path):
-    try:
-        handle = path.open("rb")
-    except OSError:
-        return False
-    with handle:
-        if _read_flv_header(handle) is None:
-            return False
-        first = None
-        for tag_type, _timestamp, body in _iter_tags(handle):
-            if tag_type != 9:
-                continue
-            seq = _video_sequence_header(body)
-            if seq is None:
-                continue
-            if _video_codec(seq) == b"hvc1":
-                return True
-            if first is None:
-                first = seq
-            elif seq != first:
-                return True
-    return False
+    return _analyze_flv(path)[1]
 
 
 def _video_codec(sequence_header):
@@ -487,6 +574,7 @@ def _read_flv_header(handle):
 
 def _iter_tags(handle):
     while True:
+        check_finalize_deadline()
         tag_header = handle.read(11)
         if not tag_header:
             return

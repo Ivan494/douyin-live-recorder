@@ -60,6 +60,8 @@ from recording_segments import (
     finalize_prepared_recording,
     flv_playback_span_ms,
     probe_recording,
+    finalize_budget,
+    check_finalize_deadline,
     ffmpeg_live_capture_output_args,
 )
 from recording_urls import (
@@ -1420,6 +1422,7 @@ class MonitorEngine:
             "profile_url",
             "finalize_attempts",
             "final_outputs",
+            "publication_plan",
         )
         return {key: recording.get(key) for key in keys}
 
@@ -1432,6 +1435,8 @@ class MonitorEngine:
         temporary = path.with_suffix(path.suffix + ".tmp")
         with open(temporary, "w", encoding="utf-8") as fh:
             json.dump(self._manifest_payload(recording), fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
         temporary.replace(path)
 
     @staticmethod
@@ -1950,6 +1955,46 @@ class MonitorEngine:
         return base + int(size / (1 << 30) * 120)
 
     def _finalize_recording_worker(self, recording, reason):
+        # A complete retained session must never produce a second publication.
+        if recording.get("status") == "complete":
+            return
+        parts = [Path(value) for value in recording.get("parts") or []]
+        base = max(30, int(self.store.settings.get("headless_finalize_timeout_seconds", 240)))
+        with finalize_budget(self._finalize_timeout(parts), base):
+            self._finalize_recording_with_budget(recording, reason)
+
+    def _resume_recording_publication(self, recording):
+        """Roll forward exactly the verified batch saved before its first rename."""
+        plan = recording["publication_plan"]
+        parts = [Path(value) for value in recording.get("parts") or []]
+        if [list(self._recording_part_stamp(path)) for path in parts] != plan["part_stamps"]:
+            raise RuntimeError("MKV parts changed since publication plan; raw parts preserved")
+        outputs = []
+        for member in plan["members"]:
+            check_finalize_deadline()
+            source, destination = Path(member["staging"]), Path(member["destination"])
+            # Rename changes ctime on some platforms. The other identity fields
+            # distinguish a verified moved file from an older destination.
+            current = source if source.exists() else destination
+            if list(self._recording_part_stamp(current)[:4]) != member["stamp"]:
+                raise RuntimeError(f"Verified publication member changed or missing: {current}")
+            if current == source:
+                source.replace(destination)
+            outputs.append(destination)
+        check_finalize_deadline()
+        if [list(self._recording_part_stamp(path)) for path in parts] != plan["part_stamps"]:
+            raise RuntimeError("MKV parts changed during publication; raw parts preserved")
+        recording["final_outputs"] = [str(path) for path in outputs]
+        recording["status"] = "complete"
+        recording["publication_plan"] = dict(plan, state="committed")
+        try:
+            self._save_recording_manifest(recording)
+        except Exception:
+            recording["publication_plan"] = plan
+            raise
+        return outputs
+
+    def _finalize_recording_with_budget(self, recording, reason):
         final_output = Path(recording["final_output"])
         session_dir = Path(recording["session_dir"])
         parts = [Path(value) for value in recording.get("parts") or []]
@@ -1961,6 +2006,17 @@ class MonitorEngine:
         try:
             with finalize_log.open("a", encoding="utf-8") as log:
                 log.write(f"\n=== finalize call {int(recording.get('finalize_attempts') or 0) + 1}: {reason} ===\n")
+            check_finalize_deadline()
+            if recording.get("publication_plan"):
+                # Never select a new strategy while a saved batch exists.
+                outputs = self._resume_recording_publication(recording)
+                try:
+                    shutil.rmtree(session_dir)
+                except OSError:
+                    logging.warning("Could not clean up session dir %s (non-fatal)", session_dir)
+                self.emit(profile_id, f"Recording publication resumed: {len(outputs)} output(s).",
+                          status="Offline", recording=False, current_file=str(outputs[0]), cooldown="Complete")
+                return
             if not parts:
                 raise RuntimeError("No usable MKV parts")
             # Missing parts must not silently shorten the capture. A failed
@@ -1984,12 +2040,14 @@ class MonitorEngine:
                 raise RuntimeError("no usable recording parts after splitting sequence headers")
             with open(concat_path, "w", encoding="utf-8") as fh:
                 fh.write(manifest)
+            check_finalize_deadline()
             recording["status"] = "finalizing"
             recording["stop_reason"] = reason
             self._save_recording_manifest(recording)
             durations = {}
 
             def duration_for(path):
+                check_finalize_deadline()
                 if path not in durations:
                     span = flv_playback_span_ms(path)
                     durations[path] = span / 1000 if span is not None else self._validate_final_recording(path)
@@ -2011,13 +2069,19 @@ class MonitorEngine:
                 final_output.with_name(f"{final_output.stem}.part{index:02d}.mkv")
                 for index in range(1, len(staged) + 1)
             ])
-            # Each rename is atomic. If publication is interrupted halfway,
-            # retain raw parts; deterministic names let a bounded retry finish.
-            for source, destination in zip(staged, outputs):
-                source.replace(destination)
-            recording["final_outputs"] = [str(path) for path in outputs]
-            recording["status"] = "complete"
+            check_finalize_deadline()
+            recording["publication_plan"] = {
+                "state": "pending",
+                "part_stamps": [list(stamp) for stamp in stamps],
+                "members": [{"staging": str(source.resolve()),
+                             "destination": str(destination.resolve()),
+                             "stamp": list(self._recording_part_stamp(source)[:4])}
+                            for source, destination in zip(staged, outputs)],
+            }
+            # Durable gate: uploader reads this plan until the entire batch is
+            # committed. Staging files survive any later failure or process exit.
             self._save_recording_manifest(recording)
+            outputs = self._resume_recording_publication(recording)
             # FIX-H5: Move rmtree outside the critical path. If cleanup fails
             # (locked file, antivirus), the recording is still successful.
             try:
@@ -2037,15 +2101,18 @@ class MonitorEngine:
         except Exception as exc:
             # A killed/failed concat leaves a partial temp file the uploader
             # skips forever; it is never the only copy (raw parts remain).
-            try:
-                if temporary_output.exists():
-                    temporary_output.unlink()
-            except OSError:
-                logging.warning("Could not remove partial %s", temporary_output)
+            pending_plan = recording.get("publication_plan")
+            if not pending_plan:
+                try:
+                    if temporary_output.exists():
+                        temporary_output.unlink()
+                except OSError:
+                    logging.warning("Could not remove partial %s", temporary_output)
             # Split pieces are rebuilt from the raw parts on retry; do not let
             # them double the session's disk use while it waits.
             shutil.rmtree(session_dir / "parameter_sets", ignore_errors=True)
-            shutil.rmtree(remux_dir, ignore_errors=True)
+            if not pending_plan:
+                shutil.rmtree(remux_dir, ignore_errors=True)
             recording["status"] = "failed"
             recording["finalize_attempts"] = int(recording.get("finalize_attempts") or 0) + 1
             recording["stop_reason"] = f"{reason}: {exc}"

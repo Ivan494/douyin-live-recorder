@@ -32,13 +32,13 @@ def session(tmp_path, monkeypatch):
     engine.emit = Mock()
     monkeypatch.setattr(app, "resolve_ffmpeg_executable", lambda _setting: "fixture-ffmpeg")
     monkeypatch.setattr(app, "resolve_trusted_executable", lambda *_args, **_kwargs: "fixture-ffprobe")
-    root = tmp_path / ".recording_sessions" / "capture"
+    root = tmp_path / "acct" / ".recording_sessions" / "capture"
     root.mkdir(parents=True)
     parts = [root / f"part-{i}.mkv" for i in range(2)]
     for part in parts:
         part.write_bytes(b"raw media")
-    final = tmp_path / "capture.mkv"
-    temporary = tmp_path / "capture.finalizing.mkv"
+    final = tmp_path / "acct" / "capture.mkv"
+    temporary = tmp_path / "acct" / "capture.finalizing.mkv"
     recording = {"profile_id": "fixture", "final_output": str(final), "session_dir": str(root),
                  "manifest_path": str(root / "session.json"), "parts": [str(p) for p in parts]}
     calls = []
@@ -236,3 +236,80 @@ def test_transient_strict_timeout_escalates_in_same_call(session, monkeypatch):
     assert len(attempts) == 2
     assert '-xerror' in attempts[0] and '-xerror' not in attempts[1]
     assert session.final.exists() and not session.root.exists()
+
+
+@pytest.mark.parametrize('crash', [False, True])
+def test_interrupted_batch_is_gated_and_restart_finishes_same_plan(session, monkeypatch, crash):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('batch_uploader',
+        Path(__file__).resolve().parents[1] / 'uploader' / 'drive_uploader.py')
+    uploader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(uploader)
+    stages = []
+    def split(_ffmpeg, _inputs, _manifest, _temp, remux, *_args, **_kwargs):
+        # A retry must resume the batch, even if this strategy would now return
+        # a single different output. Prohibit a second ladder invocation.
+        assert not stages
+        remux.mkdir()
+        outputs = [remux / f'part{i}.finalizing.mkv' for i in (1, 2)]
+        for i, output in enumerate(outputs):
+            output.write_bytes(f'verified media {i}'.encode())
+        stages.extend(outputs)
+        return outputs
+    monkeypatch.setattr(app, 'finalize_prepared_recording', split)
+    replace = Path.replace
+    def interrupt(source, destination):
+        if Path(destination).name == 'capture.part02.mkv':
+            if crash:
+                raise KeyboardInterrupt('process exit after first rename')
+            raise PermissionError('second destination locked')
+        if Path(destination).name == 'capture.part01.mkv':
+            saved = json.loads((session.root / 'session.json').read_text())
+            assert saved['publication_plan']['state'] == 'pending'
+            assert len(saved['publication_plan']['members']) == 2
+        return replace(source, destination)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, 'replace', interrupt)
+        if crash:
+            with pytest.raises(KeyboardInterrupt):
+                session.engine._finalize_recording_worker(session.recording, 'batch')
+        else:
+            session.engine._finalize_recording_worker(session.recording, 'batch')
+    first = session.final.with_name('capture.part01.mkv')
+    second = session.final.with_name('capture.part02.mkv')
+    assert first.exists() and not second.exists()
+    assert stages[1].exists() and all(p.exists() for p in session.parts)
+    saved = json.loads((session.root / 'session.json').read_text())
+    assert saved['publication_plan']['state'] == 'pending'
+    # Actual uploader, with unrelated eligibility guards removed. The batch
+    # prefix remains ineligible after the failed worker has stopped.
+    monkeypatch.setattr(uploader, 'ROOT', session.root.parent.parent.parent)
+    monkeypatch.setattr(uploader, 'MIN_AGE', -1)
+    monkeypatch.setattr(uploader, 'open_files', lambda: set())
+    monkeypatch.setattr(uploader, 'busy_profiles', lambda: set())
+    assert uploader.candidates() == []
+    assert not uploader.upload_one(first, first.relative_to(uploader.ROOT), first.stat().st_size, False)
+    # Reload the durable manifest as the orphan sweep does, not the old dict.
+    session.engine._finalize_recording_worker(saved, 'restart')
+    assert saved['status'] == 'complete' and saved['publication_plan']['state'] == 'committed'
+    assert saved['final_outputs'] == [str(first), str(second)]
+    assert first.read_bytes() == b'verified media 0' and second.read_bytes() == b'verified media 1'
+    assert not session.final.exists() and not session.root.exists()
+    assert {p for p, _, _ in uploader.candidates()} == {first, second}
+
+
+def test_deadline_during_preparation_fails_once_with_raw_intact(session, monkeypatch):
+    import recording_segments as segments
+    now = [0.0]
+    monkeypatch.setattr(segments.time, 'monotonic', lambda: now[0])
+    def prepare(*_args):
+        now[0] = 241.0
+        segments.check_finalize_deadline()
+    monkeypatch.setattr(app, 'prepare_recording_parts', prepare)
+    session.engine._finalize_recording_worker(session.recording, 'deadline')
+    assert_preserved(session)
+    assert session.recording['finalize_attempts'] == 1
+    assert not session.calls
+    assert all(p.read_bytes() == b'raw media' for p in session.parts)
+    log = (session.root / 'finalize.log').read_text()
+    assert log.count('FINALIZE_FAILED') == 1 and 'deadline exhausted' in log

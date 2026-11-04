@@ -107,7 +107,22 @@ def file_stamp(path):
 
 def is_busy_live(path, rel, busy):
     return (path.suffix.lower() in VIDEO and "stories" not in rel.parts
-            and ("*" in busy or rel.parts[0] in busy))
+            and ("*" in busy or rel.parts[0] in busy or publication_pending(path)))
+
+
+def publication_pending(path):
+    """A renamed batch prefix remains private until its session commits."""
+    for manifest in (path.parent / ".recording_sessions").glob("*/session.json"):
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8-sig"))
+            plan = payload.get("publication_plan")
+            if plan and plan.get("state") != "committed":
+                if any(Path(member["destination"]) == path.resolve() for member in plan["members"]):
+                    return True
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            # Unreadable state cannot establish safe batch completion.
+            return True
+    return False
 
 
 def candidates():

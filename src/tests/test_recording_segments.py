@@ -764,3 +764,23 @@ def test_real_multi_track_input_publishes_one_video_and_audio(tmp_path):
         assert sorted(s['codec_type'] for s in json.loads(result.stdout)['streams']) == ['audio', 'video']
         assert len(_frame_fingerprints(ffmpeg, output)) == 5
         _assert_silent_full_decode(ffmpeg, output)
+
+
+@pytest.mark.parametrize('stream', [8, 9])
+def test_timestamp_reset_detection_is_per_stream_and_wrap_is_unwrapped(tmp_path, stream):
+    from recording_segments import TimestampDiscontinuity
+    path = tmp_path / 'epochs.flv'
+    body = b'\xaf\x01data' if stream == 8 else _video_nalu(b'frame')
+    path.write_bytes(_flv([(stream, ts, body) for ts in
+                          (0xFFFFFFB0, 0xFFFFFFD8, 0, 40)]))
+    assert flv_playback_span_ms(path) == 160
+    path.write_bytes(_flv([(stream, ts, body) for ts in (0, 40, 80, 1000, 0, 40)]))
+    with pytest.raises(TimestampDiscontinuity, match='not authoritative'):
+        flv_playback_span_ms(path)
+
+
+def test_pts_reordering_and_small_dts_jitter_are_not_clock_resets(tmp_path):
+    path = tmp_path / 'jitter.flv'
+    path.write_bytes(_flv([(9, ts, bytes((0x17, 1)) + cts.to_bytes(3, 'big', signed=True) + b'frame')
+                          for ts, cts in [(0, 80), (40, 0), (20, -20), (80, 0), (120, 0)]]))
+    assert flv_playback_span_ms(path) == 160

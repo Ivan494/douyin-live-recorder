@@ -395,3 +395,21 @@ def test_main_reports_lsof_failure_without_uploading(sandbox, drive, monkeypatch
     monkeypatch.setattr(uploader.sys, "argv", ["drive_uploader.py"])
     assert uploader.main() == 1
     assert path.exists() and not drive.calls
+
+
+@pytest.mark.parametrize('state', ['pending', 'committed', 'unreadable'])
+def test_publication_plan_gates_split_members_after_worker_exit(sandbox, drive, state):
+    first = sandbox.make_file('acct/capture.part01.mkv')
+    second = sandbox.make_file('acct/capture.part02.mkv')
+    unrelated = sandbox.make_file('acct/other.mkv')
+    manifest = first.parent / '.recording_sessions' / 'capture' / 'session.json'
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text('{torn' if state == 'unreadable' else json.dumps({
+        'publication_plan': {'state': state, 'members': [
+            {'destination': str(first)}, {'destination': str(second)}]}}))
+    found = {p for p, _, _ in uploader.candidates()}
+    assert found == ({first, second, unrelated} if state == 'committed' else
+                     {unrelated} if state == 'pending' else set())
+    if state != 'committed':
+        assert upload(first, sandbox) is False
+        assert not drive.calls and first.exists()
