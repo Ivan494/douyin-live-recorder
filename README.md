@@ -15,7 +15,7 @@ Cookie），因此不会把你已经打开的抖音网页挤下线。
 
 ## 下载
 
-到 [Releases](https://github.com/Ivan494/douyin-live-recorder/releases) 下载最新的
+到 [最新发布](https://github.com/Ivan494/douyin-live-recorder/releases/latest) 下载
 `DouyinLiveRecorder-vX.Y.Z-win64.zip`。解压到任意目录，运行
 `DouyinLiveRecorder.exe`。已内置 Python 和 ffmpeg，不用再装别的。
 只有使用 YouTube 直播资料时才需要另行配置 yt-dlp；抖音功能无需它。
@@ -117,10 +117,11 @@ python -m pytest src/tests
 
 ```text
 pip install -r requirements-release.txt
-pwsh ./scripts/build_release.ps1 -Version 1.2.14 -FfmpegDir <含 ffmpeg.exe 和 ffprobe.exe 的目录>
+pwsh ./scripts/build_release.ps1 -FfmpegDir <含 ffmpeg.exe 和 ffprobe.exe 的目录>
 ```
 
-推送 `v*` 标签会在 GitHub Actions 上走同样的打包流程。
+版本统一记录在 `VERSION`。推送相同版本的 `vX.Y.Z` 标签会在 GitHub Actions 上走
+同样的打包流程并发布；手动运行工作流只构建验证，不发布。
 
 发布包未签名；解压后的离线自检不能证明 Windows 智能应用控制会放行。
 从源码运行需要自己安装 Python 和 FFmpeg，也不能保证避开该拦截。
@@ -153,7 +154,7 @@ monitoring does not kick an already-open Douyin session.
 ## Download
 
 Grab the latest `DouyinLiveRecorder-vX.Y.Z-win64.zip` from
-[Releases](https://github.com/Ivan494/douyin-live-recorder/releases).
+[latest release](https://github.com/Ivan494/douyin-live-recorder/releases/latest).
 Unzip anywhere and run `DouyinLiveRecorder.exe`. Python and ffmpeg are
 bundled; nothing else to install.
 yt-dlp is only needed for YouTube live profiles and must be configured separately.
@@ -264,10 +265,11 @@ python -m pytest src/tests
 
 ```text
 pip install -r requirements-release.txt
-pwsh ./scripts/build_release.ps1 -Version 1.2.14 -FfmpegDir <folder-with-ffmpeg.exe>
+pwsh ./scripts/build_release.ps1 -FfmpegDir <folder-with-ffmpeg.exe>
 ```
 
-Pushing a `v*` tag runs the same packaging on GitHub Actions.
+`VERSION` is the release version. Pushing its matching `vX.Y.Z` tag builds and
+publishes the package on GitHub Actions. Manual workflow runs only validate a build.
 
 Release ZIPs are unsigned. The extracted-package self-test does not establish
 Smart App Control compatibility. Running from source requires your own Python

@@ -1,12 +1,16 @@
 param(
-    [string]$Version = "1.2.14",
+    [string]$Version,
     [Parameter(Mandatory = $true)][string]$FfmpegDir,
     [string]$Python = "python"
 )
 $ErrorActionPreference = "Stop"
+$root = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$sourceVersion = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim()
+if ($sourceVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid VERSION file.' }
+if (!$Version) { $Version = $sourceVersion }
 $Version = $Version.TrimStart("vV")
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Version must be X.Y.Z.' }
-$root = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+if ($Version -ne $sourceVersion) { throw 'Version differs from VERSION.' }
 $src = Join-Path $root 'src'
 $dist = Join-Path $root 'dist'
 $staging = Join-Path $dist "DouyinLiveRecorder-v$Version-win64"

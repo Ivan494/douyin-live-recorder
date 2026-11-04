@@ -1,18 +1,19 @@
 ## 下载与启动
 
-下载本页的 `DouyinLiveRecorder-v@VERSION@-win64.zip`，完整解压后双击根目录的 `DouyinLiveRecorder.exe`。便携包内置 Python 运行时、FFmpeg 和 FFprobe。抖音功能无需 yt-dlp；YouTube 直播需自行配置可信的 yt-dlp。浏览器登录与回退功能需要本机安装 Microsoft Edge。
+下载本页的 `DouyinLiveRecorder-v@VERSION@-win64.zip`，完整解压后双击根目录的 `DouyinLiveRecorder.exe`。便携包内置 Python 运行时、FFmpeg 和 FFprobe，无需另装 Python。登录与浏览器回退功能需要本机安装 Microsoft Edge；YouTube 直播需要自行配置可信的 yt-dlp。
 
 ## 本次更新
 
-- 补齐 v1.2.13 的回归审计发现：历史归档查询成功时，也必须查询并合并刷新视图，避免遗漏仅由刷新视图返回的日常。
-- 两种历史视图以轮转方式共享每轮 15 次请求额度，分别保存游标及完成状态；一条未完成或失败的视图不会被另一条成功视图覆盖。
-- 安全重新验证旧版无法确认所属视图的历史进度，保留已明确的归档进度、作品续扫游标和已下载文件记录。升级后的第一次历史扫描可能需要重新遍历；两种视图都有大量分页时，会在相同请求上限下分多轮完成。
-- 保留超过 20 条日常的目录分页、作者核对、去重、重启续扫，以及 H.264 / HEVC 直播封装功能。
+- 修复重连分段交界处时间戳轻微倒退导致最终封装反复失败的问题。仍先尝试严格无损合并，再按顺序尝试容错合并、分段整理及按顺序编号的多个 MKV。
+- 发布前检查媒体轨道及完整时长，所有封装步骤共享总时限，并检查临时文件所需空间。失败或原始分段发生变化时保留原始录制，不把过短或不完整的结果当作成功。
+- 最终文件发布中断后可从已验证的进度继续，不重复封装、不覆盖已有录制；Windows 发布不依赖硬链接，可用于不支持硬链接的移动存储。
+- 命令行值守录制使用相同的最终封装流程，重启时恢复保存的录制任务；发现仍在写入的旧录制进程时，等待它结束后再处理，避免截断或重复录制。
+- 保留历史归档与刷新视图合并、分页续扫，以及 H.264 / HEVC 参数变化时的画面和音视频时间线。
 
-本次更新来自 [#21](https://github.com/Ivan494/douyin-live-recorder/pull/21)，继续处理 [#19](https://github.com/Ivan494/douyin-live-recorder/issues/19)。Windows 完整验证通过 591 个测试及 8 个子测试、三种启动器诊断检查。与 v1.2.9 / v1.2.12 / v1.2.13 的 24 种独立响应组合比较后，不再丢失此前可取得的条目；两次只读实测均取全 37 条目录。另有长分页、轮转预算、JSON 重载和三种旧状态格式的测试。问题报告人的具体主页仍待本人确认。
+录制修复来自 [#23](https://github.com/Ivan494/douyin-live-recorder/pull/23)。发布构建运行完整回归测试、三种启动器诊断检查，并在中文及空格路径中解压后运行实际 EXE 的离线自检。H.264 / HEVC 合成素材逐帧验证各 16 帧；日常归档及刷新两种模式也通过合成检查。历史日常问题 [#19](https://github.com/Ivan494/douyin-live-recorder/issues/19) 仍等待报告人确认其具体主页。
 
-便携 EXE 离线自检现在要求额外的“仅刷新可见”条目也被保留（合成归档场景 4 条、刷新场景 2 条），并保留 H.264 / HEVC 实际封装及逐帧校验。发布构建使用经 SHA-256 校验的 FFmpeg 8.1.2；包内附有 `release-manifest.json`，本页附有 `SHA256SUMS.txt`。
+发布构建使用经 SHA-256 校验的 FFmpeg 8.1.2。包内附有 `release-manifest.json`，本页附有 `SHA256SUMS.txt`。
 
-**本压缩包未做 Windows 代码签名。** Windows 智能应用控制仍可能阻止启动；[#11](https://github.com/Ivan494/douyin-live-recorder/issues/11) 尚未解决。
+**本压缩包未做 Windows 代码签名。** Windows 智能应用控制仍可能阻止启动；[#11](https://github.com/Ivan494/douyin-live-recorder/issues/11) 尚未解决。离线自检通过不代表该功能放行。
 
-请在直播结束、旧程序停止后升级。保留旧安装目录，把新版解压到新目录，迁移自己的配置和录制文件；不要用新版空白 `profiles.json`、`settings.json` 覆盖个人配置。登录态使用本机 Windows DPAPI 加密，换电脑后请重新登录。
+请在直播结束、旧程序停止后升级。保留旧安装目录，把新版解压到新目录，再迁移自己的配置、登录文件、录制文件及各输出目录中的 `douyin_media_state.json` 下载记录。不要用新版空白 `profiles.json`、`settings.json` 覆盖个人配置。登录态使用本机 Windows DPAPI 加密，换电脑或 Windows 用户后请重新登录。

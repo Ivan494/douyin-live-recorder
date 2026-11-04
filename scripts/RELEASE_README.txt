@@ -9,8 +9,12 @@
 录制文件保存在 douyindownload 下。不要把这些个人文件上传到 GitHub。
 登录态使用 Windows DPAPI 加密，不能当作可跨电脑使用的登录备份。
 
+直播结束后先尝试无损封装成一个 MKV；无法安全合并时，可能生成按顺序编号的多个 MKV。
+失败时原始录制保留在对应目录的 .recording_sessions 中，不要手动删除。
+
 升级：先保留旧目录和录制文件，将新版解压到另一个新目录。
-停止旧程序后，可复制自己的 profiles.json、settings.json 和录制文件。
+直播结束并停止旧程序后，可迁移自己的配置、登录文件、录制文件和各目录的
+douyin_media_state.json 下载记录；登录文件仅限原 Windows 用户在原电脑上使用。
 不要直接覆盖正在录制的安装目录；不要把空白模板覆盖到自己的配置上。
 
 压缩包附带 release-manifest.json；发布页面提供 SHA256SUMS.txt。

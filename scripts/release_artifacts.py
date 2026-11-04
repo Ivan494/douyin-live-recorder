@@ -38,6 +38,7 @@ def validate_defaults(profiles, settings):
 
 
 def verify_source():
+    version_value((ROOT / "VERSION").read_text(encoding="utf-8").strip())
     validate_defaults(json.loads((ROOT / "src/profiles.json").read_text(encoding="utf-8-sig")),
                       json.loads((ROOT / "src/settings.json").read_text(encoding="utf-8-sig")))
     # Only tracked repository material is considered for publication.
