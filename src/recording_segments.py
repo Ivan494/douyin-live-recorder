@@ -16,6 +16,9 @@ across parameter changes and preserve the encoded media without re-encoding.
 from __future__ import annotations
 
 import logging
+import json
+import math
+import subprocess
 from pathlib import Path
 
 
@@ -82,6 +85,123 @@ def ffmpeg_concat_copy_command(ffmpeg_executable, concat_path, output_path):
 def concat_list_line(path):
     normalized = Path(path).resolve().as_posix().replace("'", "'\\''")
     return "file '" + normalized + "'"
+
+
+def ffmpeg_tolerant_concat_command(ffmpeg_executable, concat_path, output_path):
+    """Let the muxer repair backwards DTS, retaining the strict stream maps."""
+    command = ffmpeg_concat_copy_command(ffmpeg_executable, concat_path, output_path)
+    command.remove("-xerror")
+    # Input flags must precede -i. Do not discard valid B-frame DTS: igndts
+    # caused repeated timestamps throughout the real incident's second input.
+    command[command.index("-f"):command.index("-f")] = ["-fflags", "+genpts"]
+    return command
+
+
+def validate_recording_duration(duration, expected=None):
+    if not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError("Recording has no finite positive duration")
+    if expected is not None:
+        if not math.isfinite(expected) or expected <= 0:
+            raise RuntimeError("Input recording has no finite positive duration")
+        # A little container/frame padding is normal for very short clips.
+        if duration < expected * 0.97 or duration > max(expected * 1.03, expected + 0.25):
+            raise RuntimeError(f"Recording duration {duration:.3f}s differs from expected {expected:.3f}s")
+    return duration
+
+
+def probe_recording(path, ffprobe_executable, expected=None, process_kwargs=None):
+    """Require media and a plausible duration before any publication/cleanup."""
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise RuntimeError(f"Recording was not created or is empty: {path}")
+    result = subprocess.run(
+        [str(ffprobe_executable), "-v", "error", "-show_entries",
+         "stream=codec_type:format=duration", "-of", "json", str(path)],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL, timeout=60, **(process_kwargs or {}),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"ffprobe could not validate {path}")
+    payload = json.loads(result.stdout or "{}")
+    if not any(s.get("codec_type") in {"audio", "video"} for s in payload.get("streams") or []):
+        raise RuntimeError(f"Recording contains no audio or video streams: {path}")
+    try:
+        duration = float(payload.get("format", {}).get("duration", "nan"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Recording duration is unavailable: {path}") from exc
+    return validate_recording_duration(duration, expected)
+
+
+def finalize_prepared_recording(ffmpeg_executable, inputs, concat_path, temporary,
+                                work_dir, log, validate, duration_for, expected_duration,
+                                timeout=240, process_kwargs=None):
+    """Bounded stream-copy ladder; return verified staging files, never raw files.
+
+    The caller checks raw-part stamps and atomically publishes the returned
+    file(s). All staging names end in .finalizing.mkv, including split fallback.
+    Callbacks keep trusted executable resolution and platform flags in callers.
+    """
+    temporary, work_dir = Path(temporary), Path(work_dir)
+    failures = []
+
+    def attempt(label, manifest, output, expected):
+        command_builder = (ffmpeg_concat_copy_command if label == "strict concat"
+                           else ffmpeg_tolerant_concat_command)
+        command = command_builder(ffmpeg_executable, manifest, output)
+        log.write(f"\n=== {label} ===\n{json.dumps(command, ensure_ascii=False)}\n")
+        log.flush()
+        try:
+            output.unlink(missing_ok=True)
+            result = subprocess.run(
+                command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=log, timeout=timeout, **(process_kwargs or {}),
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"FFmpeg exited with code {result.returncode}")
+            duration = validate(output, expected())
+            log.write(f"Verified {output.name}: {duration:.3f}s\n")
+            log.flush()
+            return duration
+        except Exception as exc:
+            message = f"{label}: {exc}"
+            failures.append(message)
+            log.write(f"FAILED {message}\n")
+            log.flush()
+            logger.warning("Finalize strategy failed: %s", message)
+            output.unlink(missing_ok=True)
+            return None
+
+    for label in ("strict concat", "timestamp-tolerant concat"):
+        if attempt(label, concat_path, temporary, expected_duration) is not None:
+            return [temporary]
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    normalized, durations = [], []
+    for index, source in enumerate(inputs, 1):
+        manifest = work_dir / "single.txt"
+        manifest.write_text("ffconcat version 1.0\n" + concat_list_line(source) + "\n", encoding="utf-8")
+        output = work_dir / f"part{index:04d}.finalizing.mkv"
+        duration = attempt(f"normalize segment {index}/{len(inputs)}", manifest, output,
+                           lambda source=source: duration_for(source))
+        if duration is None:
+            # Publishing a subset would silently lose part of the recording.
+            raise RuntimeError("; ".join(failures))
+        normalized.append(output)
+        durations.append(duration)
+
+    manifest = work_dir / "normalized.txt"
+    manifest.write_text("ffconcat version 1.0\n" + "".join(
+        concat_list_line(path) + f"\nduration {duration:.6f}\n"
+        for path, duration in zip(normalized, durations)), encoding="utf-8")
+    if attempt("normalized concat", manifest, temporary, expected_duration) is not None:
+        return [temporary]
+
+    # Every piece was probed above. Also require collective coverage of the
+    # original capture, so gaps or failed segments cannot produce false success.
+    validate_recording_duration(sum(durations), expected_duration())
+    log.write(f"\n=== split fallback: {len(normalized)} verified sequential outputs ===\n")
+    log.flush()
+    return normalized
 
 
 def flv_playback_span_ms(path):

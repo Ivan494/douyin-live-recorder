@@ -46,10 +46,15 @@ def session(tmp_path, monkeypatch):
     def run(args, **_kwargs):
         calls.append(args)
         if args[0] == "fixture-ffmpeg":
-            temporary.write_bytes(b"remuxed media")
+            Path(args[-1]).write_bytes(b"remuxed media")
             return subprocess.CompletedProcess(args, 0)
         assert args[0] == "fixture-ffprobe", args
-        return subprocess.CompletedProcess(args, 0, json.dumps({"streams": [{"codec_type": "video"}, {"codec_type": "audio"}]}), "")
+        duration = (sum(p.stat().st_size > 0 for p in parts)
+                    if Path(args[-1]) == temporary else 1)
+        return subprocess.CompletedProcess(args, 0, json.dumps({
+            "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
+            "format": {"duration": str(duration)},
+        }), "")
 
     monkeypatch.setattr(app.subprocess, "run", run)
     return SimpleNamespace(engine=engine, root=root, parts=parts, final=final,
@@ -101,7 +106,7 @@ def test_failed_remux_or_probe_never_deletes_raw_parts(session, monkeypatch, fai
                 return subprocess.CompletedProcess(args, 1)
             result = session.run(args, **kwargs)
             if failure == "empty-output":
-                session.temporary.write_bytes(b"")
+                Path(args[-1]).write_bytes(b"")
             return result
         if failure == "probe-error":
             return subprocess.CompletedProcess(args, 1, "", "invalid MKV")
@@ -215,3 +220,19 @@ def test_crash_during_concat_preserves_raw_and_can_retry(session, monkeypatch):
     assert json.loads((session.root / "session.json").read_text())["status"] == "finalizing"
     session.engine._finalize_recording_worker(session.recording, "retry")
     assert session.final.read_bytes() == b"remuxed media" and not session.root.exists()
+
+
+def test_transient_strict_timeout_escalates_in_same_call(session, monkeypatch):
+    attempts = []
+    def run(args, **kwargs):
+        if args[0] == 'fixture-ffmpeg':
+            attempts.append(args)
+            if len(attempts) == 1:
+                raise subprocess.TimeoutExpired(args, 30)
+        return session.run(args, **kwargs)
+    monkeypatch.setattr(app.subprocess, 'run', run)
+    session.engine._finalize_recording_worker(session.recording, 'transient timeout')
+    assert session.recording['status'] == 'complete'
+    assert len(attempts) == 2
+    assert '-xerror' in attempts[0] and '-xerror' not in attempts[1]
+    assert session.final.exists() and not session.root.exists()

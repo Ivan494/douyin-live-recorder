@@ -57,7 +57,9 @@ from lookup_resilience import LOOKUP_DEFAULTS, LookupDeferred
 from recording_segments import (
     concat_list_line,
     prepare_recording_parts,
-    ffmpeg_concat_copy_command,
+    finalize_prepared_recording,
+    flv_playback_span_ms,
+    probe_recording,
     ffmpeg_live_capture_output_args,
 )
 from recording_urls import (
@@ -1417,6 +1419,7 @@ class MonitorEngine:
             "segment_started_at",
             "profile_url",
             "finalize_attempts",
+            "final_outputs",
         )
         return {key: recording.get(key) for key in keys}
 
@@ -1915,7 +1918,7 @@ class MonitorEngine:
     def _concat_file_line(path):
         return concat_list_line(path)
 
-    def _validate_final_recording(self, path):
+    def _validate_final_recording(self, path, expected=None):
         probe_setting = self.store.settings.get("ffprobe_path") or str(DEFAULT_FFPROBE_PATH)
         try:
             probe_path = resolve_trusted_executable(
@@ -1923,36 +1926,9 @@ class MonitorEngine:
                 allowed_basenames={"ffprobe.exe"} if os.name == "nt" else {"ffprobe"},
                 trusted_roots=_trusted_tool_roots(),
             )
-        except ValueError:
-            probe_path = ""
-        if not path.exists() or path.stat().st_size <= 0:
-            raise RuntimeError("Final MKV was not created or is empty")
-        if not probe_path:
-            raise RuntimeError("FFprobe is unavailable; raw MKV parts cannot be safely removed")
-        result = subprocess.run(
-            [
-                probe_path,
-                "-v",
-                "error",
-                "-show_entries",
-                "stream=codec_type",
-                "-of",
-                "json",
-                str(path),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            timeout=60,
-            **hidden_subprocess_kwargs(),
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "ffprobe could not validate the final MKV")
-        payload = json.loads(result.stdout or "{}")
-        stream_types = {item.get("codec_type") for item in payload.get("streams") or []}
-        if not stream_types.intersection({"audio", "video"}):
-            raise RuntimeError("Final MKV contains no audio or video streams")
+        except ValueError as exc:
+            raise RuntimeError("FFprobe is unavailable; raw parts cannot be safely removed") from exc
+        return probe_recording(path, probe_path, expected, hidden_subprocess_kwargs())
 
     @staticmethod
     def _recording_part_stamp(path):
@@ -1981,7 +1957,10 @@ class MonitorEngine:
         concat_path = session_dir / "parts.txt"
         temporary_output = final_output.with_name(final_output.stem + ".finalizing.mkv")
         finalize_log = session_dir / "finalize.log"
+        remux_dir = session_dir / "finalize_remux"
         try:
+            with finalize_log.open("a", encoding="utf-8") as log:
+                log.write(f"\n=== finalize call {int(recording.get('finalize_attempts') or 0) + 1}: {reason} ===\n")
             if not parts:
                 raise RuntimeError("No usable MKV parts")
             # Missing parts must not silently shorten the capture. A failed
@@ -2008,28 +1987,35 @@ class MonitorEngine:
             recording["status"] = "finalizing"
             recording["stop_reason"] = reason
             self._save_recording_manifest(recording)
-            command = ffmpeg_concat_copy_command(
-                resolve_ffmpeg_executable(self.store.settings["ffmpeg_path"]),
-                concat_path,
-                temporary_output,
-            )
-            with open(finalize_log, "w", encoding="utf-8") as log_handle:
-                result = subprocess.run(
-                    command,
-                    cwd=str(session_dir),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=log_handle,
-                    timeout=self._finalize_timeout(usable_parts) if HEADLESS else None,
-                    **hidden_subprocess_kwargs(),
+            durations = {}
+
+            def duration_for(path):
+                if path not in durations:
+                    span = flv_playback_span_ms(path)
+                    durations[path] = span / 1000 if span is not None else self._validate_final_recording(path)
+                return durations[path]
+
+            with finalize_log.open("a", encoding="utf-8") as log_handle:
+                staged = finalize_prepared_recording(
+                    resolve_ffmpeg_executable(self.store.settings["ffmpeg_path"]),
+                    concat_inputs, concat_path, temporary_output, remux_dir, log_handle,
+                    self._validate_final_recording, duration_for,
+                    lambda: sum(duration_for(path) for path in usable_parts),
+                    timeout=self._finalize_timeout(usable_parts),
+                    process_kwargs=hidden_subprocess_kwargs(),
                 )
-            if result.returncode != 0:
-                raise RuntimeError(f"FFmpeg concat exited with code {result.returncode}")
-            self._validate_final_recording(temporary_output)
             if [self._recording_part_stamp(path) for path in parts] != stamps:
                 raise RuntimeError("MKV parts changed during finalization; raw parts preserved")
             final_output.parent.mkdir(parents=True, exist_ok=True)
-            temporary_output.replace(final_output)
+            outputs = ([final_output] if staged == [temporary_output] else [
+                final_output.with_name(f"{final_output.stem}.part{index:02d}.mkv")
+                for index in range(1, len(staged) + 1)
+            ])
+            # Each rename is atomic. If publication is interrupted halfway,
+            # retain raw parts; deterministic names let a bounded retry finish.
+            for source, destination in zip(staged, outputs):
+                source.replace(destination)
+            recording["final_outputs"] = [str(path) for path in outputs]
             recording["status"] = "complete"
             self._save_recording_manifest(recording)
             # FIX-H5: Move rmtree outside the critical path. If cleanup fails
@@ -2040,14 +2026,14 @@ class MonitorEngine:
                 logging.warning("Could not clean up session dir %s (non-fatal)", session_dir)
             self.emit(
                 profile_id,
-                f"Recording finalized: {final_output.name} ({len(usable_parts)} part{'s' if len(usable_parts) != 1 else ''}).",
+                f"Recording finalized: {len(outputs)} output(s), {outputs[0].name} ({len(usable_parts)} capture part(s)).",
                 status="Offline",
                 recording=False,
-                current_file=str(final_output),
-                file_size=file_size_text(final_output),
+                current_file=str(outputs[0]),
+                file_size=file_size_text(outputs[0]),
                 cooldown="Complete",
             )
-            logging.info("Finalized %s from %s part(s) (%s concat input(s)): %s", profile_id, len(usable_parts), len(concat_inputs), final_output)
+            logging.info("Finalized %s from %s part(s) (%s concat input(s)): %s", profile_id, len(usable_parts), len(concat_inputs), outputs)
         except Exception as exc:
             # A killed/failed concat leaves a partial temp file the uploader
             # skips forever; it is never the only copy (raw parts remain).
@@ -2059,6 +2045,7 @@ class MonitorEngine:
             # Split pieces are rebuilt from the raw parts on retry; do not let
             # them double the session's disk use while it waits.
             shutil.rmtree(session_dir / "parameter_sets", ignore_errors=True)
+            shutil.rmtree(remux_dir, ignore_errors=True)
             recording["status"] = "failed"
             recording["finalize_attempts"] = int(recording.get("finalize_attempts") or 0) + 1
             recording["stop_reason"] = f"{reason}: {exc}"
@@ -2066,10 +2053,15 @@ class MonitorEngine:
                 self._save_recording_manifest(recording)
             except Exception:
                 logging.exception("Could not update failed recording manifest for %s", profile_id)
-            logging.exception("Could not finalize MKV session for %s", profile_id)
+            logging.exception("FINALIZE_FAILED session=%s profile=%s reason=%s", session_dir, profile_id, exc)
+            try:
+                with finalize_log.open("a", encoding="utf-8") as log:
+                    log.write(f"FINALIZE_FAILED session={session_dir} reason={exc}\n")
+            except OSError:
+                logging.warning("Could not append failure to %s", finalize_log)
             self.emit(
                 profile_id,
-                f"Recording finalization failed; raw recording parts were preserved: {exc}",
+                f"FINALIZE_FAILED session={session_dir}; raw recording parts preserved: {exc}",
                 status="Finalization failed",
                 recording=False,
                 current_file=str(session_dir),

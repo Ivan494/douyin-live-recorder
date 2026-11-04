@@ -200,8 +200,9 @@ class HeadlessMonitorEngine(app.MonitorEngine):
     MAX_FINALIZE_ATTEMPTS = 3
 
     def _finalize_space_needed(self, recording):
-        # FLV parts whose sequence header changes (PK) are split into a second
-        # copy before the MKV concat, so peak use can be 2x those parts + MKV.
+        # Peak additional space: prepared FLVs + normalized MKVs + one concat
+        # (or the sequential outputs). Failed concat candidates are unlinked
+        # before escalating. Reserve 20% for container overhead as well.
         flv = 0
         for value in recording.get("parts") or []:
             try:
@@ -209,7 +210,7 @@ class HeadlessMonitorEngine(app.MonitorEngine):
                     flv += Path(value).stat().st_size
             except OSError:
                 continue
-        return self._parts_size(recording) + flv + self.disk.critical
+        return int((2 * self._parts_size(recording) + flv) * 1.2) + self.disk.critical
 
     @classmethod
     def _should_retry_finalize(cls, manifest):
