@@ -1,24 +1,23 @@
 import argparse
 import asyncio
+import io
 import json
 import logging
 import os
 import re
-import shutil
+import shlex
 import signal
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+import queue
 
 from streamget.platforms.douyin.live_stream import DouyinLiveStream
 
-from recording_segments import (
-    prepare_recording_parts,
-    ffmpeg_concat_copy_command,
-    ffmpeg_live_capture_output_args,
-)
+from recording_segments import ffmpeg_live_capture_output_args
 from recording_urls import (
     ffmpeg_live_input_options,
     has_recording_url,
@@ -169,33 +168,111 @@ def _hidden_process_kwargs():
 
 
 def _remux_capture(ffmpeg_path, capture_file, output_file, logger, stderr_file):
-    """Publish a finished MKV from an FLV capture, splitting on sequence headers."""
-    work_dir = capture_file.with_name(capture_file.stem + ".segments")
-    _parts, manifest = prepare_recording_parts([capture_file], work_dir)
+    """Use the recorder's validated, resumable publication before raw cleanup."""
+    from douyin_recorder_app import MonitorEngine
+
+    work_dir = capture_file.parent
+    if work_dir.parent.name != ".recording_sessions":
+        raise RuntimeError("Watcher captures must remain inside their recording session")
     work_dir.mkdir(parents=True, exist_ok=True)
-    concat_path = work_dir / "parts.txt"
-    concat_path.write_text(manifest, encoding="utf-8")
-    temporary = output_file.with_name(output_file.stem + ".finalizing.mkv")
-    command = ffmpeg_concat_copy_command(ffmpeg_path, concat_path, temporary)
+    manifest_path = work_dir / "session.json"
+    recording = MonitorEngine._read_recording_manifest(manifest_path)
+    if recording is None:
+        recording = {
+            "profile_id": "watcher", "final_output": str(output_file),
+            "session_dir": str(work_dir), "manifest_path": str(manifest_path),
+            "parts": [str(capture_file)],
+        }
+    elif (Path(recording.get("final_output", "")) != output_file
+          or recording.get("parts") != [str(capture_file)]):
+        raise RuntimeError("Saved watcher publication belongs to a different capture")
+    ffmpeg = Path(ffmpeg_path)
+    ffprobe = ffmpeg.with_name("ffprobe" + ffmpeg.suffix)
+    engine = MonitorEngine(SimpleNamespace(settings={
+        "ffmpeg_path": str(ffmpeg), "ffprobe_path": str(ffprobe),
+    }), queue.Queue())
     stderr_file.write(f"\n=== remux {capture_file.name} -> {output_file.name} ===\n")
     stderr_file.flush()
+    engine._finalize_recording_worker(recording, "Watcher capture ended")
+    if recording.get("status") != "complete":
+        raise RuntimeError(recording.get("stop_reason") or "Recording finalization failed")
+    logger.info("Recording remuxed: %s", recording.get("final_outputs") or [str(output_file)])
+
+
+def _watcher_capture_processes():
+    """Inspect writers; an unsuccessful scan must never imply an idle capture."""
     result = subprocess.run(
-        command,
-        cwd=str(output_file.parent),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_file,
-        text=True,
-        check=False,
+        ["powershell", "-NoProfile", "-Command",
+         "$ErrorActionPreference='Stop'; "
+         "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+         "@(Get-CimInstance Win32_Process -Filter \"Name = 'ffmpeg.exe'\" | "
+         "Select-Object ProcessId,CommandLine) | ConvertTo-Json -Compress"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+        text=True, encoding="utf-8", errors="replace", timeout=10,
         **_hidden_process_kwargs(),
     )
-    if result.returncode != 0 or not temporary.exists() or temporary.stat().st_size <= 0:
-        temporary.unlink(missing_ok=True)
-        raise RuntimeError(f"FFmpeg remux exited with code {result.returncode}")
-    temporary.replace(output_file)
-    shutil.rmtree(work_dir, ignore_errors=True)
-    capture_file.unlink(missing_ok=True)
-    logger.info("Recording remuxed: %s", output_file)
+    if result.returncode:
+        raise RuntimeError("Could not establish whether saved captures are still running")
+    processes = json.loads(result.stdout or "[]")
+    if isinstance(processes, dict):
+        processes = [processes]
+    if not isinstance(processes, list) or any(not p.get("CommandLine") for p in processes):
+        raise RuntimeError("A capture process could not be inspected")
+    return processes
+
+
+def _watcher_session_has_writer(recording, processes):
+    from douyin_recorder_app import pid_is_running as process_is_running
+
+    if process_is_running(recording.get("capture_pid"),
+                          not_started_after=recording.get("capture_started_at")):
+        return True
+    parts = {os.path.normcase(str(Path(part).resolve())) for part in recording["parts"]}
+    for process in processes:
+        arguments = shlex.split(process["CommandLine"], posix=False)
+        if arguments and os.path.normcase(str(Path(arguments[-1].strip('"')).resolve())) in parts:
+            return True
+    return False
+
+
+def recover_watcher_recordings(config, logger):
+    """Resume saved watcher sessions before starting a fresh live capture."""
+    output_dir = Path(config["output_dir"]).resolve()
+    manifests = list((output_dir / ".recording_sessions").glob("*-watcher/session.json"))
+    if not manifests:
+        return True
+    try:
+        processes = _watcher_capture_processes()
+    except Exception:
+        logger.exception("Watcher recovery deferred until capture processes can be inspected")
+        return False
+    ffmpeg = resolve_trusted_executable(
+        config["ffmpeg_path"], allowed_basenames={"ffmpeg.exe"},
+        trusted_roots=default_trusted_tool_roots(APP_DIR, TOOLS_DIR),
+    )
+    ready = True
+    for manifest in manifests:
+        try:
+            recording = json.loads(manifest.read_text(encoding="utf-8-sig"))
+            output = Path(recording["final_output"])
+            parts = [Path(part) for part in recording["parts"]]
+            if (recording.get("profile_id") != "watcher" or not parts
+                    or output.resolve().parent != output_dir
+                    or any(part.resolve().parent != manifest.parent.resolve() for part in parts)):
+                raise ValueError("Watcher session paths do not match its output folder")
+            if _watcher_session_has_writer(recording, processes):
+                logger.info("Waiting for the existing watcher capture to finish: %s", manifest.parent)
+                ready = False
+                continue
+        except Exception:
+            logger.exception("Watcher session could not be inspected; recovery deferred: %s", manifest)
+            ready = False
+            continue
+        try:
+            _remux_capture(ffmpeg, parts[0], output, logger, io.StringIO())
+        except Exception:
+            logger.exception("Watcher session could not be recovered; raw capture retained: %s", manifest)
+    return ready
 
 
 def run_ffmpeg(config, stream, logger):
@@ -223,7 +300,14 @@ def run_ffmpeg(config, stream, logger):
             )
             output_file = output_file.with_suffix(".mkv")
             extension = "mkv"
-        capture_file = output_file.with_name(output_file.stem + ".capture.flv")
+        session_dir = output_dir / ".recording_sessions" / (output_file.stem + "-watcher")
+        session_dir.mkdir(parents=True, exist_ok=False)
+        capture_file = session_dir / "part-0001.flv"
+        (session_dir / "session.json").write_text(json.dumps({
+            "profile_id": "watcher", "final_output": str(output_file),
+            "session_dir": str(session_dir), "manifest_path": str(session_dir / "session.json"),
+            "parts": [str(capture_file)], "status": "recording",
+        }), encoding="utf-8")
 
     ffmpeg_path = resolve_trusted_executable(
         config["ffmpeg_path"],
@@ -256,6 +340,18 @@ def run_ffmpeg(config, stream, logger):
             text=True,
             **_hidden_process_kwargs(),
         )
+        if extension != "flv":
+            try:
+                manifest = session_dir / "session.json"
+                recording = json.loads(manifest.read_text(encoding="utf-8"))
+                recording.update(capture_pid=process.pid, capture_started_at=time.time())
+                temporary = manifest.with_suffix(".json.tmp")
+                temporary.write_text(json.dumps(recording), encoding="utf-8")
+                temporary.replace(manifest)
+            except OSError:
+                # Keep owning/waiting for the child even if metadata cannot be
+                # saved. Recovery also discovers writers by their output path.
+                logger.exception("Could not save capture identity; continuing to watch FFmpeg")
         while process.poll() is None:
             if STOP:
                 logger.info("Stop requested; terminating FFmpeg.")
@@ -287,6 +383,8 @@ def run_ffmpeg(config, stream, logger):
 
 async def watch(config, logger):
     poll_interval = int(config["poll_interval_seconds"])
+    while not STOP and not recover_watcher_recordings(config, logger):
+        await asyncio.sleep(poll_interval)
     while not STOP:
         try:
             _room, stream = await resolve_stream(config, logger)

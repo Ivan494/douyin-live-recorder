@@ -4,6 +4,11 @@ Use the GitHub checkout as the only development source. Treat the portable
 personal installation as a deployment target with its own data and local
 rollback history. Do not develop the two copies independently.
 
+Keep `main` and the current task branch in this checkout. Use a linked worktree
+only for simultaneous work; after its task ends, preserve any unmerged commits
+and local files, remove the worktree with Git, and delete merged task branches.
+Keep recovery archives outside the source checkout.
+
 ## Normal update
 
 1. Edit a branch in the GitHub checkout.
@@ -47,7 +52,7 @@ Restart the app. This is a source rollback, not a dependency rollback.
 ## H.264 / HEVC sequence headers (PK / co-stream)
 
 New captures are stream-copied to FLV (`part-NNNN.flv` under
-`.recording_sessions`, or `*.capture.flv` for the headless watcher) so FFmpeg
+`.recording_sessions`, including the CLI watcher) so FFmpeg
 stores a new AVC/HEVC sequence header instead of dropping it. Finalization
 splits a part where that header changes and concatenates the pieces into the
 same finished `.mkv` as before. Non-PK lives still publish one `.mkv`.
@@ -68,10 +73,19 @@ The media tests honor `DOUYIN_TEST_TOOLS_DIR` so the release's pinned tools
 are actually exercised rather than silently skipped.
 
 Finished recordings already on disk are left untouched. Do not delete or
-remux user archives as part of this update. If a watcher pull is killed
-before remux, keep the `.capture.flv`: it is the playable copy. The Drive
-uploader should keep watching the finished `.mkv` in the output folder, not
-the session parts.
+remux user archives as part of this update. Interrupted watcher captures stay
+in their recording session and are recovered at the next watcher startup.
+Recovery waits for surviving capture processes to exit before publishing or
+starting another capture. If process inspection fails, recovery waits safely.
+External tools should watch finished `.mkv` files in the output folder.
+
+Finalization first attempts the existing strict stream copy, then tolerant
+timestamp handling, normalized copies, and verified sequential MKV outputs.
+Every result must contain media and have a plausible duration. One deadline
+covers preparation, FFmpeg, validation, and publication; temporary copies
+also require free disk space. Failures retain raw captures and their manifest.
+Saved publication plans resume without repeating a completed remux. Existing
+finished recordings are never overwritten by a new session.
 
 Local patches that edit `_start_recording`, `_finalize_recording_worker`, or
 `douyin_live_watcher.run_ffmpeg` need a rebase onto this change.
