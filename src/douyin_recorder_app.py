@@ -14,6 +14,7 @@ import random
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -530,6 +531,30 @@ def hidden_subprocess_kwargs():
         "creationflags": subprocess.CREATE_NO_WINDOW,
         "startupinfo": startupinfo,
     }
+
+
+def force_kill_process(process):
+    """Force-stop a capture process on Windows or Linux.
+
+    ``taskkill /T`` stops a Windows process tree. Elsewhere, ``Popen.kill()``
+    sends SIGKILL. AdoptedProcess implements ``terminate()`` but not
+    ``kill()``, so a handle without ``kill()`` is signalled by PID.
+    """
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/PID", str(process.pid), "/T"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+            **hidden_subprocess_kwargs(),
+        )
+        return
+    kill = getattr(process, "kill", None)
+    if callable(kill):
+        kill()
+        return
+    os.kill(int(process.pid), getattr(signal, "SIGKILL", 9))
 
 
 def setup_logging(*, console=False):
@@ -1769,8 +1794,40 @@ class MonitorEngine:
             if process.poll() is None:
                 recording = self.recordings.get(profile_id, {})
                 rotate_at = recording.get("rotate_at")
+                if rotate_at and time.time() >= rotate_at and recording.get("rotation_stop_requested"):
+                    # FIX-ROT2: FFmpeg usually exits within a few seconds of the
+                    # rotate SIGTERM. If it ignores that stop, re-send it and
+                    # then force-kill so the part cannot run on indefinitely.
+                    # Stall detection stays paused only while this stop is pending.
+                    asked = recording.get("rotation_stop_requested_at") or time.time()
+                    recording.setdefault("rotation_stop_requested_at", asked)
+                    waited = time.time() - asked
+                    if waited >= 90 and not recording.get("rotation_kill_sent"):
+                        recording["rotation_kill_sent"] = True
+                        logging.warning(
+                            "FFmpeg for %s still alive %.0fs after rotate stop; sending SIGKILL.",
+                            profile_id,
+                            waited,
+                        )
+                        try:
+                            force_kill_process(process)
+                        except Exception:
+                            logging.exception("Failed to kill FFmpeg for %s", profile_id)
+                    elif waited >= 60 and not recording.get("rotation_term_resent"):
+                        recording["rotation_term_resent"] = True
+                        logging.warning(
+                            "FFmpeg for %s still alive %.0fs after rotate stop; re-sending SIGTERM.",
+                            profile_id,
+                            waited,
+                        )
+                        try:
+                            process.terminate()
+                        except Exception:
+                            logging.exception("Failed to re-terminate FFmpeg for %s", profile_id)
+                    continue
                 if rotate_at and time.time() >= rotate_at and not recording.get("rotation_stop_requested"):
                     recording["rotation_stop_requested"] = True
+                    recording["rotation_stop_requested_at"] = time.time()
                     recording["stop_reason"] = "Scheduled signed-URL refresh"
                     self.emit(
                         profile_id,
@@ -1851,6 +1908,8 @@ class MonitorEngine:
             recording["status"] = "recovering"
             recording.pop("stall_stop_requested", None)
             recording.pop("rotation_stop_requested", None)
+            for flag in ("rotation_stop_requested_at", "rotation_term_resent", "rotation_kill_sent"):
+                recording.pop(flag, None)
             try:  # FIX-APP-5: prevent I/O error from killing monitor thread
                 self._save_recording_manifest(recording)
             except OSError:
@@ -2501,6 +2560,31 @@ class MonitorEngine:
         if not is_safe_recording_url(input_url):
             raise RuntimeError("Live stream URL uses an unsupported or unsafe protocol")
         ffmpeg_executable = resolve_ffmpeg_executable(self.store.settings["ffmpeg_path"])
+        # FIX-ROT3: the profile loop can observe this part's exit through
+        # _is_recording() -> poll() after this pass already ran _poll_processes().
+        # Replacing processes[id] then drops the exit path: the rotation flag
+        # stays set, "Recording ended" is never logged, and the rapid-death
+        # and finalize_on_exit checks never run. Reap first, and never start a
+        # second FFmpeg while the previous one is still alive.
+        previous = self.processes.get(profile["id"])
+        if previous is not None:
+            if previous.poll() is None:
+                logging.warning(
+                    "%s: previous FFmpeg (PID %s) is still running; not starting another capture part.",
+                    profile.get("name"),
+                    getattr(previous, "pid", "?"),
+                )
+                return
+            pending = self.recordings.get(profile["id"]) or {}
+            stop_requested = bool(pending.get("finalize_on_exit"))
+            errors_before = self.recording_error_counts.get(profile["id"], 0)
+            logging.info("%s: reaping exited FFmpeg part before starting the next one.", profile.get("name"))
+            self._poll_processes_locked()
+            if stop_requested or profile["id"] in self.processes:
+                return
+            if self.recording_error_counts.get(profile["id"], 0) > errors_before:
+                # FIX-S3 counted a rapid death; honour its backoff instead of respawning now.
+                return
         recording = self.recordings.get(profile["id"])
         is_resume = bool(recording and recording.get("session_dir"))
         if not is_resume:
@@ -2574,6 +2658,17 @@ class MonitorEngine:
         recording["last_growth_at"] = time.time()
         recording["segment_started_at"] = time.time()
         recording["rotate_at"] = time.time() + self.setting_seconds("recording_segment_max_seconds")
+        # FIX-ROT1: backstop for a respawn that did not go through the exit path.
+        # _start_recording resets rotate_at; the stop flags must be reset too,
+        # or the pending-stop guard skips every later rotation for this session.
+        for flag in (
+            "rotation_stop_requested",
+            "rotation_stop_requested_at",
+            "rotation_term_resent",
+            "rotation_kill_sent",
+            "stall_stop_requested",
+        ):
+            recording.pop(flag, None)
         recording["status"] = "recording"
         recording["stop_reason"] = ""
         recording.pop("recovery_started_at", None)
