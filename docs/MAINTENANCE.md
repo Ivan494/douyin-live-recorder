@@ -79,6 +79,11 @@ Recovery waits for surviving capture processes to exit before publishing or
 starting another capture. If process inspection fails, recovery waits safely.
 External tools should watch finished `.mkv` files in the output folder.
 
+Controller restart recovery retains every declared part in order, including
+missing or temporarily inaccessible paths. A missing part must cause a visible
+finalization failure and preserve available raw media, rather than publish a
+shorter recording. Sessions whose declared files are all missing remain untouched.
+
 Finalization first attempts the existing strict stream copy, then tolerant
 timestamp handling, normalized copies, and verified sequential MKV outputs.
 Every result must contain media and have a plausible duration. One deadline

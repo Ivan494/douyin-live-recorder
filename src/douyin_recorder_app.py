@@ -1607,15 +1607,28 @@ class MonitorEngine:
                     continue
                 if manifest.get("status") in {"complete", "failed"}:
                     continue
-                parts = [str(Path(value)) for value in manifest.get("parts") or [] if Path(value).exists()]
-                if not parts:
+                # A saved declaration may represent real media even when its
+                # file is missing now. Keep the complete list so finalization
+                # cannot silently publish a shorter recording after restart.
+                parts = [str(Path(value)) for value in manifest.get("parts") or []]
+                observed_sizes = {}
+                for part in parts:
+                    try:
+                        observed_sizes[part] = Path(part).stat().st_size
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        # An inaccessible file has unknown state, not proof
+                        # that this session contains no recoverable media.
+                        observed_sizes[part] = None
+                if not observed_sizes:
                     continue
                 manifest["parts"] = parts
                 manifest["manifest_path"] = str(manifest_path)
                 manifest["session_dir"] = str(manifest_path.parent)
                 manifest["output_file"] = parts[-1]
                 manifest["started_at"] = float(manifest.get("started_at") or time.time())
-                manifest["last_size"] = Path(parts[-1]).stat().st_size
+                manifest["last_size"] = observed_sizes.get(parts[-1]) or None
                 manifest["last_growth_at"] = time.time()
                 manifest["status"] = "recovering"
                 manifest["recovery_started_at"] = time.time()
