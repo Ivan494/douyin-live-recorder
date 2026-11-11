@@ -9,15 +9,9 @@ is skipped.
 """
 import itertools
 import logging
-import os
 import queue
-import signal
-import subprocess
 import time
 from types import SimpleNamespace
-
-# Windows Python does not define SIGKILL. The value is 9 on Linux.
-SIGKILL = getattr(signal, "SIGKILL", 9)
 
 import pytest
 
@@ -27,9 +21,6 @@ import douyin_recorder_app as app
 _PIDS = itertools.count(2_100_000_001)
 _STOP_FLAGS = (
     "rotation_stop_requested",
-    "rotation_stop_requested_at",
-    "rotation_term_resent",
-    "rotation_kill_sent",
     "stall_stop_requested",
 )
 
@@ -54,25 +45,6 @@ class FakeCapture:
         self.signals.append("KILL")
 
     def exit(self, code=255):
-        self.returncode = code
-
-
-class AdoptedLike:
-    """Windows-style adopted handle: ``terminate()`` exists, ``kill()`` does not."""
-
-    def __init__(self, *args, **kwargs):
-        self.pid = next(_PIDS)
-        self.returncode = None
-        self.signals = []
-        self.stderr_file = kwargs.get("stderr")
-
-    def poll(self):
-        return self.returncode
-
-    def terminate(self):
-        self.signals.append("TERM")
-
-    def exit(self, code=-9):
         self.returncode = code
 
 
@@ -214,115 +186,15 @@ def test_finalize_on_exit_during_respawn_does_not_start_another_part(engine, mon
     assert profile["id"] not in monitor.recordings
 
 
-def _record_force_kills(monkeypatch):
-    runs = []
-    os_kills = []
-
-    def fake_run(cmd, **kwargs):
-        runs.append((list(cmd), kwargs.get("timeout")))
-        return subprocess.CompletedProcess(cmd, 0)
-
-    monkeypatch.setattr(app.subprocess, "run", fake_run)
-    monkeypatch.setattr(app.os, "kill", lambda pid, sig: os_kills.append((pid, sig)))
-    return runs, os_kills
-
-
-def test_rotation_stop_resends_term_then_force_kills(engine, monkeypatch):
+def test_reaping_before_start_does_not_poll_other_profiles(engine):
     monitor, profile, stream = engine
-    runs, os_kills = _record_force_kills(monkeypatch)
-    proc = start(monitor, profile, stream)
+    first = start(monitor, profile, stream)
     expire(monitor, profile["id"])
-    monitor._poll_processes()
-    assert proc.signals == ["TERM"]
+    first.exit(255)
+    untouched = SimpleNamespace(poll=lambda: pytest.fail("unrelated process was polled"))
+    monitor.processes["other-profile"] = untouched
 
-    monitor.recordings[profile["id"]]["rotation_stop_requested_at"] = time.time() - 50
-    monitor._poll_processes()
-    assert proc.signals == ["TERM"]
-    assert runs == [] and os_kills == []
+    second = start(monitor, profile, stream)
 
-    monitor.recordings[profile["id"]]["rotation_stop_requested_at"] = time.time() - 61
-    monitor._poll_processes()
-    assert proc.signals == ["TERM", "TERM"]
-    monitor._poll_processes()
-    assert proc.signals == ["TERM", "TERM"]
-
-    monitor.recordings[profile["id"]]["rotation_stop_requested_at"] = time.time() - 91
-    monitor._poll_processes()
-    if os.name == "nt":
-        assert proc.signals == ["TERM", "TERM"]
-        assert os_kills == []
-        command, timeout = runs[-1]
-        assert command[:4] == ["taskkill", "/F", "/PID", str(proc.pid)]
-        assert command[-1] == "/T"
-        assert timeout == 10
-    else:
-        assert proc.signals == ["TERM", "TERM", "KILL"]
-        assert runs == [] and os_kills == []
-    monitor._poll_processes()
-    if os.name == "nt":
-        assert len(runs) == 1
-    else:
-        assert proc.signals == ["TERM", "TERM", "KILL"]
-    assert monitor.recordings[profile["id"]]["rotation_kill_sent"] is True
-
-    proc.exit(-9)
-    monitor._poll_processes()
-    assert profile["id"] not in monitor.processes
-    recording = monitor.recordings[profile["id"]]
-    for flag in _STOP_FLAGS:
-        assert flag not in recording
-    assert recording["status"] == "recovering"
-
-
-def test_rotation_force_kill_does_not_require_a_kill_method(engine, monkeypatch):
-    monitor, profile, stream = engine
-    runs, os_kills = _record_force_kills(monkeypatch)
-    monkeypatch.setattr(app.subprocess, "Popen", AdoptedLike)
-    proc = start(monitor, profile, stream)
-    assert not hasattr(proc, "kill")
-    expire(monitor, profile["id"])
-    monitor._poll_processes()
-    monitor.recordings[profile["id"]]["rotation_stop_requested_at"] = time.time() - 61
-    monitor._poll_processes()
-    assert proc.signals == ["TERM", "TERM"]
-    assert runs == [] and os_kills == []
-    monitor.recordings[profile["id"]]["rotation_stop_requested_at"] = time.time() - 91
-    monitor._poll_processes()
-    assert proc.signals == ["TERM", "TERM"]
-    if os.name == "nt":
-        command, timeout = runs[-1]
-        assert command[:4] == ["taskkill", "/F", "/PID", str(proc.pid)]
-        assert "/T" in command
-        assert timeout == 10
-        assert os_kills == []
-    else:
-        assert os_kills == [(proc.pid, SIGKILL)]
-        assert runs == []
-
-
-def test_force_kill_process_covers_windows_taskkill_and_posix_without_kill(monkeypatch):
-    runs = []
-    os_kills = []
-    monkeypatch.setattr(
-        app.subprocess,
-        "run",
-        lambda cmd, **kwargs: runs.append((list(cmd), kwargs.get("timeout"))) or subprocess.CompletedProcess(cmd, 0),
-    )
-    monkeypatch.setattr(app.os, "kill", lambda pid, sig: os_kills.append((pid, sig)))
-    monkeypatch.setattr(app, "hidden_subprocess_kwargs", lambda: {})
-    adopted = SimpleNamespace(pid=424242)
-
-    monkeypatch.setattr(app.os, "name", "nt")
-    app.force_kill_process(adopted)
-    command, timeout = runs[-1]
-    assert command == ["taskkill", "/F", "/PID", "424242", "/T"]
-    assert timeout == 10
-    assert os_kills == []
-
-    monkeypatch.setattr(app.os, "name", "posix")
-    app.force_kill_process(adopted)
-    assert os_kills == [(424242, SIGKILL)]
-
-    popen_like = SimpleNamespace(pid=424243, kill=lambda: os_kills.append("method"))
-    app.force_kill_process(popen_like)
-    assert os_kills == [(424242, SIGKILL), "method"]
+    assert second is not first
+    assert monitor.processes["other-profile"] is untouched
