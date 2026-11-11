@@ -1844,6 +1844,18 @@ class MonitorEngine:
                 continue
             recording["pid"] = ""
             recording["last_exit_code"] = process.returncode
+            # FIX-MISSINGPART: FFmpeg that fails at input open (e.g. CDN 404)
+            # never creates its part file. Drop that path so finalize does not
+            # abort on stat(); a part that grew (last_size > 0) and later vanished
+            # still aborts finalize as before.
+            _part = recording.get("output_file") or ""
+            if _part and _part in (recording.get("parts") or []) and not recording.get("last_size") and not Path(_part).exists():
+                recording["parts"].remove(_part)
+                logging.warning(
+                    "Part %s for %s produced no file (stream unavailable); dropping from part list.",
+                    recording.get("part_index"),
+                    profile_id,
+                )
             recording["segment_ended_at"] = time.time()
             recording.setdefault("recovery_started_at", time.time())  # FIX-M12: Don't reset on every segment end
             recording["offline_since"] = None
