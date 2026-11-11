@@ -1483,7 +1483,9 @@ class MonitorEngine:
             manifest["parts"].append(output_file)
         manifest.setdefault("started_at", time.time())
         manifest.setdefault("last_growth_at", time.time())
-        manifest.setdefault("last_size", 0)
+        # A saved zero may predate later writes; recovery cannot prove that
+        # this part never held media. Preserve that uncertainty until it grows.
+        manifest["last_size"] = manifest.get("last_size") or None
         now = time.time()
         try:
             output_modified_at = Path(output_file).stat().st_mtime
@@ -1846,6 +1848,21 @@ class MonitorEngine:
                 continue
             recording["pid"] = ""
             recording["last_exit_code"] = process.returncode
+            # Only a part observed to have no data can be omitted. Missing
+            # previously populated parts must still fail finalization.
+            part = recording.get("output_file")
+            if part in (recording.get("parts") or []) and recording.get("last_size") == 0:
+                try:
+                    Path(part).stat()
+                except FileNotFoundError:
+                    recording["parts"].remove(part)
+                    logging.warning(
+                        "Part %s for %s produced no file (stream unavailable); dropping from part list.",
+                        recording.get("part_index"),
+                        profile_id,
+                    )
+                except OSError:
+                    logging.warning("Could not inspect capture part for %s; preserving it.", profile_id)
             recording["segment_ended_at"] = time.time()
             recording.setdefault("recovery_started_at", time.time())  # FIX-M12: Don't reset on every segment end
             recording["offline_since"] = None
@@ -1895,10 +1912,10 @@ class MonitorEngine:
         try:
             current_size = Path(output_file).stat().st_size
         except OSError:
-            current_size = 0
+            current_size = None
         now = time.time()
         last_size = recording.get("last_size")
-        if last_size is None or current_size > last_size:
+        if current_size is not None and current_size > (last_size or 0):
             recording["last_size"] = current_size
             recording["last_growth_at"] = now
             if now - (recording.get("segment_started_at") or now) >= 30:
@@ -1907,7 +1924,8 @@ class MonitorEngine:
                 self.last_error_kinds.pop(profile_id, None)
             recording.pop("stall_stop_requested", None)
             return False
-        recording["last_size"] = current_size
+        # Keep the largest observed size until the next part starts. A stat
+        # failure or truncation must not erase evidence of recorded media.
         last_growth_at = recording.get("last_growth_at") or now
         timeout = self.setting_seconds("recording_stall_timeout_seconds")
         return now - last_growth_at >= timeout
