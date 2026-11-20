@@ -17,6 +17,7 @@ import time
 # This must precede the application import: servers do not install Tk/pystray.
 os.environ["DOUYIN_HEADLESS"] = "1"
 import douyin_recorder_app as app
+import media_collection_policy as media_policy
 
 GIB = 1024 ** 3
 
@@ -67,9 +68,7 @@ def prepare_store(store):
     root = store.settings.get("headless_output_root") or str(app.APP_DIR.parent / "downloads")
     root = Path(root).expanduser().resolve()
     store.settings["headless_output_root"] = str(root)
-    # Enforce the requested scope even after a later config edit.
     for profile in store.profiles:
-        profile["auto_download_videos"] = False
         profile["output_dir"] = normalize_output_path(profile.get("output_dir"), profile.get("name"), root)
     return store
 
@@ -92,14 +91,18 @@ def validate(store):
     for profile in store.profiles:
         if not profile.get("url") or app.detect_platform(profile["url"]) != "douyin":
             raise ValueError(f"Unsupported profile URL for {profile.get('name')}")
-        if profile.get("auto_download_videos"):
-            raise ValueError("Post downloads must be disabled")
+    policy = media_policy.media_policy_document(store.profiles)
+    counts = policy["counts"]
     return {
         "profiles": len(ids),
         "enabled_profiles": sum(bool(p.get("enabled", True)) for p in store.profiles),
         "live_profiles": sum(app.wants_live_recording(p) for p in store.profiles),
         "story_profiles": sum(bool(p.get("enabled", True)) and bool(p.get("auto_download_stories")) for p in store.profiles),
-        "post_downloads": False,
+        "works_profiles": sum(bool(p.get("enabled", True)) and bool(p.get("auto_download_videos")) for p in store.profiles),
+        "post_downloads": counts["effective_works"] > 0,
+        "effective_works": counts["effective_works"],
+        "effective_stories": counts["effective_stories"],
+        "effective_live": counts["effective_live"],
         "output_root": store.settings["headless_output_root"],
         "min_free_gb": minimum,
         "critical_free_gb": critical,
@@ -307,16 +310,10 @@ class HeadlessStoryEngine(app.MediaDownloadEngine):
         super().__init__(store, events)
         self.disk = disk
 
-    @staticmethod
-    def enabled_for_profile(profile):
-        return bool(profile.get("auto_download_stories"))
-
     def _check_profile(self, profile):
         if not self.disk.can_start(profile):
             self.emit(profile["id"], "New stories paused: low free disk space.", media_status="Disk paused")
             return
-        # Keep identity equal to the stored profile for ProfileCancellation.
-        profile["auto_download_videos"] = False
         return super()._check_profile(profile)
 
 
@@ -369,17 +366,30 @@ class HeadlessService:
             logging.info("%s: %s", profile_id, event.get("message", ""))
 
     def write_status(self, phase):
+        profiles = []
+        for profile in self.store.profiles:
+            row = media_policy.effective_row(profile)
+            profiles.append({
+                "id": profile["id"], "name": profile.get("name", ""),
+                "enabled": row["enabled"], "record_live": row["record_live"],
+                "videos": row["auto_download_videos"], "stories": row["auto_download_stories"],
+                "media_not_before": profile.get("media_not_before"),
+                "media_gate": row["media_gate"],
+                "effective_works": row["effective_works"],
+                "effective_stories": row["effective_stories"],
+                "effective_live": row["effective_live"],
+                "state": self.states.get(profile["id"], {}),
+            })
         atomic_status(self.status_path, {
             "phase": phase, "pid": os.getpid(), "started_at": self.started_at,
-            "updated_at": app.now_text(), "post_downloads": False,
+            "updated_at": app.now_text(),
+            "post_downloads": any(row["effective_works"] for row in profiles),
             "disk": self.disk_state,
             "engines": {"live_running": self.live.is_running(), "stories_running": self.stories.is_running(),
                         "active_recordings": len(self.live.processes),
                         "active_finalizers": sum(t.is_alive() for t in self.live.finalizer_threads),
                         "deferred_finalizers": len(self.live.deferred_finalizers)},
-            "profiles": [{"id": p["id"], "name": p.get("name", ""), "enabled": p.get("enabled", True),
-                          "record_live": p.get("record_live", True), "stories": p.get("auto_download_stories", False),
-                          "state": self.states.get(p["id"], {})} for p in self.store.profiles],
+            "profiles": profiles,
         })
 
     def enforce_disk_guard(self):
@@ -440,10 +450,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--headless", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--check", "--validate", dest="check", action="store_true", help="Offline configuration validation (no probes)")
+    parser.add_argument("--policy", action="store_true", help="Print effective per-profile media policy and exit (no probes, no downloads)")
     parser.add_argument("--once", type=float, metavar="SECONDS", help="Run both engines for a bounded time, then stop gracefully")
     parser.add_argument("--status-file", help="Atomic status JSON path")
     args = parser.parse_args(argv)
     store = prepare_store(app.RecorderStore(read_only=True))
+    if args.policy:
+        print(json.dumps(media_policy.media_policy_document(store.profiles), ensure_ascii=False, indent=2))
+        return 0
     summary = validate(store)
     if args.check:
         print(json.dumps(summary, ensure_ascii=False, indent=2))

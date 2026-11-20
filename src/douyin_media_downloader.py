@@ -27,6 +27,7 @@ import httpx
 from streamget.platforms.douyin.live_stream import DouyinLiveStream
 
 from douyin_abogus import ABogus, BrowserFingerprintGenerator
+from media_collection_policy import item_cutoff_skip_reason, media_cutoff_enforced
 from lookup_resilience import (
     AccountCircuitBreaker, LookupPolicy, account_key, retry_lookup,
 )
@@ -4476,6 +4477,12 @@ def download_aweme_items(
     uploaded_entries = list(_uploaded_entries(output_dir))
     uploaded_ids = _uploaded_aweme_ids(output_dir, state, uploaded_entries)
     uploaded_paths = _uploaded_media_paths(output_dir, uploaded_entries)
+    forward_only = media_cutoff_enforced(profile)
+    retained_ids = set()
+    if forward_only:
+        for key in ("downloaded_video_ids", "downloaded_story_ids"):
+            retained_ids.update(str(item) for item in state.get(key, []) if item not in (None, ""))
+        retained_ids.update(str(item) for item in uploaded_ids if item not in (None, ""))
     total_items = len(items)
     report_progress(
         progress_callback,
@@ -4493,6 +4500,22 @@ def download_aweme_items(
         aweme_id = str(aweme.get("aweme_id") or "")
         if not aweme_id:  # FIX-3.3: only fall back to group_id when aweme_id is truly absent
             aweme_id = str(aweme.get("group_id") or "")
+        if forward_only:
+            # Completed ids and uploaded receipts win, including a story id
+            # seen again as a work. Older and undated items are not completed.
+            if aweme_id and aweme_id in retained_ids:
+                result.skipped += 1
+                continue
+            reason = item_cutoff_skip_reason(profile, aweme)
+            if reason:
+                logging.info(
+                    "Forward-only media skip profile=%s kind=%s aweme=%s reason=%s",
+                    profile.get("id") or profile.get("name") or "",
+                    media_kind,
+                    aweme_id,
+                    reason,
+                )
+                continue
         image_motion_urls = collect_image_motion_urls(aweme)
         image_url_entries = collect_indexed_image_urls(aweme)
         image_urls = [url for _index, url in image_url_entries]

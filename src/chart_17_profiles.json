@@ -1,0 +1,160 @@
+{
+  "proposal_only": true,
+  "activation_cutoff": "UNAPPROVED/UNSET; implement a forward-only gate but do not choose a historical date or backfill",
+  "notes": "Minimal sanitized 17-row fixture for coding tests. Keys are deployed profile.id values. Flags are the desired chart values. No credentials, session data, login fields, output paths, URLs, or creator user IDs. If a test needs a user-id field, use an opaque placeholder such as USER_ID_ROW_N, never a production value.",
+  "profiles": [
+    {
+      "row": 1,
+      "id": "zhuni-zhea",
+      "name": "猪呢.《浙A》",
+      "enabled": true,
+      "auto_download_videos": true,
+      "auto_download_stories": true,
+      "record_live": true
+    },
+    {
+      "row": 2,
+      "id": "douyin-922949271615",
+      "name": "皖驾学车金荣驾校",
+      "enabled": true,
+      "auto_download_videos": false,
+      "auto_download_stories": false,
+      "record_live": true
+    },
+    {
+      "row": 3,
+      "id": "e55ff90f-80ff-4cd9-90cc-8bb4c28f239f",
+      "name": "缓（）",
+      "enabled": true,
+      "auto_download_videos": true,
+      "auto_download_stories": true,
+      "record_live": true
+    },
+    {
+      "row": 4,
+      "id": "e2219a44-798e-4dd1-baef-58482e885307",
+      "name": "Rely",
+      "enabled": true,
+      "auto_download_videos": true,
+      "auto_download_stories": true,
+      "record_live": true
+    },
+    {
+      "row": 5,
+      "id": "338c550f-9fb1-428e-adc2-70ef6535e4a9",
+      "name": "ciu7",
+      "enabled": false,
+      "auto_download_videos": true,
+      "auto_download_stories": true,
+      "record_live": true
+    },
+    {
+      "row": 6,
+      "id": "a61a2e7e-f184-49ef-8ad1-f3cd18259534",
+      "name": "ciu7-2",
+      "enabled": false,
+      "auto_download_videos": true,
+      "auto_download_stories": true,
+      "record_live": true
+    },
+    {
+      "row": 7,
+      "id": "59280f26-4f18-4628-865d-d2a652e46f7e",
+      "name": "陈皮兔o(一ω一)o",
+      "enabled": true,
+      "auto_download_videos": true,
+      "auto_download_stories": true,
+      "record_live": true
+    },
+    {
+      "row": 8,
+      "id": "shuaiqi-shutiao-167551967373",
+      "name": "帅气薯条.",
+      "enabled": true,
+      "auto_download_videos": false,
+      "auto_download_stories": false,
+      "record_live": true
+    },
+    {
+      "row": 9,
+      "id": "efa6edfb-cbe4-4896-9355-9a52294e81c2",
+      "name": "iis",
+      "enabled": true,
+      "auto_download_videos": false,
+      "auto_download_stories": false,
+      "record_live": true
+    },
+    {
+      "row": 10,
+      "id": "07207e98-eab9-4a1e-ba77-6cd9523e8e2d",
+      "name": "软柿子",
+      "enabled": true,
+      "auto_download_videos": false,
+      "auto_download_stories": false,
+      "record_live": true
+    },
+    {
+      "row": 11,
+      "id": "d32e20d9-b6d1-4c7a-8cbb-73ea3a791ba8",
+      "name": "鸟",
+      "enabled": true,
+      "auto_download_videos": false,
+      "auto_download_stories": false,
+      "record_live": true
+    },
+    {
+      "row": 12,
+      "id": "abb51513-6641-4579-9b87-184ef027e3ae",
+      "name": "📦",
+      "enabled": true,
+      "auto_download_videos": false,
+      "auto_download_stories": false,
+      "record_live": true
+    },
+    {
+      "row": 13,
+      "id": "163d22f9-9d35-4f63-ac6f-3b544265742a",
+      "name": "潘婆婆",
+      "enabled": true,
+      "auto_download_videos": false,
+      "auto_download_stories": false,
+      "record_live": true
+    },
+    {
+      "row": 14,
+      "id": "f8108c74-ea7e-4e40-a3a4-e515326e1b01",
+      "name": "罐梨脆芝士",
+      "enabled": false,
+      "auto_download_videos": false,
+      "auto_download_stories": false,
+      "record_live": true
+    },
+    {
+      "row": 15,
+      "id": "8ea110b6-3a28-4719-83e8-cb32b9edb6e7",
+      "name": "成熟女性",
+      "enabled": true,
+      "auto_download_videos": false,
+      "auto_download_stories": false,
+      "record_live": true
+    },
+    {
+      "row": 16,
+      "id": "beeb1512-87a4-4bda-8144-603587b03649",
+      "name": "狸pu酒馆",
+      "enabled": true,
+      "auto_download_videos": false,
+      "auto_download_stories": false,
+      "record_live": true
+    },
+    {
+      "row": 17,
+      "id": "6a3124fe-4427-4f5c-8eb5-f718e8a819ac",
+      "name": "@虎牙钉",
+      "enabled": true,
+      "auto_download_videos": true,
+      "auto_download_stories": true,
+      "record_live": true
+    }
+  ]
+}

@@ -65,9 +65,11 @@ def test_portable_placeholder_backslashes_only_normalized_on_posix(monkeypatch, 
 
 
 def test_posts_never_download_and_disabled_profile_retained(monkeypatch, tmp_path):
+    """Stored works flags survive startup. Headless still refuses them without a cutoff."""
     store = headless.prepare_store(store_at(tmp_path))
     assert len(store.profiles) == 2 and store.profiles[1]["enabled"] is False
-    assert all(p["auto_download_videos"] is False for p in store.profiles)
+    assert store.profiles[0]["auto_download_videos"] is True
+    assert store.profiles[0]["auto_download_stories"] is True
     monkeypatch.setattr(app, "HEADLESS", True)
     download = Mock(return_value={"videos": {"status": "disabled"}, "stories": {"status": "no_active_stories"}})
     monkeypatch.setattr(app, "download_profile", download)
@@ -75,9 +77,15 @@ def test_posts_never_download_and_disabled_profile_retained(monkeypatch, tmp_pat
     engine = headless.HeadlessStoryEngine(store, app.RecorderEventQueue(), disk)
     monkeypatch.setattr(engine, "_save_circuit_breaker_state", lambda: None)
     engine._check_profile(store.profiles[0])
-    assert download.call_args.kwargs["videos"] is False
+    download.assert_not_called()
+    store.profiles[0]["media_not_before"] = "2026-11-20T12:00:00+00:00"
+    engine._check_profile(store.profiles[0])
+    assert download.call_args.kwargs["videos"] is True
     assert download.call_args.kwargs["stories"] is True
-    assert not engine.enabled_for_profile({"auto_download_videos": True, "auto_download_stories": False})
+    engine._check_profile(store.profiles[1])
+    assert download.call_count == 1
+    assert engine.enabled_for_profile({"auto_download_videos": True, "auto_download_stories": False})
+    assert not engine.enabled_for_profile({"auto_download_videos": False, "auto_download_stories": False})
 
 
 def test_disk_guard_blocks_new_capture_but_does_not_delete(tmp_path, monkeypatch):

@@ -55,6 +55,7 @@ from douyin_media_downloader import (
     saved_session_info,
 )
 from lookup_resilience import LOOKUP_DEFAULTS, LookupDeferred
+from media_collection_policy import parse_media_not_before
 from recording_segments import (
     concat_list_line,
     prepare_recording_parts,
@@ -2842,7 +2843,7 @@ class MediaDownloadEngine:
 
     @staticmethod
     def enabled_for_profile(profile):
-        return (not HEADLESS and bool(profile.get("auto_download_videos"))) or bool(profile.get("auto_download_stories"))
+        return bool(profile.get("auto_download_videos")) or bool(profile.get("auto_download_stories"))
 
     def _run(self):
         while not self.stop_event.is_set():
@@ -2979,11 +2980,24 @@ class MediaDownloadEngine:
 
     def _check_profile(self, profile):
         profile = dict(profile)
+        if not profile.get("enabled", True):
+            return
         cancellation = ProfileCancellation(self.stop_event, self.store, profile)
         if cancellation.is_set():
             return
-        videos = not HEADLESS and bool(profile.get("auto_download_videos"))
+        videos = bool(profile.get("auto_download_videos"))
         stories = bool(profile.get("auto_download_stories"))
+        # Headless used to force ordinary videos off and stories on. Per-profile
+        # flags now decide. A missing cutoff closes only this media gate.
+        if HEADLESS and not videos and not stories:
+            return
+        if HEADLESS and (videos or stories) and parse_media_not_before(profile.get("media_not_before")) is None:
+            self.emit(
+                profile["id"],
+                "Media gate closed: missing or invalid forward-only cutoff.",
+                media_status="Media gate closed",
+            )
+            return
         last_progress = ""
 
         def on_progress(progress):
