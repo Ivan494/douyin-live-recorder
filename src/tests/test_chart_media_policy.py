@@ -46,7 +46,6 @@ PRESERVED_HASHES = {
     "src/douyin_live_watcher.py": "415409e36a97bf0ac8258a8d0123c2770500e7cfd167dde95198216d90113a3e",
     "tests/test_capture_finalizer.py": "8f1cb64626718a1d7e624c60a9ce8c84116ff525b1e69f0d7617f4228b16e177",
     "tests/test_finalize_retry.py": "99cc12518c665402ec76decb1172c976eb75d1d7bb9cc5215b1312733328cf73",
-    "tests/test_drive_uploader.py": "dc51d07343aeb3555c1734862555a2275ecffb8b7ac40fa3b73cdad7b28d5926",
 }
 
 

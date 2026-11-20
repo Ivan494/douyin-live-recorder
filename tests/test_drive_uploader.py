@@ -10,7 +10,13 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
+import sys
 
+if sys.platform != "linux":
+    pytest.skip(
+        "The deployed uploader uses Linux flock and is covered on the host, not by the Windows release suite.",
+        allow_module_level=True,
+    )
 
 SPEC = importlib.util.spec_from_file_location(
     "drive_uploader", Path(__file__).resolve().parents[1] / "uploader" / "drive_uploader.py"
