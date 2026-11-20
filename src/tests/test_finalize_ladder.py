@@ -171,10 +171,12 @@ def test_timestamp_epochs_cannot_authorize_short_output_cleanup(capture, monkeyp
             segments.flv_playback_span_ms(source)
     capture.engine._finalize_recording_worker(capture.recording, clock_damage)
     if capture.recording['status'] == 'complete':
-        assert clock_damage == 'wrap'
+        # 2026-11-12 owner GO: a genuine reset is split at the reset and both
+        # clock epochs are published back to back, so it must cover both.
+        covered = expected * (2 if clock_damage == 'reset' else 1)
         outputs = [Path(p) for p in capture.recording['final_outputs']]
         segments.validate_recording_duration(sum(segments.probe_recording(p, capture.ffprobe)
-                                                for p in outputs), expected)
+                                                for p in outputs), covered)
     else:
         assert capture.recording['status'] == 'failed'
         assert source.read_bytes() == original

@@ -16,7 +16,7 @@ import time
 import urllib.parse
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from contextlib import contextmanager
 from datetime import datetime
 from http.cookies import SimpleCookie
@@ -27,6 +27,9 @@ import httpx
 from streamget.platforms.douyin.live_stream import DouyinLiveStream
 
 from douyin_abogus import ABogus, BrowserFingerprintGenerator
+from lookup_resilience import (
+    AccountCircuitBreaker, LookupPolicy, account_key, retry_lookup,
+)
 from security_utils import (
     follow_safe_redirects,
     stream_safe_redirects,
@@ -55,6 +58,7 @@ KNOWN_GOOD_EDGE_VERSION = "150.0.4078.83"
 MEDIA_BROWSER_LAUNCH_LOCK = threading.RLock()
 MEDIA_STATE_LOCK = threading.RLock()
 _cancellation = threading.local()
+_lookup_circuits = AccountCircuitBreaker()
 
 
 def check_cancelled():
@@ -1435,6 +1439,37 @@ class CaptchaDetectedError(RuntimeError):
     pass
 
 
+def _retryable_lookup_error(exc):
+    # Authentication, captcha/risk-control and programming/configuration errors
+    # should cool down, not receive a burst of immediate retries.
+    if isinstance(exc, (LoginRequiredError, CaptchaDetectedError, InterruptedError)):
+        return False
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {408, 500, 502, 503, 504}
+    if isinstance(exc, EmptyApiResponseError) and str(exc) in {
+        "mobile_post_api: signer module not available", "mobile_post_api: no session cookies",
+        "mobile_post_api: no posts returned",
+    }:
+        return False
+    return (
+        isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError,
+                         TimeoutError, ConnectionError, EmptyApiResponseError))
+        or (isinstance(exc, RuntimeError)
+            and str(exc) == "Could not resolve sec_user_id for this Douyin profile")
+    )
+
+
+def _lookup_call(operation, *args, **kwargs):
+    return retry_lookup(
+        lambda: operation(*args, **kwargs),
+        getattr(_cancellation, "lookup_policy", None),
+        retryable=_retryable_lookup_error,
+        wait=_cancel_wait,
+        check_cancelled=check_cancelled,
+        label="identity" if operation is resolve_profile_identity_sync else "metadata",
+    )
+
+
 # OPT-D: Track consecutive HTTP fast-path failures per sec_user_id.
 # After 3 consecutive empty/failed HTTP attempts, skip the HTTP path
 # and go straight to browser to avoid wasting ~2-3s per cycle.
@@ -1504,6 +1539,11 @@ def dpapi_unprotect(data):
 
 
 def save_session_cookie_header(cookie_header, source=DEFAULT_CHROME_CDP):
+    if os.name != "nt":
+        from linux_session_storage import save_cookie_header
+
+        save_cookie_header(SESSION_FILE, cookie_header, source=source)
+        return
     encrypted = dpapi_protect(cookie_header.encode("utf-8"))
     save_json(
         SESSION_FILE,
@@ -1517,6 +1557,10 @@ def save_session_cookie_header(cookie_header, source=DEFAULT_CHROME_CDP):
 
 
 def load_session_cookie_header():
+    if os.name != "nt":
+        from linux_session_storage import load_cookie_header
+
+        return load_cookie_header(SESSION_FILE)
     session = load_json(SESSION_FILE, {})
     encoded = session.get("encrypted_cookie_header") if isinstance(session, dict) else ""
     if not encoded:
@@ -1533,6 +1577,11 @@ def load_session_cookie_header():
 
 def save_mobile_session_cookie_header(cookie_header, source="edge-qr-app"):
     """Persist the EXE QR login as the app-capable mobile session."""
+    if os.name != "nt":
+        from linux_session_storage import save_cookie_header
+
+        save_cookie_header(MOBILE_SESSION_FILE, cookie_header, source=source)
+        return
     encrypted = dpapi_protect(cookie_header.encode("utf-8"))
     save_json(
         MOBILE_SESSION_FILE,
@@ -1546,6 +1595,10 @@ def save_mobile_session_cookie_header(cookie_header, source="edge-qr-app"):
 
 
 def load_mobile_session_cookie_header():
+    if os.name != "nt":
+        from linux_session_storage import load_cookie_header
+
+        return load_cookie_header(MOBILE_SESSION_FILE)
     session = load_json(MOBILE_SESSION_FILE, {})
     encoded = session.get("encrypted_cookie_header") if isinstance(session, dict) else ""
     if not encoded:
@@ -3260,6 +3313,15 @@ async def resolve_profile_identity(profile):
     return {"sec_user_id": sec_uid, "user_id": numeric_user_id, "nickname": nickname}
 
 
+def resolve_profile_identity_sync(profile):
+    identity = httpx.run(resolve_profile_identity(profile)) if hasattr(httpx, "run") else None
+    if identity is None:
+        import asyncio
+
+        identity = asyncio.run(resolve_profile_identity(profile))
+    return identity
+
+
 def iter_url_list(source):
     if isinstance(source, str):
         yield source
@@ -3492,6 +3554,11 @@ def _media_name_tail(aweme, suffix):
     return _utf16_length(payload_suffix + ".json") + _PART_SUFFIX_RESERVE
 
 
+# Filename timestamps always use Douyin's zone, independent of the process TZ.
+from datetime import timedelta as _td, timezone as _tz
+_NAME_TZ = _tz(_td(hours=8), "UTC+08")
+
+
 def _aweme_id_for_name(aweme):
     """Sanitized id, shared by filenames and per-item subdirectories."""
     # FIX-D2: Use millisecond timestamp to reduce collision risk for items
@@ -3526,11 +3593,13 @@ def aweme_filename(aweme, suffix=".mp4", base_dir=None, include_id=True, keep_fu
         max_chars=None if keep_full_title else 120,
     )
     try:
-        stamp = datetime.fromtimestamp(int(aweme.get("create_time") or time.time())).strftime("%Y-%m-%d_%H-%M-%S")
+        # Fixed Douyin zone (UTC+8): a naive fromtimestamp() followed the
+        # process TZ, so UTC and HKT runs named one story 8h apart.
+        stamp = datetime.fromtimestamp(int(aweme.get("create_time") or time.time()), _NAME_TZ).strftime("%Y-%m-%d_%H-%M-%S")
     except InterruptedError:
         raise
     except (TypeError, ValueError, OSError):
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        stamp = datetime.now(_NAME_TZ).strftime("%Y-%m-%d_%H-%M-%S")
     prefix = f"{stamp}_{aweme_id}_" if include_id else f"{stamp}_"
     component_budget = _MAX_NAME_COMPONENT - _utf16_length(prefix) - _media_name_tail(aweme, suffix)
     if keep_full_title:
@@ -4216,25 +4285,165 @@ def _saved_file_exists(path):
         return False
 
 
+def _previously_saved_paths_by_aweme_id(target_dir, aweme, subdir_by_aweme_id=False,
+                                       uploaded_paths=()):
+    """Find saved assets for an item even when its caption has since changed."""
+    aweme_id = _aweme_id_for_name(aweme)
+    search_root = (Path(target_dir) / aweme_id if subdir_by_aweme_id else Path(target_dir)).absolute()
+    try:
+        candidates = [path for path in search_root.iterdir() if path.is_file()]
+    except OSError:
+        candidates = []
+    candidates.extend(path for path in uploaded_paths if path.parent == search_root)
+    # Dedupe by item id regardless of timestamp prefix or caption. Staging
+    # files are never evidence, including within per-item subdirectories.
+    markers = (f"_{aweme_id}_", f"_{aweme_id}.")
+    return [path for path in candidates
+            if (subdir_by_aweme_id or any(marker in path.name for marker in markers))
+            and not re.search(r"\.(?:part|tmp|partial|download)(?:\.|$)", path.name, re.I)]
+
+
+UPLOADED_LOG_ENV = "DOUYIN_UPLOADED_LOG"
+
+
+def _uploaded_log_path(output_dir):
+    """uploaded.jsonl written by uploader/drive_uploader.py (Drive offload)."""
+    env = os.environ.get(UPLOADED_LOG_ENV)
+    if env:
+        return Path(env)
+    # output_dir is <downloads root>/<profile>; the uploader lives beside downloads.
+    return Path(output_dir).resolve().parent.parent / "uploader" / "uploaded.jsonl"
+
+
+def _uploaded_entries(output_dir):
+    """Read independent receipts even after a torn or corrupt journal record."""
+    log_path = _uploaded_log_path(output_dir)
+    try:
+        with open(log_path, "rb") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if isinstance(entry, dict):
+                    yield entry
+    except OSError:
+        pass
+
+
+def _uploaded_aweme_ids(output_dir, state=None, entries=None):
+    """Complete video receipts and legacy explicit whole-item markers."""
+    ids = set()
+    if isinstance(state, dict):
+        values = state.get("uploaded_aweme_ids")
+        if isinstance(values, list):
+            ids.update(str(item) for item in values if type(item) in (str, int) and item)
+    for entry in _uploaded_entries(output_dir) if entries is None else entries:
+        item_id = entry.get("item_id")
+        if type(item_id) not in (str, int) or not item_id:
+            continue
+        path = entry.get("path")
+        if path is not None:
+            # A cover, motion clip or JSON sidecar says nothing about the rest
+            # of an album. Those receipts are checked asset by asset instead.
+            if not isinstance(path, str) or Path(path).suffix.lower() not in {".mp4", ".mkv", ".flv", ".ts"}:
+                continue
+            if re.search(r"_\d+_live\.mp4$", path, re.I):
+                continue
+        ids.add(str(item_id))
+    return ids
+
+
+def _uploaded_media_paths(output_dir, entries):
+    root = Path(output_dir).absolute()
+    paths = set()
+    for entry in entries:
+        value = entry.get("path")
+        if not isinstance(value, str) or not value:
+            continue
+        path = Path(value).absolute()
+        if path.is_relative_to(root) and path.suffix.lower() in {".mp4", ".mkv", ".flv", ".ts", ".jpg", ".jpeg", ".png", ".webp"}:
+            paths.add(path)
+    return paths
+
+
+def _uploaded_album_suffixes(target_dir, aweme, subdir_by_aweme_id, uploaded_paths):
+    """Match offloaded album positions after a caption or timestamp changes."""
+    return {
+        match.group(0)
+        for path in _previously_saved_paths_by_aweme_id(target_dir, aweme, subdir_by_aweme_id, uploaded_paths)
+        if path in uploaded_paths
+        if (match := re.search(r"_\d+(?:_live)?\.(?:jpg|mp4)$", path.name))
+    }
+
+
 def _already_saved_media_file(output_path, image_urls, target_dir, aweme,
-                              subdir_by_aweme_id=False, keep_full_title=True):
+                              subdir_by_aweme_id=False, keep_full_title=True,
+                              uploaded_paths=()):
     """
     Return the on-disk file that proves this item was saved by an earlier run.
 
     Video items live at output_path. Every expected still and motion clip must
-    be valid before an album can be treated as complete.
+    be valid before an album can be treated as complete. If a caption changes,
+    filenames change too, so fall back to the stable aweme ID in the existing
+    filename/subdirectory before deciding to download the same story again.
     """
+    uploaded_suffixes = set()
+
+    def saved(path):
+        return (path.absolute() in uploaded_paths
+                or any(path.name.endswith(suffix) for suffix in uploaded_suffixes)
+                or _has_valid_media_file(path))
+
     motion_paths = _expected_live_photo_paths(
         target_dir, aweme, subdir_by_aweme_id, keep_full_title
     )
     if image_urls or motion_paths:
+        if uploaded_paths:
+            uploaded_suffixes = _uploaded_album_suffixes(target_dir, aweme, subdir_by_aweme_id, uploaded_paths)
+        image_entries = collect_indexed_image_urls(aweme)
+        motion_indices = [index for index, _urls in collect_image_motion_urls(aweme)]
         stem = media_item_path(target_dir, aweme, suffix="", subdir_by_aweme_id=subdir_by_aweme_id, keep_full_title=keep_full_title)
-        required = [Path(f"{stem}_{index:02d}.jpg") for index, _url in collect_indexed_image_urls(aweme)] + motion_paths
-        if required and all(_has_valid_media_file(path) for path in required):
+        required = [Path(f"{stem}_{index:02d}.jpg") for index, _url in image_entries] + motion_paths
+        if required and all(saved(path) for path in required):
             return required[0]
+        candidates = _previously_saved_paths_by_aweme_id(
+            target_dir, aweme, subdir_by_aweme_id, uploaded_paths
+        )
+        if image_entries:
+            first_index = image_entries[0][0]
+            suffix = f"_{first_index:02d}.jpg"
+            for candidate in candidates:
+                if not candidate.name.endswith(suffix):
+                    continue
+                prior_stem = candidate.with_name(candidate.name[:-len(suffix)])
+                prior_required = [
+                    Path(f"{prior_stem}_{index:02d}.jpg") for index, _url in image_entries
+                ] + [
+                    Path(f"{prior_stem}_{index:02d}_live.mp4") for index in motion_indices
+                ]
+                if prior_required and all(saved(path) for path in prior_required):
+                    return prior_required[0]
+        elif motion_indices:
+            first_index = motion_indices[0]
+            suffix = f"_{first_index:02d}_live.mp4"
+            for candidate in candidates:
+                if not candidate.name.endswith(suffix):
+                    continue
+                prior_stem = candidate.with_name(candidate.name[:-len(suffix)])
+                prior_required = [
+                    Path(f"{prior_stem}_{index:02d}_live.mp4") for index in motion_indices
+                ]
+                if prior_required and all(saved(path) for path in prior_required):
+                    return prior_required[0]
         return None
-    if _has_valid_media_file(output_path):
+    if saved(output_path):
         return output_path
+    for candidate in _previously_saved_paths_by_aweme_id(
+        target_dir, aweme, subdir_by_aweme_id, uploaded_paths
+    ):
+        if candidate.suffix.lower() == output_path.suffix.lower() and saved(candidate):
+            return candidate
     return None
 
 
@@ -4264,6 +4473,9 @@ def download_aweme_items(
     downloaded_ids = set(str(item) for item in state.get(state_key, []))
     invalidated_ids = state.setdefault("_invalidated_download_ids", {}).setdefault(state_key, set())
     default_target_dir = Path(output_dir) / ("stories" if media_kind == "story" else "videos")
+    uploaded_entries = list(_uploaded_entries(output_dir))
+    uploaded_ids = _uploaded_aweme_ids(output_dir, state, uploaded_entries)
+    uploaded_paths = _uploaded_media_paths(output_dir, uploaded_entries)
     total_items = len(items)
     report_progress(
         progress_callback,
@@ -4294,8 +4506,12 @@ def download_aweme_items(
         # IDs describe successful earlier runs; files can be moved or damaged.
         # Recheck every album asset, and reuse the valid ones during repairs.
         existing_media = _already_saved_media_file(
-            output_path, image_urls, target_dir, aweme, subdir_by_aweme_id, keep_full_title
+            output_path, image_urls, target_dir, aweme, subdir_by_aweme_id, keep_full_title,
+            uploaded_paths
         )
+        if existing_media is None and aweme_id and aweme_id in uploaded_ids and not (image_urls or image_motion_urls):
+            # Uploaded to Drive and verified; local copy was removed on purpose.
+            existing_media = "uploaded"
         if existing_media is not None:
             result.skipped += 1
             if aweme_id:
@@ -4446,9 +4662,10 @@ def download_aweme_items(
                         )
         else:
             _image_failures = 0  # FIX-3.2: track partial image set failures
+            uploaded_suffixes = _uploaded_album_suffixes(target_dir, aweme, subdir_by_aweme_id, uploaded_paths) if uploaded_paths else set()
             for progress_index, (index, url) in enumerate(image_url_entries, start=1):
                 image_path = Path(f"{stem}_{index:02d}.jpg")
-                if _has_valid_media_file(image_path):
+                if f"_{index:02d}.jpg" in uploaded_suffixes or _has_valid_media_file(image_path):
                     saved = True
                     saved_files.append(image_path)
                     continue
@@ -4486,7 +4703,7 @@ def download_aweme_items(
                     )
             for index, urls in image_motion_urls:
                 motion_path = Path(f"{stem}_{index:02d}_live.mp4")
-                if _has_valid_media_file(motion_path):
+                if f"_{index:02d}_live.mp4" in uploaded_suffixes or _has_valid_media_file(motion_path):
                     saved = True
                     saved_files.append(motion_path)
                     continue
@@ -4884,9 +5101,9 @@ def fetch_stories(client, profile, sec_user_id, user_id="", *, scan_state=None):
         pending = scan_state.get("story_scan") if isinstance(scan_state, dict) else None
         if (not post_scan_attempted and isinstance(pending, dict)
                 and _story_cursor(pending.get("post_cursor")) not in ("", "0")):
-            # New active/life items must not strand a post traversal started
-            # on an earlier poll. Recheck its target/login scope before joining
-            # that bounded scan with whichever story source is returning now.
+            # V1216-PORT (1e9a4d9): new active/life items must not strand a post
+            # traversal started on an earlier poll. Recheck its target/login scope
+            # before joining that bounded scan with the story source returning now.
             pending = _story_scan_state(scan_state, sec_user_id, mobile_cookie)
             if _story_cursor(pending.get("post_cursor")) not in ("", "0"):
                 post_scan_attempted = True
@@ -5209,11 +5426,43 @@ def result_to_dict(result):
     }
 
 
+def profile_lookup_cooldown(profile, settings):
+    policy = LookupPolicy.from_settings(settings)
+    return _lookup_circuits.remaining(account_key(profile), policy) if policy else 0.0
+
+
 def download_profile(profile, settings=None, *, videos=True, stories=False, limit=0,
                      progress_callback=None, cancel_event=None):
     with cancellation_scope(cancel_event):
-        return _download_profile(profile, settings, videos=videos, stories=stories,
-                                 limit=limit, progress_callback=progress_callback)
+        policy = LookupPolicy.from_settings(settings or {})
+        if policy is None:
+            return _download_profile(profile, settings, videos=videos, stories=stories,
+                                     limit=limit, progress_callback=progress_callback)
+        # Admission precedes directories, state reads and all lookup traffic.
+        key = account_key(profile)
+        circuit, probe = _lookup_circuits.acquire(key, policy)
+        previous = getattr(_cancellation, "lookup_policy", None)
+        _cancellation.lookup_policy = replace(policy, max_attempts=1) if probe else policy
+        failed = None
+        try:
+            summary = _download_profile(profile, settings, videos=videos, stories=stories,
+                                        limit=limit, progress_callback=progress_callback)
+            check_cancelled()
+            statuses = {(summary.get(kind) or {}).get("status", "")
+                        for kind in ("videos", "stories")}
+            failed = bool(statuses.intersection({
+                "error", "api_empty", "blocked", "captcha", "login_required",
+                "partial", "unavailable",
+            })) or summary.get("auth_warning") == "login_required"
+            return summary
+        except InterruptedError:
+            raise
+        except Exception:
+            failed = True
+            raise
+        finally:
+            _cancellation.lookup_policy = previous
+            _lookup_circuits.finish(key, circuit, policy, failed=failed)
 
 
 def _download_profile(
@@ -5260,11 +5509,7 @@ def _download_profile(
     if _quick_sec:
         identity = {"sec_user_id": _quick_sec, "user_id": "", "nickname": profile.get("name") or ""}
     else:
-        identity = httpx.run(resolve_profile_identity(profile)) if hasattr(httpx, "run") else None
-        if identity is None:
-            import asyncio
-
-            identity = asyncio.run(resolve_profile_identity(profile))
+        identity = _lookup_call(resolve_profile_identity_sync, profile)
     summary["sec_user_id"] = identity["sec_user_id"]
     summary["user_id"] = identity.get("user_id", "")
     summary["resolved_name"] = identity.get("nickname", "")
@@ -5289,7 +5534,7 @@ def _download_profile(
                 _app_cookie = _profile_cookie_header(profile)
                 if _app_cookie:
                     try:
-                        posts = fetch_posts_via_mobile_api(
+                        posts = _lookup_call(fetch_posts_via_mobile_api,
                             client,
                             _fp_uid,
                             limit=limit,
@@ -5331,7 +5576,7 @@ def _download_profile(
                     else:
                         _fp_skip_counter = False
                         try:
-                            posts = fetch_posts(
+                            posts = _lookup_call(fetch_posts,
                                 client, profile, _fp_uid,
                                 limit=limit, progress_callback=progress_callback,
                             )
@@ -5366,7 +5611,7 @@ def _download_profile(
 
                 if not posts:
                     try:
-                        posts = fetch_posts_via_browser(
+                        posts = _lookup_call(fetch_posts_via_browser,
                             profile,
                             identity["sec_user_id"],
                             limit=limit,
@@ -5386,7 +5631,7 @@ def _download_profile(
                     # Last-resort mobile retry after anonymous web/browser failed.
                     try:
                         _mob_cookie = _profile_cookie_header(profile)
-                        posts = fetch_posts_via_mobile_api(
+                        posts = _lookup_call(fetch_posts_via_mobile_api,
                             client,
                             identity["sec_user_id"],
                             limit=limit,
@@ -5432,7 +5677,7 @@ def _download_profile(
         if stories:
             try:
                 report_progress(progress_callback, phase="checking_stories", media_kind="story")
-                story_fetch = fetch_stories(
+                story_fetch = _lookup_call(fetch_stories,
                     client,
                     profile,
                     identity["sec_user_id"],

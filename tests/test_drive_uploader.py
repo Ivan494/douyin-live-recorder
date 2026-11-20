@@ -1,0 +1,568 @@
+"""Offline fault injection for the upload/verify/journal/delete transaction."""
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+from types import SimpleNamespace
+
+import pytest
+
+
+SPEC = importlib.util.spec_from_file_location(
+    "drive_uploader", Path(__file__).resolve().parents[1] / "uploader" / "drive_uploader.py"
+)
+uploader = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(uploader)
+ITEM_ID = "7696544512231551040"
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Network access is forbidden in uploader tests")
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(socket.socket, "connect_ex", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden)
+
+
+@pytest.fixture
+def sandbox(tmp_path, monkeypatch):
+    root = tmp_path / "downloads"
+    root.mkdir()
+    status = tmp_path / "src" / "status.json"
+    status.parent.mkdir()
+    status.write_text('{"engines": {}, "profiles": []}')
+    journal = tmp_path / "uploaded.jsonl"
+    stability = tmp_path / "upload_stability.json"
+    for name, value in {"ROOT": root, "STATUS": status, "LOG": journal, "STABILITY": stability,
+                        "LOCK": tmp_path / "uploader.lock", "REMOTE": "fixture:Douyin"}.items():
+        monkeypatch.setattr(uploader, name, value)
+
+    def seed_stable(path):
+        """Record an earlier identical observation, as a previous timer tick would."""
+        state = uploader.load_stability()
+        st = path.stat()
+        state[str(path)] = {"stamp": [st.st_ino, st.st_size, st.st_mtime_ns],
+                            "at": uploader.time.time() - uploader.STABLE_SECS - 1}
+        uploader.save_stability(state)
+
+    def make_file(rel=f"acct/stories/stamp_{ITEM_ID}_caption.mp4", data=b"complete capture", stable=True):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        old = uploader.time.time() - uploader.MIN_AGE - 60
+        os.utime(path, (old, old))
+        if stable:
+            seed_stable(path)
+        return path
+
+    return SimpleNamespace(root=root, status=status, journal=journal, make_file=make_file,
+                           seed_stable=seed_stable, stability=stability)
+
+
+class FakeDrive:
+    """Only these fake rclone commands can run; bytes stand in for Drive objects."""
+    def __init__(self):
+        self.objects = {}
+        self.calls = []
+        self.hook = lambda _stage: None
+        self.copy_rc = self.check_rc = self.md5_rc = 0
+        self.partial = False
+        self.bad_md5 = False
+        self.opened = set()
+        self.lsof_rc = 0
+        self.lsof_stderr = ""
+        self.stderr = "synthetic Drive failure"
+
+    def run(self, args, **_kwargs):
+        if args[0] == "lsof":
+            return subprocess.CompletedProcess(args, self.lsof_rc,
+                "".join(f"n{p}\n" for p in self.opened), self.lsof_stderr)
+        assert args[0] == "rclone", args
+        stage = args[1]
+        self.calls.append(args)
+        self.hook(stage)
+        rc, out = 0, ""
+        if stage == "copyto":
+            data = Path(args[-2]).read_bytes()
+            self.objects[args[-1]] = data[:3] if self.partial else data
+            rc = self.copy_rc
+        elif stage == "check":
+            listing = Path(args[args.index("--files-from-raw") + 1])
+            names = listing.read_text().splitlines()
+            assert len(names) == 1
+            source = Path(args[-2]) / names[0]
+            remote = f"{args[-1]}/{names[0]}"
+            rc = self.check_rc or int(self.objects.get(remote) != source.read_bytes())
+        elif stage == "md5sum":
+            rc = self.md5_rc
+            data = self.objects.get(args[-1])
+            if data is not None:
+                digest = "0" * 32 if self.bad_md5 else hashlib.md5(data).hexdigest()
+                out = f"{digest}  {args[-1]}\n"
+        else:
+            raise AssertionError(args)
+        return subprocess.CompletedProcess(args, rc, out, self.stderr if rc else "")
+
+
+@pytest.fixture
+def drive(monkeypatch):
+    fake = FakeDrive()
+    monkeypatch.setattr(uploader.subprocess, "run", fake.run)
+    return fake
+
+
+def upload(path, sandbox, dry=False):
+    return uploader.upload_one(path, path.relative_to(sandbox.root), path.stat().st_size, dry)
+
+
+def test_verified_upload_fsyncs_receipt_before_unlink(sandbox, drive, monkeypatch):
+    path = sandbox.make_file()
+    data = path.read_bytes()
+    original_fsync = uploader.os.fsync
+    synced = []
+
+    def fsync(fd):
+        assert path.exists()
+        row = json.loads(sandbox.journal.read_text())
+        assert row["md5"] == hashlib.md5(data).hexdigest()
+        assert drive.objects[row["drive_path"]] == data
+        synced.append(True)
+        original_fsync(fd)
+
+    monkeypatch.setattr(uploader.os, "fsync", fsync)
+    assert upload(path, sandbox) is True
+    assert synced and not path.exists()
+    row = json.loads(sandbox.journal.read_text())
+    assert row["item_id"] == ITEM_ID and row["kind"] == "stories"
+    assert row["size"] == len(data)
+
+
+@pytest.mark.parametrize("failure", ["copy", "partial-copy", "check", "md5-command", "md5-mismatch", "missing-remote"])
+def test_drive_errors_keep_local_and_do_not_journal(sandbox, drive, failure):
+    path = sandbox.make_file()
+    if failure == "copy":
+        drive.copy_rc = 7
+    elif failure == "partial-copy":
+        drive.partial = True
+    elif failure == "check":
+        drive.check_rc = 3
+    elif failure == "md5-command":
+        drive.md5_rc = 5
+    elif failure == "md5-mismatch":
+        drive.bad_md5 = True
+    elif failure == "missing-remote":
+        drive.hook = lambda stage: drive.objects.clear() if stage == "md5sum" else None
+    assert upload(path, sandbox) is False
+    assert path.read_bytes() == b"complete capture"
+    assert not sandbox.journal.exists()
+
+
+@pytest.mark.parametrize("stage", ["copyto", "check", "md5sum"])
+def test_crash_mid_upload_can_retry(sandbox, drive, stage):
+    path = sandbox.make_file()
+    def crash(current):
+        if current == stage:
+            if current == "copyto":
+                drive.objects["fixture:Douyin/acct/stories/" + path.name] = b"partial"
+            raise KeyboardInterrupt("simulated process death")
+    drive.hook = crash
+    with pytest.raises(KeyboardInterrupt):
+        upload(path, sandbox)
+    assert path.exists() and not sandbox.journal.exists()
+    drive.hook = lambda _stage: None
+    assert upload(path, sandbox) is True
+    assert not path.exists()
+
+
+def test_crash_after_durable_receipt_before_delete_retries_safely(sandbox, drive, monkeypatch):
+    path = sandbox.make_file()
+    unlink = Path.unlink
+    def crash(self, *args, **kwargs):
+        if self == path:
+            raise KeyboardInterrupt("simulated process death before delete")
+        return unlink(self, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", crash)
+        with pytest.raises(KeyboardInterrupt):
+            upload(path, sandbox)
+    assert path.exists()
+    receipt = json.loads(sandbox.journal.read_text())
+    assert drive.objects[receipt["drive_path"]] == path.read_bytes()
+    assert upload(path, sandbox) is True
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("stage", ["copyto", "check", "md5sum"])
+@pytest.mark.parametrize("error", [FileNotFoundError("missing rclone"), subprocess.TimeoutExpired("rclone", 1)])
+def test_command_exceptions_preserve_local(sandbox, drive, stage, error):
+    path = sandbox.make_file()
+    def fail(current):
+        if current == stage:
+            raise error
+    drive.hook = fail
+    assert upload(path, sandbox) is False
+    assert path.exists() and not sandbox.journal.exists()
+
+
+@pytest.mark.parametrize("change", ["grow", "rewrite", "replace", "open"])
+def test_changes_during_verification_prevent_delete_and_receipt(sandbox, drive, change):
+    path = sandbox.make_file()
+    def mutate(stage):
+        if stage != "md5sum":
+            return
+        if change == "grow":
+            with path.open("ab") as f:
+                f.write(b"more")
+        elif change == "rewrite":
+            old = path.stat()
+            path.write_bytes(b"x" * old.st_size)
+            os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns))
+        elif change == "replace":
+            replacement = path.with_suffix(".replacement")
+            replacement.write_bytes(path.read_bytes())
+            replacement.replace(path)
+        else:
+            drive.opened.add(str(path))
+    drive.hook = mutate
+    assert upload(path, sandbox) is None
+    assert path.exists() and not sandbox.journal.exists()
+
+
+def test_file_changes_after_scan_are_rechecked_before_copy(sandbox, drive):
+    path = sandbox.make_file()
+    [(path, rel, size)] = uploader.candidates()
+    path.write_bytes(b"x" * size)
+    assert uploader.upload_one(path, rel, size, False) is None
+    assert not drive.calls and path.exists()
+
+
+def test_file_changes_while_hashing_are_never_copied(sandbox, drive, monkeypatch):
+    path = sandbox.make_file()
+    original = uploader.md5
+    def mutate(path):
+        digest = original(path)
+        path.write_bytes(b"changed while hashing")
+        return digest
+    monkeypatch.setattr(uploader, "md5", mutate)
+    assert upload(path, sandbox) is None
+    assert path.exists() and not drive.calls and not sandbox.journal.exists()
+
+
+def test_finalizer_starting_during_upload_prevents_delete(sandbox, drive):
+    path = sandbox.make_file("acct/live.mkv")
+    def start(stage):
+        if stage == "md5sum":
+            sandbox.status.write_text('{"engines":{"active_finalizers":1}}')
+    drive.hook = start
+    assert upload(path, sandbox) is None
+    assert path.exists() and not sandbox.journal.exists()
+
+
+def test_file_growing_during_journal_fsync_is_not_deleted(sandbox, drive, monkeypatch):
+    path = sandbox.make_file()
+    fsync = uploader.os.fsync
+    def grow(fd):
+        fsync(fd)
+        with path.open("ab") as handle:
+            handle.write(b"new capture bytes")
+    monkeypatch.setattr(uploader.os, "fsync", grow)
+    assert upload(path, sandbox) is None
+    assert path.read_bytes().endswith(b"new capture bytes")
+    row = json.loads(sandbox.journal.read_text())
+    assert drive.objects[row["drive_path"]] == b"complete capture"
+
+
+@pytest.mark.parametrize("tail", [b'{"item_id": "torn', b'{"item_id": "old"}', b'\xfftorn'])
+def test_append_after_torn_jsonl_keeps_new_receipt_readable(sandbox, drive, tail):
+    sandbox.journal.write_bytes(b'{"item_id": "older"}\n' + tail)
+    path = sandbox.make_file()
+    assert upload(path, sandbox) is True
+    row = json.loads(sandbox.journal.read_bytes().splitlines()[-1])
+    assert row["item_id"] == ITEM_ID
+
+
+def test_journal_fsync_failure_keeps_local(sandbox, drive, monkeypatch):
+    path = sandbox.make_file()
+    def fail(_fd):
+        raise OSError("disk full")
+    monkeypatch.setattr(uploader.os, "fsync", fail)
+    assert upload(path, sandbox) is False
+    assert path.exists()
+
+
+@pytest.mark.parametrize("rel", ["acct/stories/x.mp4.part.123.abc", "acct/stories/x.mp4.tmp.abc",
+    "acct/x.finalizing.mkv", "acct/.recording_sessions/s/part-0001.mkv", "acct/.hidden.mp4",
+    "acct/stories/x.partial", "acct/douyin_media_state.json", "acct/x.log", "loose.mp4"])
+def test_partial_and_internal_files_are_never_candidates(sandbox, drive, rel):
+    sandbox.make_file(rel)
+    assert uploader.candidates() == []
+
+
+def test_recent_empty_open_and_symlink_files_are_skipped(sandbox, drive):
+    recent = sandbox.make_file("acct/stories/recent.mp4")
+    os.utime(recent, None)
+    sandbox.make_file("acct/stories/empty.mp4", b"")
+    opened = sandbox.make_file("acct/stories/open.mp4")
+    drive.opened.add(str(opened))
+    (sandbox.root / "acct" / "alias.mp4").symlink_to(opened)
+    assert uploader.candidates() == []
+
+
+@pytest.mark.parametrize("payload", [None, [], {"profiles": [None]}, {"profiles": [{"state": []}]},
+    {"engines": []}, {"engines": {"active_finalizers": 1}, "profiles": [{"name": "other", "state": {"recording": True}}]}])
+def test_unknown_or_active_finalizer_status_blocks_live_upload(sandbox, drive, payload):
+    live = sandbox.make_file("acct/live.mkv")
+    story = sandbox.make_file()
+    sandbox.status.write_text(json.dumps(payload))
+    assert [p for p, _rel, _size in uploader.candidates()] == [story]
+    assert live.exists()
+
+
+@pytest.mark.parametrize("status", ["missing", "invalid", "auxiliary", "recording", "deferred"])
+def test_busy_or_unreadable_status_preserves_live_files(sandbox, drive, status):
+    sandbox.make_file("acct/live.mkv")
+    if status == "missing":
+        sandbox.status.unlink()
+    elif status == "invalid":
+        sandbox.status.write_text("{torn")
+    elif status == "auxiliary":
+        sandbox.status.with_name("status.fixture.json").write_text('{"engines":{"active_finalizers":1}}')
+    elif status == "recording":
+        sandbox.status.write_text('{"profiles":[{"name":"acct","state":{"recording":true}}]}')
+    else:
+        sandbox.status.write_text('{"engines":{"deferred_finalizers":1}}')
+    assert uploader.candidates() == []
+
+
+@pytest.mark.parametrize("rc,stderr", [(2, "failure"), (1, "permission denied"), (0, "incomplete scan")])
+def test_lsof_errors_fail_closed(sandbox, drive, rc, stderr):
+    sandbox.make_file()
+    drive.lsof_rc, drive.lsof_stderr = rc, stderr
+    with pytest.raises(RuntimeError, match="lsof"):
+        uploader.candidates()
+
+
+def test_lsof_no_matches_is_safe(sandbox, drive):
+    path = sandbox.make_file()
+    drive.lsof_rc = 1
+    assert [p for p, _rel, _size in uploader.candidates()] == [path]
+
+
+@pytest.mark.skipif(not shutil.which("lsof"), reason="lsof unavailable")
+@pytest.mark.parametrize("rel", ["acct/stories/video.mp4", "主播/stories/风景.mp4"])
+def test_real_lsof_detects_held_open_file(sandbox, rel):
+    path = sandbox.make_file(rel)
+    with path.open("ab"):
+        assert uploader.candidates() == []
+    assert [p for p, _rel, _size in uploader.candidates()] == [path]
+
+
+def test_dry_run_never_copies_journals_or_deletes(sandbox, drive):
+    path = sandbox.make_file()
+    assert upload(path, sandbox, dry=True) is None
+    assert path.exists() and not drive.calls and not sandbox.journal.exists()
+
+
+def test_live_destination_adds_lives_directory(sandbox, drive):
+    path = sandbox.make_file("acct/live.mkv")
+    assert upload(path, sandbox) is True
+    assert json.loads(sandbox.journal.read_text())["drive_path"] == "fixture:Douyin/acct/lives/live.mkv"
+
+
+def test_grouped_item_uses_parent_id_in_receipt(sandbox, drive):
+    path = sandbox.make_file(f"acct/stories/{ITEM_ID}/stamp_caption.mp4")
+    assert upload(path, sandbox) is True
+    assert json.loads(sandbox.journal.read_text())["item_id"] == ITEM_ID
+
+
+def test_main_continues_after_one_file_fails_and_returns_failure(sandbox, drive, monkeypatch):
+    first = sandbox.make_file("acct/stories/a.mp4")
+    second = sandbox.make_file("acct/stories/b.mp4")
+    def fail_first(stage):
+        if stage == "copyto":
+            drive.copy_rc = 7 if drive.calls[-1][-2] == str(first) else 0
+    drive.hook = fail_first
+    monkeypatch.setattr(uploader.sys, "argv", ["drive_uploader.py"])
+    assert uploader.main() == 1
+    assert first.exists() and not second.exists()
+
+
+def test_main_lock_prevents_overlapping_upload(sandbox, drive, monkeypatch):
+    path = sandbox.make_file()
+    monkeypatch.setattr(uploader.sys, "argv", ["drive_uploader.py"])
+    with uploader.LOCK.open("w") as lock:
+        uploader.fcntl.flock(lock, uploader.fcntl.LOCK_EX | uploader.fcntl.LOCK_NB)
+        assert uploader.main() == 0
+    assert path.exists() and not drive.calls
+
+
+def test_main_reports_lsof_failure_without_uploading(sandbox, drive, monkeypatch):
+    path = sandbox.make_file()
+    drive.lsof_rc = 2
+    monkeypatch.setattr(uploader.sys, "argv", ["drive_uploader.py"])
+    assert uploader.main() == 1
+    assert path.exists() and not drive.calls
+
+
+@pytest.mark.parametrize('state', ['pending', 'committed', 'unreadable'])
+def test_publication_plan_gates_split_members_after_worker_exit(sandbox, drive, state):
+    first = sandbox.make_file('acct/capture.part01.mkv')
+    second = sandbox.make_file('acct/capture.part02.mkv')
+    unrelated = sandbox.make_file('acct/other.mkv')
+    manifest = first.parent / '.recording_sessions' / 'capture' / 'session.json'
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text('{torn' if state == 'unreadable' else json.dumps({
+        'publication_plan': {'state': state, 'members': [
+            {'destination': str(first)}, {'destination': str(second)}]}}))
+    if state == 'unreadable':
+        (first.parent / '.capture.publication.json').write_text(json.dumps({
+            'destinations': [str(first), str(second)]}))
+    found = {p for p, _, _ in uploader.candidates()}
+    assert found == ({first, second, unrelated} if state == 'committed' else {unrelated})
+    if state != 'committed':
+        assert upload(first, sandbox) is None
+        assert not drive.calls and first.exists()
+
+
+@pytest.mark.parametrize('contents', ['{torn', '[]', '{"publication_plan": null}'])
+def test_unrelated_broken_or_no_plan_manifest_keeps_finished_upload_eligible(sandbox, drive, contents):
+    final = sandbox.make_file('acct/normal.mkv')
+    sandbox.make_file('acct/normal.finalizing.mkv')
+    manifest = final.parent / '.recording_sessions' / 'old' / 'session.json'
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(contents)
+    assert {p for p, _, _ in uploader.candidates()} == {final}
+    assert upload(final, sandbox) is True
+
+
+@pytest.mark.parametrize('scheme', ['hashed', 'legacy'])
+@pytest.mark.parametrize('contents', ['{torn', '[]', '{"destinations": null}', '{"destinations": []}', 'permission'])
+def test_unreadable_publication_gate_blocks_only_its_batch(sandbox, drive, monkeypatch, contents, scheme):
+    single = sandbox.make_file('acct/capture.mkv')
+    first = sandbox.make_file('acct/capture.part01.mkv')
+    second = sandbox.make_file('acct/capture.part02.mkv')
+    hundredth = sandbox.make_file('acct/capture.part100.mkv')
+    unrelated = sandbox.make_file('acct/other.mkv')
+    key = hashlib.sha256(b'capture').hexdigest()
+    gate = first.parent / (f'.publication-{key}.publication.json' if scheme == 'hashed'
+                           else '.capture.publication.json')
+    gate.write_text(contents)
+    if contents == 'permission':
+        read_text = Path.read_text
+        def unreadable(path, *args, **kwargs):
+            if path == gate:
+                raise PermissionError('gate is unreadable')
+            return read_text(path, *args, **kwargs)
+        monkeypatch.setattr(Path, 'read_text', unreadable)
+    assert {p for p, _, _ in uploader.candidates()} == {unrelated}
+    assert upload(single, sandbox) is None
+    assert upload(first, sandbox) is None
+    assert upload(second, sandbox) is None
+    assert upload(hundredth, sandbox) is None
+    assert not drive.calls
+    assert upload(unrelated, sandbox) is True
+
+
+def test_hashed_gate_does_not_gate_its_digest_as_a_capture_name(sandbox, drive):
+    key = hashlib.sha256(b'capture').hexdigest()
+    unrelated = sandbox.make_file(f'acct/publication-{key}.mkv')
+    (unrelated.parent / f'.publication-{key}.publication.json').write_text('{torn')
+    assert {p for p, _, _ in uploader.candidates()} == {unrelated}
+    assert upload(unrelated, sandbox) is True
+
+
+# ---- 2026-11-13 busy-skip guards (owner GO): busy/growing files are skips, not failures ----
+
+def run_main(monkeypatch):
+    monkeypatch.setattr(uploader.sys, "argv", ["drive_uploader.py"])
+    return uploader.main()
+
+
+def test_open_file_is_logged_skip_and_run_exits_zero(sandbox, drive, monkeypatch, capsys):
+    path = sandbox.make_file("acct/live.mkv")
+    drive.opened.add(str(path))
+    assert run_main(monkeypatch) == 0
+    assert path.exists() and not drive.calls
+    assert "INFO SKIP acct/live.mkv: still open" in capsys.readouterr().out
+
+
+def test_file_owned_by_active_session_is_skipped(sandbox, drive, monkeypatch):
+    path = sandbox.make_file("acct/live.mkv")
+    manifest = path.parent / ".recording_sessions" / "s" / "session.json"
+    manifest.parent.mkdir(parents=True)
+    for status, expected in [("finalizing", []), ("recording", []), ("failed", [path]), ("complete", [path])]:
+        manifest.write_text(json.dumps({"status": status, "final_output": str(path)}))
+        assert [p for p, _, _ in uploader.candidates()] == expected, status
+
+
+def test_still_growing_file_waits_until_stable_twice_60s_apart(sandbox, drive, monkeypatch, capsys):
+    path = sandbox.make_file("acct/live.mkv", stable=False)
+    now = uploader.time.time()
+    clock = {"t": now}
+    monkeypatch.setattr(uploader.time, "time", lambda: clock["t"])
+    assert uploader.candidates() == []                      # first observation
+    with path.open("ab") as f:                               # grows between ticks
+        f.write(b" more")
+    old = now - uploader.MIN_AGE - 60
+    os.utime(path, (old, old + 1))
+    clock["t"] = now + 300
+    assert uploader.candidates() == []                      # changed: observation restarts
+    clock["t"] = now + 330
+    assert uploader.candidates() == []                      # unchanged but only 30 s apart
+    clock["t"] = now + 361
+    assert [p for p, _, _ in uploader.candidates()] == [path]
+    assert "not yet stable" in capsys.readouterr().out
+    assert set(json.loads(sandbox.stability.read_text())) == {str(path)}
+
+
+def test_stability_state_forgets_files_that_are_gone(sandbox, drive):
+    path = sandbox.make_file("acct/live.mkv")
+    path.unlink()
+    uploader.candidates()
+    assert json.loads(sandbox.stability.read_text()) == {}
+
+
+@pytest.mark.parametrize("stderr", [
+    "ERROR : live.mkv: Failed to copy: can't copy - source file is being updated (size changed from 10 to 20)",
+    "Failed to copy: source file is being updated (mod time changed from 2026-11-14 to 2026-11-14)"])
+def test_rclone_source_changed_is_skip_and_retried(sandbox, drive, monkeypatch, stderr):
+    path = sandbox.make_file("acct/live.mkv")
+    drive.copy_rc, drive.stderr = 1, stderr
+    assert upload(path, sandbox) is None
+    assert run_main(monkeypatch) == 0
+    assert path.exists() and not sandbox.journal.exists()
+    drive.copy_rc = 0
+    assert run_main(monkeypatch) == 0 and not path.exists()
+
+
+def test_real_rclone_failure_on_unchanged_file_still_exits_nonzero(sandbox, drive, monkeypatch):
+    path = sandbox.make_file("acct/live.mkv")
+    drive.copy_rc, drive.stderr = 1, "Failed to create file system: couldn't fetch token: invalid_grant"
+    assert run_main(monkeypatch) == 1
+    assert path.exists() and not sandbox.journal.exists()
+
+
+def test_verify_mismatch_on_stable_file_still_exits_nonzero(sandbox, drive, monkeypatch):
+    sandbox.make_file("acct/live.mkv")
+    drive.bad_md5 = True
+    assert run_main(monkeypatch) == 1
+
+
+def test_incident_other_profile_finalizing_mid_upload_is_skip_then_uploads(sandbox, drive, monkeypatch):
+    # 2026-11-14 00:17 HKT: 鸟 started finalizing while iis's finished file uploaded.
+    path = sandbox.make_file("iis/live.mkv")
+    def start(stage):
+        if stage == "md5sum":
+            sandbox.status.write_text('{"engines":{"active_finalizers":1}}')
+    drive.hook = start
+    assert run_main(monkeypatch) == 0
+    assert path.exists()
+    drive.hook = lambda _stage: None
+    sandbox.status.write_text('{"engines": {}, "profiles": []}')
+    assert run_main(monkeypatch) == 0 and not path.exists()

@@ -29,7 +29,10 @@ class SingleTrackMaps(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg missing")
     def test_concat_of_2v2a_parts_yields_1v1a(self):
-        import douyin_recorder_app as app
+        try:
+            from douyin_headless import app
+        except ImportError:
+            self.skipTest("douyin_headless is provided by the Linux service checkout")
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -47,6 +47,8 @@ class FinalizeBudget:
         self.deadline = time.monotonic() + seconds
         self.base = base
         self.flv_analysis = {}
+        # Raw capture -> clock-stable sub-pieces written by split-at-reset.
+        self.reset_epochs = {}
 
     def remaining(self):
         remaining = self.deadline - time.monotonic()
@@ -280,13 +282,34 @@ def flv_playback_span_ms(path):
     """Milliseconds from the first media packet to the end of the last one.
 
     Returns None when ``path`` is not an FLV or has no media packets.
+    A capture split at clock resets in this finalize budget is measured as
+    the sum of its sub-pieces' own spans (the raw clock is not authoritative).
     """
+    epochs = _registered_reset_epochs(path)
+    if epochs is not None:
+        return sum(flv_playback_span_ms(epoch) for epoch in epochs)
     start, end = _flv_media_bounds_ms(path)
     return max(1, end - start) if start is not None else None
 
 
 def _flv_media_bounds_ms(path):
     return _analyze_flv(path)[0]
+
+
+def _flv_cache_key(path):
+    path = Path(path)
+    stat = path.stat()
+    return (path.resolve(), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _registered_reset_epochs(path):
+    budget = _finalize_budget.get()
+    if budget is None:
+        return None
+    try:
+        return budget.reset_epochs.get(_flv_cache_key(path))
+    except OSError:
+        return None
 
 
 def _analyze_flv(path):
@@ -361,7 +384,157 @@ def _analyze_flv(path):
     return result
 
 
-def prepare_recording_parts(parts, work_dir):
+# A sequence header can repeat within a frame or two (成熟女性 2026-11-12:
+# a 108 KB piece with 1 ms of media starting on the same ms as the next one).
+# Such a sliver has no playback span of its own; dropping it loses at most a
+# frame or two, far inside the duration check, instead of failing the session.
+SLIVER_MAX_SPAN_MS = 1000
+SLIVER_MAX_BYTES = 4 << 20
+
+
+def _is_timeline_sliver(piece, bounds):
+    try:
+        size = Path(piece).stat().st_size
+    except OSError:
+        return False
+    return bounds[1] - bounds[0] <= SLIVER_MAX_SPAN_MS and size <= SLIVER_MAX_BYTES
+
+
+def _drop_timeline_slivers(timed, notes):
+    """Drop tiny pieces that would otherwise get a non-positive concat duration."""
+    timed = list(timed)
+    index = 0
+    while index < len(timed) - 1:
+        (piece, bounds), (following, following_bounds) = timed[index], timed[index + 1]
+        if following_bounds[0] - bounds[0] > 0:
+            index += 1
+            continue
+        if _is_timeline_sliver(piece, bounds):
+            drop = index
+        elif _is_timeline_sliver(following, following_bounds):
+            drop = index + 1
+        else:
+            index += 1
+            continue
+        dropped, dropped_bounds = timed.pop(drop)
+        message = (f"sliver-drop: {dropped.name} ({dropped.stat().st_size} B, "
+                   f"{dropped_bounds[0]}..{dropped_bounds[1]} ms) had no playback span before the next piece")
+        logger.warning("FLV timeline sliver dropped: %s", message)
+        if notes is not None:
+            notes.append(message)
+        # The previous kept piece now ends at a different successor.
+        index = max(0, index - 1)
+    return timed
+
+
+def split_flv_on_timestamp_resets(source, directory):
+    """Split one capture copy-only wherever a stream's own clock restarts.
+
+    Uses the same rule as ``_analyze_flv`` (per-stream DTS, 250 ms jitter,
+    uint32 wrap unwrapped). Each stream moves to its next sub-piece at its own
+    reset, so packets still on the old clock stay with the old sub-piece. The
+    latest sequence header of a stream is re-emitted before its first packet
+    in every sub-piece (and after any change), so each sub-piece is a normal
+    capture: HEVC parameter NALs are then handled by
+    ``split_flv_on_parameter_sets`` exactly as for any other capture.
+    """
+    source, directory = Path(source), Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    handles, outputs = {}, []
+
+    def target(epoch, header, timestamp, latest_seq, written_seq):
+        if epoch not in handles:
+            path = directory / f"{source.stem}-epoch-{epoch + 1:04d}.flv"
+            handle = path.open("wb")
+            handle.write(header)
+            handle.write((0).to_bytes(4, "big"))
+            handles[epoch] = handle
+            outputs.append(path)
+            # Video before audio, like the capture muxer: concat maps streams
+            # by index, so every sub-piece must declare them in the same order.
+            for kind in (9, 8):
+                if latest_seq.get(kind) is not None:
+                    _write_tag(handle, kind, timestamp, latest_seq[kind])
+                    written_seq[(kind, epoch)] = latest_seq[kind]
+        return handles[epoch]
+
+    try:
+        with source.open("rb") as src:
+            header = _read_flv_header(src)
+            if header is None:
+                return [source]
+            streams, latest_seq, written_seq = {}, {}, {}
+            for tag_type, timestamp, body in _iter_tags(src):
+                if tag_type == 18 or (tag_type == 9 and _is_sequence_end(body)):
+                    continue
+                if ((tag_type == 9 and _video_sequence_header(body) is not None)
+                        or (tag_type == 8 and _is_audio_sequence_header(body))):
+                    # Emitted before this stream's next packet, in its sub-piece.
+                    latest_seq[tag_type] = body
+                    continue
+                media = tag_type == 8 or (tag_type == 9 and _is_video_media_packet(body))
+                state = streams.get(tag_type)
+                if media:
+                    if state is None:
+                        state = streams[tag_type] = {"epoch": 0, "last": timestamp,
+                                                     "high": timestamp, "offset": 0}
+                    previous_raw = state["last"] - state["offset"]
+                    if previous_raw >= 0xFFFF0000 and timestamp <= 0xFFFF:
+                        state["offset"] += 1 << 32
+                    dts = timestamp + state["offset"]
+                    if dts < state["high"] - 250:
+                        state.update(epoch=state["epoch"] + 1, offset=0, high=timestamp)
+                        dts = timestamp
+                    state["last"] = dts
+                    state["high"] = max(state["high"], dts)
+                epoch = state["epoch"] if state is not None else 0
+                handle = target(epoch, header, timestamp, latest_seq, written_seq)
+                seq = latest_seq.get(tag_type)
+                if seq is not None and written_seq.get((tag_type, epoch)) != seq:
+                    _write_tag(handle, tag_type, timestamp, seq)
+                    written_seq[(tag_type, epoch)] = seq
+                _write_tag(handle, tag_type, timestamp, body)
+        for handle in handles.values():
+            handle.close()
+        handles.clear()
+    except Exception:
+        for handle in handles.values():
+            handle.close()
+        for path in outputs:
+            path.unlink(missing_ok=True)
+        raise
+    kept = []
+    for path in outputs:
+        if _flv_media_bounds_ms(path)[0] is None:
+            path.unlink(missing_ok=True)  # work file only: no media packets
+        else:
+            kept.append(path)
+    if not kept:
+        raise ValueError("No media packets after splitting FLV at clock resets")
+    logger.info("Split %s at clock resets into %s sub-piece(s).", source.name, len(kept))
+    return kept
+
+
+def _split_capture_at_resets(part, directory, notes):
+    try:
+        _analyze_flv(part)
+        return [part]
+    except TimestampDiscontinuity as exc:
+        reason = str(exc).split(";")[0]
+    epochs = split_flv_on_timestamp_resets(part, directory)
+    budget = _finalize_budget.get()
+    if budget is not None:
+        budget.reset_epochs[_flv_cache_key(part)] = epochs
+    spans = [flv_playback_span_ms(epoch) for epoch in epochs]
+    message = (f"split-at-reset: {part.name} ({reason}); {len(epochs)} clock-stable sub-piece(s) "
+               f"placed back to back by their own spans {spans} ms = {sum(spans)} ms expected")
+    logger.warning("FLV clock reset recovery: %s", message)
+    if notes is not None:
+        notes.append(message)
+    return epochs
+
+
+def prepare_recording_parts(parts, work_dir, notes=None, split_resets=False):
     """Return concat inputs and their manifest, retaining each capture's clock.
 
     Non-FLV parts (recordings already started as Matroska) are left as-is so
@@ -370,11 +543,21 @@ def prepare_recording_parts(parts, work_dir):
     start-time differences position them on that same timeline; estimating
     each piece's duration would remove gaps or overlap B-frames.
     Only separate reconnect captures are placed back to back.
+    Recovery (described in ``notes`` when given): a zero-span sliver piece is
+    dropped; if pieces of one capture still do not advance, every piece is
+    placed back to back by its own playback span. With ``split_resets`` a
+    capture whose own clock goes backwards is split into clock-stable
+    sub-pieces that are treated as separate captures (back to back). Callers
+    must verify the published duration against the capture spans
+    (``flv_playback_span_ms`` in the same finalize budget) before trusting it.
     """
+    root = Path(work_dir)
     sources = [Path(part) for part in parts]
+    if split_resets:
+        sources = [epoch for part in sources
+                   for epoch in _split_capture_at_resets(part, root / f"reset-{part.stem}", notes)]
     expanded = []
     lines = ["ffconcat version 1.0"]
-    root = Path(work_dir)
     for source_index, part in enumerate(sources):
         check_finalize_deadline()
         pieces = split_flv_on_parameter_sets(part, root / f"{source_index:04d}-{part.stem}")
@@ -389,11 +572,24 @@ def prepare_recording_parts(parts, work_dir):
         timed = [(piece, _flv_media_bounds_ms(piece)) for piece in pieces]
         # A final sequence header without media is not a concat input.
         timed = [(piece, bounds) for piece, bounds in timed if bounds[0] is not None]
+        timed = _drop_timeline_slivers(timed, notes)
         if not timed:
             raise ValueError("No media packets after preparing FLV capture")
+        back_to_back = any(timed[index + 1][1][0] <= bounds[0]
+                           for index, (_piece, bounds) in enumerate(timed[:-1]))
+        if back_to_back:
+            message = (f"back-to-back: {part.name} pieces do not advance on one clock; "
+                       f"placing {len(timed)} piece(s) by their own playback spans")
+            logger.warning("FLV timeline reset recovery: %s", message)
+            if notes is not None:
+                notes.append(message)
         expanded.extend(piece for piece, _bounds in timed)
         for index, (piece, bounds) in enumerate(timed):
             lines.append(concat_list_line(piece))
+            if back_to_back:
+                if index < len(timed) - 1 or source_index < len(sources) - 1:
+                    lines.append(f"duration {max(1, bounds[1] - bounds[0]) / 1000:.3f}")
+                continue
             if index < len(timed) - 1:
                 duration = timed[index + 1][1][0] - bounds[0]
                 if duration <= 0:

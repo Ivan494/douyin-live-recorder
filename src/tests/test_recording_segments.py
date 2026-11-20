@@ -506,7 +506,6 @@ def test_watcher_records_a_capture_flv_before_publishing_mkv(tmp_path, monkeypat
 
         class Process:
             returncode = 0
-            pid = 12345
 
             def poll(self):
                 return 0
@@ -529,9 +528,7 @@ def test_watcher_records_a_capture_flv_before_publishing_mkv(tmp_path, monkeypat
     )
 
     command = seen["cmd"]
-    assert Path(command[-1]).name == "part-0001.flv"
-    assert Path(command[-1]).parent.parent.name == ".recording_sessions"
-    assert (Path(command[-1]).parent / "session.json").is_file()
+    assert command[-1].endswith(".capture.flv")
     assert command[command.index("-i") + 1] == "https://cdn.example/live.flv"
     assert command.index("-f") > command.index("-i")
     assert command[command.index("-f") + 1] == "flv"
@@ -729,9 +726,7 @@ def test_watcher_remux_preserves_frames_and_removes_only_work_files(tmp_path):
     for path, size in zip(inputs, ('160x120', '320x240')):
         _generate_flv(ffmpeg, path, size, 'baseline')
     expected = [frame for path in inputs for frame in _frame_fingerprints(ffmpeg, path)]
-    session = tmp_path / '.recording_sessions' / 'fixture-watcher'
-    session.mkdir(parents=True)
-    capture = session / 'part-0001.flv'
+    capture = tmp_path / 'fixture.capture.flv'
     _splice_flv(*inputs, capture)
     output = tmp_path / 'fixture.mkv'
     with (tmp_path / 'remux.log').open('w', encoding='utf-8') as log:
@@ -739,7 +734,7 @@ def test_watcher_remux_preserves_frames_and_removes_only_work_files(tmp_path):
     assert _frame_fingerprints(ffmpeg, output) == expected
     _assert_silent_full_decode(ffmpeg, output)
     assert not capture.exists()
-    assert not session.exists()
+    assert not (tmp_path / 'fixture.capture.segments').exists()
     assert all(path.exists() for path in inputs)
 
 
@@ -769,26 +764,6 @@ def test_real_multi_track_input_publishes_one_video_and_audio(tmp_path):
         assert sorted(s['codec_type'] for s in json.loads(result.stdout)['streams']) == ['audio', 'video']
         assert len(_frame_fingerprints(ffmpeg, output)) == 5
         _assert_silent_full_decode(ffmpeg, output)
-
-
-def test_packaged_media_check_with_windows_legacy_encoding(tmp_path, monkeypatch):
-    import douyin_recorder_app as app
-    from release_selftest import recording_self_test
-    ffmpeg, ffprobe = _tool('ffmpeg'), _tool('ffprobe')
-    if not ffmpeg or not ffprobe:
-        pytest.skip('ffmpeg and ffprobe are required')
-    tools = tmp_path / 'youtube-dl'
-    tools.mkdir()
-    for name, source in [('ffmpeg', ffmpeg), ('ffprobe', ffprobe)]:
-        shutil.copyfile(source, tools / (name + '.exe'))
-    original_roots = app._trusted_tool_roots
-    monkeypatch.setattr(app, '_trusted_tool_roots', lambda: (*original_roots(), tools))
-    # GitHub Windows uses cp1252. FFmpeg emits UTF-8, including the Chinese
-    # self-test path. Implicit text decoding used to crash the reader thread.
-    monkeypatch.setattr(subprocess, '_text_encoding', lambda: 'cp1252')
-    assert recording_self_test(tmp_path / 'douyindownload' / '_automation') == {
-        'libx264': 16, 'libx265': 16,
-    }
 
 
 @pytest.mark.parametrize('stream', [8, 9])

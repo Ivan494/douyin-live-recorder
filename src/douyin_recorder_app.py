@@ -1,8 +1,9 @@
-import argparse
+﻿import argparse
 import asyncio
 import base64
 import ctypes
 import copy
+import hashlib
 from collections import OrderedDict
 from contextlib import nullcontext
 import json
@@ -14,6 +15,7 @@ import random
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -21,13 +23,20 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from tkinter import BooleanVar, StringVar, Tk, Toplevel, messagebox, filedialog
-from tkinter import ttk
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-import pystray
-from PIL import Image, ImageDraw
+HEADLESS = os.environ.get("DOUYIN_HEADLESS", "").lower() in {"1", "true", "yes"} or "--headless" in sys.argv
+if HEADLESS:
+    # GUI classes are defined below, but cannot be constructed by the service.
+    class Toplevel:
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("GUI dialogs are unavailable in headless mode")
+else:
+    from tkinter import BooleanVar, StringVar, Tk, Toplevel, messagebox, filedialog
+    from tkinter import ttk
+    import pystray
+    from PIL import Image, ImageDraw
 from streamget.platforms.douyin.live_stream import DouyinLiveStream
 
 from douyin_media_downloader import (
@@ -42,17 +51,18 @@ from douyin_media_downloader import (
     import_chrome_session,
     launch_douyin_login_browser,
     normalize_pasted_link,
+    profile_lookup_cooldown,
     saved_session_info,
 )
+from lookup_resilience import LOOKUP_DEFAULTS, LookupDeferred
 from recording_segments import (
     concat_list_line,
+    prepare_recording_parts,
     finalize_prepared_recording,
     flv_playback_span_ms,
     probe_recording,
     finalize_budget,
     check_finalize_deadline,
-    prepare_recording_parts,
-    ffmpeg_concat_copy_command,
     ffmpeg_live_capture_output_args,
 )
 from recording_urls import (
@@ -69,8 +79,8 @@ APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
 PACK_ROOT = APP_DIR.parent.parent
 ROOT_DOWNLOAD_DIR = APP_DIR.parent
 TOOLS_DIR = PACK_ROOT / "youtube-dl"
-DEFAULT_FFMPEG_PATH = TOOLS_DIR / "ffmpeg.exe"
-DEFAULT_FFPROBE_PATH = TOOLS_DIR / "ffprobe.exe"
+DEFAULT_FFMPEG_PATH = TOOLS_DIR / "ffmpeg.exe" if os.name == "nt" else Path("/usr/bin/ffmpeg")
+DEFAULT_FFPROBE_PATH = TOOLS_DIR / "ffprobe.exe" if os.name == "nt" else Path("/usr/bin/ffprobe")
 DEFAULT_YTDLP_PATH = TOOLS_DIR / "yt-dlp.exe"
 PROFILES_FILE = APP_DIR / "profiles.json"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -264,7 +274,10 @@ def expand_portable_path(value):
     }
     for marker, path in replacements.items():
         if value == marker or value.startswith((marker + "\\", marker + "/")):
-            return str(path) + value[len(marker):]
+            rest = value[len(marker):]
+            if os.name != "nt":
+                rest = rest.replace("\\", "/")
+            return str(path) + rest
     # Do not remigrate a current install nested under a historical root, or
     # recursively replace a root just produced by expanding a portable token.
     normalized = value.replace("/", "\\").casefold()
@@ -500,13 +513,14 @@ def _looks_like_cookie_header(value):
 
 
 def _trusted_tool_roots():
-    return default_trusted_tool_roots(APP_DIR, TOOLS_DIR)
+    roots = default_trusted_tool_roots(APP_DIR, TOOLS_DIR)
+    return roots if os.name == "nt" else (*roots, Path("/usr/bin"), Path("/usr/local/bin"))
 
 
 def resolve_ffmpeg_executable(path_text):
     return resolve_trusted_executable(
         path_text,
-        allowed_basenames={"ffmpeg.exe"},
+        allowed_basenames={"ffmpeg.exe"} if os.name == "nt" else {"ffmpeg"},
         trusted_roots=_trusted_tool_roots(),
     )
 
@@ -530,6 +544,18 @@ def hidden_subprocess_kwargs():
         "creationflags": subprocess.CREATE_NO_WINDOW,
         "startupinfo": startupinfo,
     }
+
+
+def force_kill_process(process):
+    """Use the platform's process API; taskkill is Windows-only."""
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/PID", str(process.pid), "/T"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=10, **hidden_subprocess_kwargs(),
+        )
+    else:
+        process.kill()
 
 
 def setup_logging(*, console=False):
@@ -837,6 +863,7 @@ def default_settings():
         "priority_poll_jitter_seconds": 2,
         "poll_jitter_seconds": 8,
         "media_poll_interval_seconds": DEFAULT_MEDIA_INTERVAL,
+        **LOOKUP_DEFAULTS,
         # FIX-PATHLEN: long captions used to be truncated so the full path could
         # fit Windows' 260-char MAX_PATH.  Keep the caption intact and let
         # extended-length paths carry the overflow; optionally group every
@@ -938,13 +965,13 @@ class RecorderStore:
         if not isinstance(self.settings, dict):
             raise ValueError("settings.json must contain an object")
         set_language(self.settings.get("language"))
-        if "start_with_windows" not in self.settings:
+        if os.name == "nt" and "start_with_windows" not in self.settings:
             self.settings["start_with_windows"] = is_autostart_enabled()
         # Repair the startup shortcut when the setting is enabled but the
         # shortcut is missing or broken (e.g. after a directory move or a
         # failed PowerShell read).  Failures here are non-fatal — the app can
         # still run; the user will see the toggle state in Settings.
-        if not read_only and self.settings.get("start_with_windows") and not is_autostart_enabled():
+        if os.name == "nt" and not read_only and self.settings.get("start_with_windows") and not is_autostart_enabled():
             try:
                 set_autostart_enabled(True)
             except Exception:
@@ -1196,11 +1223,7 @@ class MonitorEngine:
                 if process.poll() is None:
                     logging.warning("Force-killing unresponsive FFmpeg for %s (PID %s)", profile_id, getattr(process, "pid", "?"))
                     try:
-                        subprocess.run(
-                            ["taskkill", "/F", "/PID", str(process.pid), "/T"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            timeout=10, **hidden_subprocess_kwargs(),
-                        )
+                        force_kill_process(process)
                     except Exception:
                         pass
             self._poll_processes()
@@ -1234,13 +1257,7 @@ class MonitorEngine:
                     getattr(process, "pid", "?"),
                 )
                 try:
-                    subprocess.run(
-                        ["taskkill", "/F", "/PID", str(process.pid), "/T"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=10,
-                        **hidden_subprocess_kwargs(),
-                    )
+                    force_kill_process(process)
                 except Exception:
                     logging.exception("Failed to force-kill FFmpeg for %s", profile_id)
         self._poll_processes()
@@ -1410,7 +1427,6 @@ class MonitorEngine:
         )
         return {key: recording.get(key) for key in keys}
 
-
     def _save_recording_manifest(self, recording):
         manifest_path = recording.get("manifest_path")
         if not manifest_path:
@@ -1420,6 +1436,8 @@ class MonitorEngine:
         temporary = path.with_suffix(path.suffix + ".tmp")
         with open(temporary, "w", encoding="utf-8") as fh:
             json.dump(self._manifest_payload(recording), fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
         temporary.replace(path)
 
     @staticmethod
@@ -1483,8 +1501,8 @@ class MonitorEngine:
             manifest["parts"].append(output_file)
         manifest.setdefault("started_at", time.time())
         manifest.setdefault("last_growth_at", time.time())
-        # A saved zero may predate later writes; recovery cannot prove that
-        # this part never held media. Preserve that uncertainty until it grows.
+        # V1216-PORT (#25): a saved zero may predate later writes; recovery cannot
+        # prove this part never held media. Keep that uncertainty until it grows.
         manifest["last_size"] = manifest.get("last_size") or None
         now = time.time()
         try:
@@ -1579,24 +1597,26 @@ class MonitorEngine:
                 key=_safe_mtime,
                 reverse=True,
             )
-            # Saved batches are immutable, including after a caught rename
-            # failure. Publish independently of any current/new capture.
-            for manifest_path in manifests:
-                manifest = self._read_recording_manifest(manifest_path)
-                if (not manifest or manifest.get("profile_id") != profile_id
-                        or not manifest.get("publication_plan") or manifest.get("status") == "complete"):
-                    continue
-                name = f"publication-finalizer-{manifest_path.parent}"
-                if any(t.name == name and t.is_alive() for t in self.finalizer_threads):
-                    continue
-                manifest["manifest_path"] = str(manifest_path)
-                manifest["session_dir"] = str(manifest_path.parent)
-                thread = threading.Thread(
-                    target=self._finalize_recording_worker,
-                    args=(manifest, "Resume saved publication"), name=name, daemon=False,
-                )
-                self.finalizer_threads.append(thread)
-                thread.start()
+            if not HEADLESS:
+                # Saved batches are immutable, including after a caught rename
+                # failure. Publish independently of any current/new capture.
+                # Headless queues these through its disk-guarded sweep instead.
+                for manifest_path in manifests:
+                    manifest = self._read_recording_manifest(manifest_path)
+                    if (not manifest or manifest.get("profile_id") != profile_id
+                            or not manifest.get("publication_plan") or manifest.get("status") == "complete"):
+                        continue
+                    name = f"publication-finalizer-{manifest_path.parent}"
+                    if any(t.name == name and t.is_alive() for t in self.finalizer_threads):
+                        continue
+                    manifest["manifest_path"] = str(manifest_path)
+                    manifest["session_dir"] = str(manifest_path.parent)
+                    thread = threading.Thread(
+                        target=self._finalize_recording_worker,
+                        args=(manifest, "Resume saved publication"), name=name, daemon=False,
+                    )
+                    self.finalizer_threads.append(thread)
+                    thread.start()
             if profile_id in self.recordings:
                 continue
             for manifest_path in manifests:
@@ -1605,10 +1625,10 @@ class MonitorEngine:
                     continue
                 if manifest.get("publication_plan"):
                     continue
-                if manifest.get("status") in {"complete", "failed"}:
+                if manifest.get("status") in {"complete", "failed"} or (HEADLESS and manifest.get("status") in {"waiting_for_disk", "finalizing"}):
                     continue
-                # A saved declaration may represent real media even when its
-                # file is missing now. Keep the complete list so finalization
+                # V1216-PORT (#26): a saved declaration may represent real media even
+                # when its file is missing now. Keep the complete list so finalization
                 # cannot silently publish a shorter recording after restart.
                 parts = [str(Path(value)) for value in manifest.get("parts") or []]
                 observed_sizes = {}
@@ -1618,8 +1638,7 @@ class MonitorEngine:
                     except FileNotFoundError:
                         continue
                     except OSError:
-                        # An inaccessible file has unknown state, not proof
-                        # that this session contains no recoverable media.
+                        # Inaccessible = unknown state, not proof of no media.
                         observed_sizes[part] = None
                 if not observed_sizes:
                     continue
@@ -1651,7 +1670,6 @@ class MonitorEngine:
                 break
         if recovered:
             self.emit("engine", f"Recovered {recovered} unfinished MKV recording session(s).")
-
 
     @staticmethod
     def classify_error(exc):
@@ -1781,13 +1799,35 @@ class MonitorEngine:
 
     def _poll_processes_locked(self, only_profile_id=None):
         for profile_id, process in list(self.processes.items()):
+            # V1216-PORT (#24): OK-FIX-ROT3 reaps only the profile being started.
             if only_profile_id is not None and profile_id != only_profile_id:
                 continue
             if process.poll() is None:
                 recording = self.recordings.get(profile_id, {})
                 rotate_at = recording.get("rotate_at")
+                if rotate_at and time.time() >= rotate_at and recording.get("rotation_stop_requested"):
+                    # OK-FIX-ROT2: hard-stop fallback if FFmpeg ignores the soft rotate stop.
+                    asked = recording.get("rotation_stop_requested_at") or time.time()
+                    recording.setdefault("rotation_stop_requested_at", asked)
+                    waited = time.time() - asked
+                    if waited >= 90 and not recording.get("rotation_kill_sent"):
+                        recording["rotation_kill_sent"] = True
+                        logging.warning("FFmpeg for %s still alive %.0fs after rotate stop; sending SIGKILL.", profile_id, waited)
+                        try:
+                            force_kill_process(process)
+                        except Exception:
+                            logging.exception("Failed to kill FFmpeg for %s", profile_id)
+                    elif waited >= 60 and not recording.get("rotation_term_resent"):
+                        recording["rotation_term_resent"] = True
+                        logging.warning("FFmpeg for %s still alive %.0fs after rotate stop; re-sending SIGTERM.", profile_id, waited)
+                        try:
+                            process.terminate()
+                        except Exception:
+                            logging.exception("Failed to re-terminate FFmpeg for %s", profile_id)
+                    continue
                 if rotate_at and time.time() >= rotate_at and not recording.get("rotation_stop_requested"):
                     recording["rotation_stop_requested"] = True
+                    recording["rotation_stop_requested_at"] = time.time()
                     recording["stop_reason"] = "Scheduled signed-URL refresh"
                     self.emit(
                         profile_id,
@@ -1861,14 +1901,17 @@ class MonitorEngine:
                 continue
             recording["pid"] = ""
             recording["last_exit_code"] = process.returncode
-            # Only a part observed to have no data can be omitted. Missing
-            # previously populated parts must still fail finalization.
-            part = recording.get("output_file")
-            if part in (recording.get("parts") or []) and recording.get("last_size") == 0:
+            # FIX-MISSINGPART / V1216-PORT (#25): FFmpeg that fails at input open
+            # (e.g. CDN 404) never creates its part file. Drop only a part that was
+            # observed empty (last_size == 0, set at part start, never lowered) and
+            # whose path is definitely absent. A part that held data, an unknown
+            # size after restart (None), or an unreadable path still fails finalize.
+            _part = recording.get("output_file")
+            if _part in (recording.get("parts") or []) and recording.get("last_size") == 0:
                 try:
-                    Path(part).stat()
+                    Path(_part).stat()
                 except FileNotFoundError:
-                    recording["parts"].remove(part)
+                    recording["parts"].remove(_part)
                     logging.warning(
                         "Part %s for %s produced no file (stream unavailable); dropping from part list.",
                         recording.get("part_index"),
@@ -1883,6 +1926,8 @@ class MonitorEngine:
             recording["status"] = "recovering"
             recording.pop("stall_stop_requested", None)
             recording.pop("rotation_stop_requested", None)
+            for _flag in ("rotation_stop_requested_at", "rotation_term_resent", "rotation_kill_sent"):
+                recording.pop(_flag, None)
             try:  # FIX-APP-5: prevent I/O error from killing monitor thread
                 self._save_recording_manifest(recording)
             except OSError:
@@ -1925,7 +1970,7 @@ class MonitorEngine:
         try:
             current_size = Path(output_file).stat().st_size
         except OSError:
-            current_size = None
+            current_size = None  # V1216-PORT (#25): unknown, not "empty"
         now = time.time()
         last_size = recording.get("last_size")
         if current_size is not None and current_size > (last_size or 0):
@@ -1937,8 +1982,8 @@ class MonitorEngine:
                 self.last_error_kinds.pop(profile_id, None)
             recording.pop("stall_stop_requested", None)
             return False
-        # Keep the largest observed size until the next part starts. A stat
-        # failure or truncation must not erase evidence of recorded media.
+        # V1216-PORT (#25): keep the largest observed size until the next part
+        # starts. A stat failure or truncation must not erase evidence of media.
         last_growth_at = recording.get("last_growth_at") or now
         timeout = self.setting_seconds("recording_stall_timeout_seconds")
         return now - last_growth_at >= timeout
@@ -1972,7 +2017,6 @@ class MonitorEngine:
             raise RuntimeError("FFprobe is unavailable; raw parts cannot be safely removed") from exc
         return probe_recording(path, probe_path, expected, hidden_subprocess_kwargs())
 
-
     @staticmethod
     def _recording_part_stamp(path):
         st = path.stat()
@@ -1980,11 +2024,10 @@ class MonitorEngine:
             raise RuntimeError(f"Missing MKV part: {path}")
         return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
 
-
     def _finalize_timeout(self, parts):
         # Stream-copy concat scales with size: a fixed 240 s killed a 10 GB
         # session at 8 GB. Allow base + 120 s per GiB.
-        base = max(30, int(self.store.settings.get("recording_finalize_timeout_seconds", 240)))
+        base = max(30, int(self.store.settings.get("headless_finalize_timeout_seconds", 240)))
         size = 0
         for path in parts:
             try:
@@ -1993,11 +2036,17 @@ class MonitorEngine:
                 pass
         return base + int(size / (1 << 30) * 120)
 
+    def _finalize_recording_worker(self, recording, reason):
+        # A complete retained session must never produce a second publication.
+        if recording.get("status") == "complete":
+            return
+        parts = [Path(value) for value in recording.get("parts") or []]
+        base = max(30, int(self.store.settings.get("headless_finalize_timeout_seconds", 240)))
+        with finalize_budget(self._finalize_timeout(parts), base):
+            self._finalize_recording_with_budget(recording, reason)
 
     def _check_finalize_normalization_space(self, recording, inputs):
-        required = sum(Path(path).stat().st_size for path in inputs) * 2
-        if shutil.disk_usage(recording["session_dir"]).free < required:
-            raise RuntimeError("Insufficient space for normalized recording copies; raw parts preserved")
+        """Headless overrides this to reserve extra copies under its lock."""
 
     @staticmethod
     def _sync_recording_directory(path):
@@ -2008,59 +2057,79 @@ class MonitorEngine:
             finally:
                 os.close(descriptor)
 
-
     def _resume_recording_publication(self, recording):
-        """Roll forward exactly the verified batch saved before publication."""
+        """Roll forward exactly the verified batch saved before its first rename."""
         plan = recording["publication_plan"]
         parts = [Path(value) for value in recording.get("parts") or []]
         if [list(self._recording_part_stamp(path)) for path in parts] != plan["part_stamps"]:
             raise RuntimeError("MKV parts changed since publication plan; raw parts preserved")
-        manifest = Path(recording["manifest_path"])
-        with manifest.open("r+b") as handle:
+        final_output = Path(recording["final_output"])
+        # Capture stems can already fill NAME_MAX with the staging suffix.
+        # Keep the gate (including its temporary suffix) independent of length.
+        key = hashlib.sha256(final_output.stem.encode("utf-8")).hexdigest()
+        gate = final_output.with_name(f".publication-{key}.publication.json")
+        temporary_gate = gate.with_suffix(".json.tmp")
+        with temporary_gate.open("w", encoding="utf-8") as handle:
+            json.dump({"destinations": [member["destination"] for member in plan["members"]],
+                       "manifest": str(Path(recording["manifest_path"]).resolve())}, handle)
+            handle.flush()
             os.fsync(handle.fileno())
-        self._sync_recording_directory(manifest.parent)
+        temporary_gate.replace(gate)
+        self._sync_recording_directory(gate.parent)
         outputs = []
         for member in plan["members"]:
             check_finalize_deadline()
             source, destination = Path(member["staging"]), Path(member["destination"])
+            # Rename changes ctime on some platforms. The other identity fields
+            # distinguish a verified moved file from an older destination.
             current = source if source.exists() else destination
             if list(self._recording_part_stamp(current)[:4]) != member["stamp"]:
                 raise RuntimeError(f"Verified publication member changed or missing: {current}")
-            # Flush media contents before committing the name or deleting raw.
+            # V1216-PORT (#23): flush media contents before committing the name.
             with current.open("r+b") as handle:
                 os.fsync(handle.fileno())
             if current == source:
-                if os.name == "nt":
-                    # Windows rename refuses an existing destination and also
-                    # works on removable drives without hard-link support.
-                    source.rename(destination)
-                else:
-                    # A restart can encounter both links after interruption.
-                    if destination.exists():
-                        if not source.samefile(destination):
-                            raise FileExistsError(f"Final recording already exists: {destination}")
-                    else:
-                        os.link(source, destination)
+                # V1216-PORT (#23): never overwrite a different existing final video.
+                # A restart may find both names linked to the same verified file.
+                if destination.exists():
+                    if not source.samefile(destination):
+                        raise FileExistsError(f"Final recording already exists: {destination}")
                     source.unlink()
+                else:
+                    source.replace(destination)
             outputs.append(destination)
         check_finalize_deadline()
         if [list(self._recording_part_stamp(path)) for path in parts] != plan["part_stamps"]:
             raise RuntimeError("MKV parts changed during publication; raw parts preserved")
-        for directory in {path.parent for path in outputs}:
-            self._sync_recording_directory(directory)
+        self._sync_recording_directory(gate.parent)
         recording["final_outputs"] = [str(path) for path in outputs]
         recording["status"] = "complete"
         recording["publication_plan"] = dict(plan, state="committed")
         try:
             self._save_recording_manifest(recording)
-            with manifest.open("r+b") as handle:
-                os.fsync(handle.fileno())
-            self._sync_recording_directory(manifest.parent)
+            self._sync_recording_directory(Path(recording["manifest_path"]).parent)
         except Exception:
             recording["publication_plan"] = plan
             raise
+        # A saved batch may have started with the earlier stem-based gate.
+        for legacy_gate in gate.parent.glob(".*.publication.json"):
+            if legacy_gate.name == f".{final_output.stem}.publication.json":
+                legacy_gate.unlink()
+        gate.unlink()
+        self._sync_recording_directory(gate.parent)
         return outputs
 
+    def _verify_recovered_duration(self, staged, expected, finalize_log):
+        """A recovered timeline must cover the capture spans tightly before publish."""
+        total = sum(self._validate_final_recording(path) for path in staged)
+        tolerance = max(2.0, expected * 0.001)
+        verdict = "PASS" if abs(total - expected) <= tolerance else "FAIL"
+        with finalize_log.open("a", encoding="utf-8") as log:
+            log.write(f"RECOVERY VERIFY {verdict}: output {total:.3f}s vs capture spans "
+                      f"{expected:.3f}s (tolerance {tolerance:.3f}s, {len(staged)} file(s))\n")
+        if verdict != "PASS":
+            raise RuntimeError(f"Recovered timeline {total:.3f}s differs from capture spans "
+                               f"{expected:.3f}s; raw capture must be preserved")
 
     def _finalize_recording_with_budget(self, recording, reason):
         final_output = Path(recording["final_output"])
@@ -2090,17 +2159,15 @@ class MonitorEngine:
             # Missing parts must not silently shorten the capture. A failed
             # connection may leave a zero-byte part; track it too so growth
             # during the remux cannot be lost, but omit it from the concat.
-            required = sum(path.stat().st_size for path in parts)
-            required += sum(path.stat().st_size for path in parts if path.suffix.lower() == ".flv")
-            if shutil.disk_usage(session_dir).free < required:
-                raise RuntimeError("Insufficient space for recording preparation and output; raw parts preserved")
             stamps = [self._recording_part_stamp(path) for path in parts]
             usable_parts = [path for path, stamp in zip(parts, stamps) if stamp[2] > 0]
             if not usable_parts:
                 raise RuntimeError("No usable MKV parts")
             # Split any FLV capture whose H.264/HEVC sequence header changes
             # (PK / co-stream) so every piece carries one parameter set.
-            concat_inputs, manifest = prepare_recording_parts(usable_parts, session_dir / "parameter_sets")
+            recovery_notes = []
+            concat_inputs, manifest = prepare_recording_parts(
+                usable_parts, session_dir / "parameter_sets", recovery_notes, True)  # split_resets: verified below
             if len(concat_inputs) != len(usable_parts):
                 logging.info(
                     "Expanded %s capture file(s) into %s parameter-stable segment(s) for %s.",
@@ -2126,6 +2193,8 @@ class MonitorEngine:
                 return durations[path]
 
             with finalize_log.open("a", encoding="utf-8") as log_handle:
+                for note in recovery_notes:
+                    log_handle.write(f"RECOVERY {note}\n")
                 staged = finalize_prepared_recording(
                     resolve_ffmpeg_executable(self.store.settings["ffmpeg_path"]),
                     concat_inputs, concat_path, temporary_output, remux_dir, log_handle,
@@ -2135,6 +2204,9 @@ class MonitorEngine:
                     process_kwargs=hidden_subprocess_kwargs(),
                     before_normalize=lambda: self._check_finalize_normalization_space(recording, concat_inputs),
                 )
+            if recovery_notes:
+                self._verify_recovered_duration(
+                    staged, sum(duration_for(path) for path in usable_parts), finalize_log)
             if [self._recording_part_stamp(path) for path in parts] != stamps:
                 raise RuntimeError("MKV parts changed during finalization; raw parts preserved")
             final_output.parent.mkdir(parents=True, exist_ok=True)
@@ -2151,7 +2223,8 @@ class MonitorEngine:
                              "stamp": list(self._recording_part_stamp(source)[:4])}
                             for source, destination in zip(staged, outputs)],
             }
-            # Persist the recovery plan before publishing any verified output.
+            # Save the recovery plan; publication also persists an independent
+            # uploader gate before any rename. Keep stages until batch commit.
             self._save_recording_manifest(recording)
             outputs = self._resume_recording_publication(recording)
             # FIX-H5: Move rmtree outside the critical path. If cleanup fails
@@ -2171,8 +2244,8 @@ class MonitorEngine:
             )
             logging.info("Finalized %s from %s part(s) (%s concat input(s)): %s", profile_id, len(usable_parts), len(concat_inputs), outputs)
         except Exception as exc:
-            # A killed/failed concat leaves a partial temp file external consumers
-            # must ignore; it is never the only copy (raw parts remain).
+            # A killed/failed concat leaves a partial temp file the uploader
+            # skips forever; it is never the only copy (raw parts remain).
             pending_plan = recording.get("publication_plan")
             if not pending_plan:
                 try:
@@ -2206,17 +2279,6 @@ class MonitorEngine:
                 current_file=str(session_dir),
                 cooldown="Raw parts preserved",
             )
-
-
-    def _finalize_recording_worker(self, recording, reason):
-        # A complete retained session must never produce a second publication.
-        if recording.get("status") == "complete":
-            return
-        parts = [Path(value) for value in recording.get("parts") or []]
-        base = max(30, int(self.store.settings.get("recording_finalize_timeout_seconds", 240)))
-        with finalize_budget(self._finalize_timeout(parts), base):
-            self._finalize_recording_with_budget(recording, reason)
-
 
     def _finalize_recording_session(self, profile_id, reason):
         recording = self.recordings.pop(profile_id, None)
@@ -2534,19 +2596,18 @@ class MonitorEngine:
         if not is_safe_recording_url(input_url):
             raise RuntimeError("Live stream URL uses an unsupported or unsafe protocol")
         ffmpeg_executable = resolve_ffmpeg_executable(self.store.settings["ffmpeg_path"])
-        # FIX-ROT3: the profile loop can observe this part's exit through
-        # _is_recording() -> poll() after this pass already ran _poll_processes().
-        # Replacing processes[id] then drops the exit path: the rotation flag
-        # stays set, "Recording ended" is never logged, and the rapid-death
-        # and finalize_on_exit checks never run. Reap first, and never start a
-        # second FFmpeg while the previous one is still alive.
+        # OK-FIX-ROT3 (root cause): the live-monitor loop can see the old part's FFmpeg exit
+        # (via _is_recording -> poll()) after this pass's _poll_processes() already ran, and get
+        # here before the exit was handled. Overwriting self.processes[...] then silently drops the
+        # exit bookkeeping (rotation/stall flag reset, "Recording ended" log, stderr close, FIX-S3
+        # churn guard, finalize_on_exit). Never spawn over an un-reaped entry: reap it first, and
+        # never start a second FFmpeg while the previous one is still alive.
         previous = self.processes.get(profile["id"])
         if previous is not None:
             if previous.poll() is None:
                 logging.warning(
                     "%s: previous FFmpeg (PID %s) is still running; not starting another capture part.",
-                    profile.get("name"),
-                    getattr(previous, "pid", "?"),
+                    profile.get("name"), getattr(previous, "pid", "?"),
                 )
                 return
             pending = self.recordings.get(profile["id"]) or {}
@@ -2632,14 +2693,11 @@ class MonitorEngine:
         recording["last_growth_at"] = time.time()
         recording["segment_started_at"] = time.time()
         recording["rotate_at"] = time.time() + self.setting_seconds("recording_segment_max_seconds")
-        # FIX-ROT1: backstop for a respawn that did not go through the exit path.
-        # _start_recording resets rotate_at; the stop flags must be reset too,
-        # or the pending-stop guard skips every later rotation for this session.
-        for flag in (
-            "rotation_stop_requested",
-            "stall_stop_requested",
-        ):
-            recording.pop(flag, None)
+        # OK-FIX-ROT1: a new part can be spawned by the stream-check loop before the poll loop
+        # sees the old part exit; clear per-part stop flags here so rotation re-arms every part.
+        for _flag in ("rotation_stop_requested", "rotation_stop_requested_at", "rotation_term_resent",
+                      "rotation_kill_sent", "stall_stop_requested"):
+            recording.pop(_flag, None)
         recording["status"] = "recording"
         recording["stop_reason"] = ""
         recording.pop("recovery_started_at", None)
@@ -2784,7 +2842,7 @@ class MediaDownloadEngine:
 
     @staticmethod
     def enabled_for_profile(profile):
-        return bool(profile.get("auto_download_videos")) or bool(profile.get("auto_download_stories"))
+        return (not HEADLESS and bool(profile.get("auto_download_videos"))) or bool(profile.get("auto_download_stories"))
 
     def _run(self):
         while not self.stop_event.is_set():
@@ -2819,7 +2877,8 @@ class MediaDownloadEngine:
                 # remaining profiles will almost certainly hit the same IP-level
                 # captcha.  Skip them and let the backoff cool down.
                 last_status = (self._last_video_status or {}).get(profile_id, "")
-                if last_status == "captcha":
+                resilient = self.store.settings.get("media_lookup_resilience_enabled") is True
+                if last_status == "captcha" and not resilient:
                     # FIX-CB-2: Only trip circuit breaker after 2+ consecutive captcha hits.
                     # A single captcha may be a false positive (preloaded SDK element).
                     captcha_streak = self.consecutive_failures.get(profile_id, 0)
@@ -2839,14 +2898,19 @@ class MediaDownloadEngine:
                             "Captcha on %s (streak=%d), continuing with remaining profiles.",
                             profile.get("name"), captcha_streak,
                         )
-                if failures > 0:
+                if failures > 0 and not resilient:
                     backoff_multiplier = min(2 ** failures, 8)
                     wait_seconds = int(wait_seconds * backoff_multiplier)
                     logging.info(
                         "Media backoff for %s: %d consecutive failures, waiting %ds",
                         profile.get("name"), failures, wait_seconds,
                     )
-                self.next_check[profile_id] = time.monotonic() + wait_seconds
+                if resilient:
+                    wait_seconds = max(wait_seconds, profile_lookup_cooldown(profile, self.store.settings))
+                self.next_check[profile_id] = max(
+                    self.next_check.get(profile_id, 0) if resilient else 0,
+                    time.monotonic() + wait_seconds,
+                )
                 self.emit(
                     profile_id,
                     f"Next media check in {wait_seconds}s.",
@@ -2918,7 +2982,7 @@ class MediaDownloadEngine:
         cancellation = ProfileCancellation(self.stop_event, self.store, profile)
         if cancellation.is_set():
             return
-        videos = bool(profile.get("auto_download_videos"))
+        videos = not HEADLESS and bool(profile.get("auto_download_videos"))
         stories = bool(profile.get("auto_download_stories"))
         last_progress = ""
 
@@ -2970,6 +3034,12 @@ class MediaDownloadEngine:
                 media_last_checked=now_text(),
                 media_next_check="",
             )
+        except LookupDeferred as exc:
+            # A refresh must respect admission too. Deferral is not a failed
+            # lookup and must not generate another exception/attention alert.
+            self.next_check[profile["id"]] = time.monotonic() + exc.retry_after
+            self.emit(profile["id"], str(exc), media_status="Lookup cooling down",
+                      media_progress="", media_next_check=future_text(exc.retry_after))
         except InterruptedError:
             self.emit(profile["id"], "Media download cancelled.", media_status="Stopped", media_progress="Stopped")
         except CaptchaDetectedError as exc:
@@ -2987,7 +3057,12 @@ class MediaDownloadEngine:
                 media_next_check="",
             )
         except Exception as exc:
-            logging.exception("Media download check failed for %s", profile.get("name"))
+            if self.store.settings.get("media_lookup_resilience_enabled") is True:
+                # Retry details are DEBUG; admitted failures get one concise
+                # warning without exception text, URLs or a repeated traceback.
+                logging.warning("Media download check failed (%s)", type(exc).__name__)
+            else:
+                logging.exception("Media download check failed for %s", profile.get("name"))
             self.consecutive_failures[profile["id"]] = self.consecutive_failures.get(profile["id"], 0) + 1
             self.emit(
                 profile["id"],
@@ -3018,6 +3093,12 @@ class AdoptedProcess:
 
     def terminate(self):
         if self.poll() is not None:
+            return
+        if os.name != "nt":
+            try:
+                os.kill(self.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             return
         # FIX-APP-11: Try graceful shutdown first (lets ffmpeg flush MKV trailer),
         # then escalate to force-kill after 3 seconds.
@@ -3050,6 +3131,16 @@ class AdoptedProcess:
                 )
             except Exception:
                 pass
+
+    def kill(self):
+        if self.poll() is None:
+            if os.name == "nt":
+                force_kill_process(self)
+            else:
+                try:
+                    os.kill(self.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 class ProfileDialog(Toplevel):
@@ -4305,6 +4396,9 @@ def run_check():
 
 
 def main():
+    if HEADLESS:
+        from douyin_headless import main as headless_main
+        return headless_main()
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="Run one profile check without opening the UI.")
     parser.add_argument("--self-test-report", help="Run an offline packaging self-test and write its JSON result.")

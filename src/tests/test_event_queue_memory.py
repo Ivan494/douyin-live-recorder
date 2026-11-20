@@ -1,6 +1,7 @@
 """Exercise the GUI callback/worker seam without starting Tk or loading state."""
 import queue
 import threading
+import pytest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -108,6 +109,7 @@ def test_distinct_producer_flood_has_fixed_capacity_and_never_blocks():
     assert pending[-1] == "4999"
 
 
+@pytest.mark.skipif(getattr(app, 'HEADLESS', False), reason='GUI construction is unavailable in headless mode')
 def test_recorder_app_constructs_bounded_queue():
     root = Mock()
     with patch.object(app, "setup_logging"), patch.object(app, "RecorderStore"), \

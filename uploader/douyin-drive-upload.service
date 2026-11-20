@@ -1,0 +1,11 @@
+[Unit]
+Description=Douyin recorder: offload finished files to Google Drive (saridq)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/bin/python3 /home/ubuntu/douyin-live-recorder/uploader/drive_uploader.py
+TimeoutStartSec=6h
