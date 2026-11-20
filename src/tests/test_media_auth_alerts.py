@@ -58,7 +58,7 @@ class AuthAlertsTest(unittest.TestCase):
         browser.assert_not_called()
 
     def test_login_summary_backs_off_and_updates_status(self):
-        p={'id':'a','name':'Test','auto_download_stories':True}
+        p={'id':'a','name':'Test','auto_download_stories':True,'media_not_before':'2026-11-20T12:00:00+00:00'}
         store=SimpleNamespace(settings={}, get_profile=lambda _:p)
         with patch.object(app.MediaDownloadEngine,'_load_circuit_breaker_state'):
             engine=app.MediaDownloadEngine(store,queue.Queue(),notify_callback=Mock())

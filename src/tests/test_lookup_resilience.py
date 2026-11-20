@@ -398,11 +398,12 @@ def test_asset_timeout_does_not_retry_metadata_or_download(sandbox, monkeypatch)
 
 
 def test_engine_deferral_does_not_log_exception_or_increment_failures(sandbox, monkeypatch, caplog):
-    store = SimpleNamespace(settings=sandbox.settings, get_profile=lambda _id: sandbox.profile)
+    profile = {**sandbox.profile, "media_not_before": "2026-11-20T12:00:00+00:00"}
+    store = SimpleNamespace(settings=sandbox.settings, get_profile=lambda _id: profile)
     engine = app.MediaDownloadEngine(store, app.RecorderEventQueue(), notify_callback=Mock())
     monkeypatch.setattr(app, "download_profile", Mock(side_effect=LookupDeferred(45)))
     with caplog.at_level(logging.WARNING):
-        engine._check_profile(sandbox.profile)
+        engine._check_profile(profile)
     assert not caplog.records
     assert not engine.consecutive_failures
     engine.notify_callback.assert_not_called()
@@ -438,11 +439,12 @@ def test_scheduler_isolates_captcha_and_honors_cooldown_only_when_enabled(
 
 
 def test_enabled_engine_reports_one_sanitized_warning(sandbox, monkeypatch, caplog):
-    store = SimpleNamespace(settings=sandbox.settings, get_profile=lambda _id: sandbox.profile)
+    profile = {**sandbox.profile, "media_not_before": "2026-11-20T12:00:00+00:00"}
+    store = SimpleNamespace(settings=sandbox.settings, get_profile=lambda _id: profile)
     engine = app.MediaDownloadEngine(store, app.RecorderEventQueue())
     monkeypatch.setattr(app, "download_profile", Mock(side_effect=TimeoutError("dummy-secret-marker")))
     with caplog.at_level(logging.WARNING):
-        engine._check_profile(sandbox.profile)
+        engine._check_profile(profile)
     assert len(caplog.records) == 1
     assert caplog.records[0].exc_info is None
     assert "TimeoutError" in caplog.text

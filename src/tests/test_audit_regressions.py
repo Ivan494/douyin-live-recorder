@@ -188,7 +188,8 @@ def test_check_mode_never_starts_recording():
 
 
 def test_story_captcha_sets_shared_breaker():
-    profile = {"id": "p", "name": "p", "auto_download_stories": True}
+    profile = {"id": "p", "name": "p", "auto_download_stories": True,
+               "media_not_before": "2026-11-20T12:00:00+00:00"}
     store = SimpleNamespace(settings={}, get_profile=lambda _: profile)
     with patch.object(media, "load_json", return_value={}):
         engine = app.MediaDownloadEngine(store, queue.Queue())
